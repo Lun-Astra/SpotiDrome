@@ -1,0 +1,33 @@
+version: "3.9"
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI}
+      - NAVIDROME_URL=${NAVIDROME_URL}
+      - NAVIDROME_USER=${NAVIDROME_USER}
+      - NAVIDROME_PASSWORD=${NAVIDROME_PASSWORD}
+      - SSH_HOST=${SSH_HOST}
+      - SSH_USER=${SSH_USER}
+      - SSH_PORT=${SSH_PORT:-22}
+      - SSH_MUSIC_PATH=${SSH_MUSIC_PATH}
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+    volumes:
+      - ~/.ssh:/root/.ssh
+      - /tmp/spotidrome:/downloads
+    restart: unless-stopped

@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpotiDrome</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d0d12;
+  --bg2: #13131a;
+  --bg3: #1a1a24;
+  --bg4: #22222e;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --sp: #1ed760;
+  --sp2: #17a349;
+  --nd: #8b5cf6;
+  --nd2: #6d28d9;
+  --yt: #ff3333;
+  --amber: #f59e0b;
+  --text: #f0f0f8;
+  --text2: #9090b0;
+  --text3: #5a5a7a;
+  --r: 10px;
+  --r2: 14px;
+  --font: 'Inter', sans-serif;
+  --font2: 'Space Grotesk', sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
+
+/* Subtle grid bg */
+body::before{content:'';position:fixed;inset:0;
+  background-image:radial-gradient(circle at 20% 20%, rgba(139,92,246,0.06) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, rgba(30,215,96,0.04) 0%, transparent 50%),
+    linear-gradient(var(--border) 1px,transparent 1px),
+    linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:100% 100%,100% 100%,32px 32px,32px 32px;
+  pointer-events:none;z-index:0}
+
+.app{position:relative;z-index:1;max-width:1280px;margin:0 auto;padding:0 20px 80px}
+
+/* ── Header ─────────────────────────────────────────────────────────── */
+header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:20px 0 24px;border-bottom:1px solid var(--border);margin-bottom:24px;
+  flex-wrap:wrap;gap:12px;
+}
+.logo{font-family:var(--font2);font-size:24px;font-weight:700;letter-spacing:-0.5px;display:flex;align-items:center;gap:2px}
+.logo .sp{color:var(--sp)}
+.logo .arr{color:var(--text3);margin:0 4px;font-weight:400}
+.logo .nd{color:var(--nd)}
+.header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
+/* Pills */
+.pill{
+  display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
+  border-radius:40px;font-size:12px;font-weight:500;cursor:pointer;
+  background:var(--bg3);border:1px solid var(--border);color:var(--text2);
+  transition:all .15s;white-space:nowrap;
+}
+.pill:hover{border-color:var(--border2);color:var(--text)}
+.pill.nd-pill:hover{border-color:rgba(139,92,246,.4);color:var(--nd)}
+.pill.settings-pill:hover{border-color:var(--border2)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--text3);flex-shrink:0}
+.dot.on{background:var(--nd);box-shadow:0 0 0 2px rgba(139,92,246,.2)}
+.dot.sp-on{background:var(--sp);box-shadow:0 0 0 2px rgba(30,215,96,.2)}
+.user-pill{display:flex;align-items:center;gap:8px;padding:5px 12px 5px 5px;border-radius:40px;background:var(--bg3);border:1px solid var(--border)}
+.user-pill img{width:26px;height:26px;border-radius:50%;object-fit:cover}
+.user-pill span{font-size:12px;font-weight:500;color:var(--text2)}
+
+/* ── Auth screen ────────────────────────────────────────────────────── */
+#auth-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;gap:20px;text-align:center}
+.auth-logo{width:72px;height:72px;border-radius:50%;background:var(--bg3);border:1px solid var(--border);display:flex;align-items:center;justify-content:center}
+.auth-logo svg{width:36px;height:36px}
+.auth-title{font-family:var(--font2);font-size:28px;font-weight:700}
+.auth-sub{color:var(--text2);font-size:14px;max-width:320px;line-height:1.6}
+.btn-spotify{
+  display:inline-flex;align-items:center;gap:10px;background:var(--sp);color:#000;
+  font-family:var(--font);font-weight:600;font-size:14px;padding:12px 24px;
+  border-radius:40px;border:none;cursor:pointer;text-decoration:none;
+  transition:transform .15s,box-shadow .15s;
+}
+.btn-spotify:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(30,215,96,.3)}
+
+/* ── Layout ─────────────────────────────────────────────────────────── */
+.main{display:grid;grid-template-columns:280px 1fr;gap:16px}
+@media(max-width:780px){.main{grid-template-columns:1fr}}
+
+/* ── Panels ─────────────────────────────────────────────────────────── */
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden}
+.panel-hd{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 16px;border-bottom:1px solid var(--border);
+}
+.panel-title{font-family:var(--font2);font-size:12px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text2)}
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--text3);font-weight:500}
+
+/* ── Playlist items ─────────────────────────────────────────────────── */
+#playlists-list{overflow-y:auto;max-height:calc(100vh - 280px)}
+.pl-item{
+  display:flex;align-items:center;gap:12px;padding:11px 16px;cursor:pointer;
+  border-bottom:1px solid var(--border);transition:background .1s;position:relative;
+}
+.pl-item:hover{background:var(--bg3)}
+.pl-item.active{background:var(--bg3)}
+.pl-item.active::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--sp);border-radius:0 1px 1px 0}
+.pl-thumb{width:40px;height:40px;border-radius:8px;flex-shrink:0;overflow:hidden;background:var(--bg4);display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:16px}
+.pl-thumb img{width:100%;height:100%;object-fit:cover}
+.pl-info{overflow:hidden;flex:1}
+.pl-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pl-meta{font-size:11px;color:var(--text3);margin-top:2px}
+.pl-tracked{width:6px;height:6px;border-radius:50%;background:var(--sp);flex-shrink:0}
+
+/* ── YT tracked ─────────────────────────────────────────────────────── */
+#yt-tracked-panel{margin-top:12px}
+
+/* ── Right panel ────────────────────────────────────────────────────── */
+.right{display:flex;flex-direction:column;gap:14px}
+
+/* ── YT Music input ─────────────────────────────────────────────────── */
+.yt-panel{}
+.yt-input-row{display:flex;gap:8px;padding:14px 16px;border-bottom:1px solid var(--border)}
+.yt-input{
+  flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  color:var(--text);font-family:var(--font);font-size:13px;padding:9px 14px;outline:none;
+  transition:border-color .15s;
+}
+.yt-input:focus{border-color:rgba(255,51,51,.4)}
+.yt-input::placeholder{color:var(--text3)}
+.btn-yt{background:var(--yt);color:#fff;border:none;border-radius:var(--r);padding:9px 16px;font-family:var(--font);font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-yt:hover{box-shadow:0 4px 12px rgba(255,51,51,.3);transform:translateY(-1px)}
+.btn-yt:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+
+.yt-preview{display:none;padding:12px 16px;gap:12px;align-items:center;border-bottom:1px solid var(--border);background:var(--bg3)}
+.yt-preview.show{display:flex}
+.yt-prev-thumb{width:52px;height:52px;border-radius:8px;object-fit:cover;background:var(--bg4);flex-shrink:0}
+.yt-prev-info{flex:1;overflow:hidden}
+.yt-prev-title{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.yt-prev-meta{font-size:12px;color:var(--text2);margin-top:3px}
+.type-badge{font-size:10px;padding:2px 8px;border-radius:20px;font-weight:600;margin-left:6px}
+.type-badge.track{background:rgba(255,51,51,.15);color:#ff6666}
+.type-badge.playlist{background:rgba(139,92,246,.15);color:#a78bfa}
+
+/* ── Tracks panel ───────────────────────────────────────────────────── */
+#tracks-panel{display:none}
+#tracks-panel.visible{display:flex;flex-direction:column}
+.tracks-hd{
+  padding:14px 16px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+}
+.tracks-title{font-family:var(--font2);font-size:18px;font-weight:600}
+.tracks-meta{font-size:12px;color:var(--text2);margin-top:2px}
+.tracks-actions{display:flex;gap:8px;flex-shrink:0}
+
+/* Buttons */
+.btn{
+  display:inline-flex;align-items:center;gap:6px;font-family:var(--font);
+  font-size:12px;font-weight:500;padding:8px 14px;border-radius:var(--r);
+  border:none;cursor:pointer;transition:all .15s;white-space:nowrap;
+}
+.btn-primary{background:var(--sp);color:#000}
+.btn-primary:hover{box-shadow:0 4px 12px rgba(30,215,96,.3);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--border2);color:var(--text)}
+.btn-nd{background:rgba(139,92,246,.12);color:#a78bfa;border:1px solid rgba(139,92,246,.2)}
+.btn-nd:hover{background:rgba(139,92,246,.2)}
+
+#tracks-list{overflow-y:auto;max-height:320px}
+.track-item{display:flex;align-items:center;gap:12px;padding:8px 16px;border-bottom:1px solid var(--border);transition:background .1s}
+.track-item:hover{background:var(--bg3)}
+.track-num{width:22px;text-align:right;font-size:11px;color:var(--text3);flex-shrink:0}
+.track-art{width:32px;height:32px;border-radius:4px;background:var(--bg4);flex-shrink:0;overflow:hidden}
+.track-art img{width:100%;height:100%;object-fit:cover}
+.track-info{flex:1;overflow:hidden}
+.track-name{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.track-artist{font-size:11px;color:var(--text3);margin-top:1px}
+.track-dur{font-size:11px;color:var(--text3);flex-shrink:0}
+
+/* Sync row */
+.sync-row{
+  display:flex;align-items:center;gap:10px;padding:10px 16px;
+  border-top:1px solid var(--border);background:var(--bg3);flex-wrap:wrap;
+}
+.toggle{position:relative;width:32px;height:17px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-sl{position:absolute;inset:0;background:var(--bg4);border-radius:9px;transition:.2s;cursor:pointer}
+.toggle-sl::before{content:'';position:absolute;width:11px;height:11px;left:3px;top:3px;background:var(--text3);border-radius:50%;transition:.2s}
+.toggle input:checked+.toggle-sl{background:var(--nd)}
+.toggle input:checked+.toggle-sl::before{transform:translateX(15px);background:#fff}
+.sync-label{font-size:12px;font-weight:500}
+.sync-desc{font-size:11px;color:var(--text3)}
+
+/* ── Jobs panel ─────────────────────────────────────────────────────── */
+.job-card{padding:14px 16px;border-bottom:1px solid var(--border)}
+.job-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.job-name{font-family:var(--font2);font-size:13px;font-weight:600}
+.job-status{font-size:10px;padding:3px 10px;border-radius:20px;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
+.job-status.pending{background:var(--bg4);color:var(--text3)}
+.job-status.running{background:rgba(30,215,96,.12);color:var(--sp)}
+.job-status.uploading{background:rgba(245,158,11,.12);color:var(--amber)}
+.job-status.scanning{background:rgba(139,92,246,.12);color:#a78bfa}
+.job-status.done{background:rgba(30,215,96,.08);color:#5af082}
+
+/* ── Sync health panel ──────────────────────────────────────────────── */
+.health-pill{font-size:10px;padding:3px 10px;border-radius:20px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;flex-shrink:0}
+.health-pill.ok{background:rgba(30,215,96,.08);color:#5af082}
+.health-pill.partial{background:rgba(245,158,11,.12);color:var(--amber)}
+.health-pill.failed{background:rgba(248,113,113,.12);color:#f87171}
+.health-pill.unknown{background:var(--bg4);color:var(--text3)}
+.health-dup-line{padding:10px 16px;border-top:1px solid var(--border);font-size:11px;color:var(--text3)}
+
+.prog-bar{height:4px;background:var(--bg4);border-radius:2px;overflow:hidden;margin-bottom:8px}
+.prog-fill{height:100%;border-radius:2px;background:var(--sp);transition:width .4s ease}
+.prog-fill.nd{background:var(--nd)}
+.prog-fill.up{background:var(--amber)}
+
+.job-stats{display:flex;gap:14px;font-size:11px;color:var(--text3);flex-wrap:wrap}
+.job-stats b{color:var(--text)}
+.job-track{font-size:11px;color:var(--text2);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.nd-result{display:flex;align-items:center;gap:6px;margin-top:8px;background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.15);border-radius:6px;padding:7px 12px;font-size:11px;color:#a78bfa}
+.job-log{margin-top:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;max-height:110px;overflow-y:auto;font-size:11px;line-height:1.7;font-family:monospace}
+.ll.ok{color:#4ade80}.ll.skip{color:#fbbf24}.ll.nd{color:#a78bfa}.ll.err{color:#f87171}
+
+.skip-btn{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:#f87171;font-size:10px;padding:3px 9px;border-radius:5px;cursor:pointer;font-family:var(--font);flex-shrink:0}
+.skip-btn:hover{background:rgba(248,113,113,.2)}
+
+/* ── Modals ─────────────────────────────────────────────────────────── */
+.modal-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)}
+.modal-ov.show{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);width:100%;max-width:460px;overflow:hidden}
+.modal-hd{padding:18px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-title{font-family:var(--font2);font-size:16px;font-weight:600}
+.modal-close{background:none;border:none;color:var(--text3);cursor:pointer;font-size:18px;padding:2px;transition:color .15s}
+.modal-close:hover{color:var(--text)}
+.modal-body{padding:20px;display:flex;flex-direction:column;gap:14px}
+.modal-foot{padding:14px 20px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
+
+.field{display:flex;flex-direction:column;gap:5px}
+.field label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;font-weight:500}
+.field input,.field select,.field textarea{
+  background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  color:var(--text);font-family:var(--font);font-size:13px;padding:9px 12px;outline:none;
+  transition:border-color .15s;
+}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:rgba(139,92,246,.5)}
+.field textarea{resize:vertical;min-height:80px;font-family:monospace}
+.field-hint{font-size:11px;color:var(--text3);line-height:1.5}
+.conn-ok{background:rgba(30,215,96,.1);border:1px solid rgba(30,215,96,.2);color:#4ade80;font-size:12px;padding:6px 12px;border-radius:6px}
+.conn-err{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:#f87171;font-size:12px;padding:6px 12px;border-radius:6px}
+
+/* Schedule modal */
+.radio-group{display:flex;gap:8px;flex-wrap:wrap}
+.radio-opt{
+  display:flex;align-items:center;gap:7px;cursor:pointer;
+  background:var(--bg3);border:1px solid var(--border);padding:8px 14px;border-radius:var(--r);
+  font-size:12px;font-weight:500;transition:all .15s;
+}
+.radio-opt:has(input:checked){border-color:rgba(139,92,246,.4);color:#a78bfa;background:rgba(139,92,246,.08)}
+.radio-opt input{accent-color:var(--nd)}
+.next-run-badge{background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.15);border-radius:6px;padding:8px 12px;font-size:12px;color:#a78bfa}
+
+/* Settings */
+.settings-sec{margin-bottom:4px}
+.settings-sec-title{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;font-weight:500;margin-bottom:10px}
+.settings-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
+.settings-label{font-size:13px;font-weight:500}
+.settings-sub{font-size:11px;color:var(--text3);margin-top:1px}
+.ver-badge{font-size:11px;padding:3px 10px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);font-weight:500}
+.ck-badge{font-size:11px;padding:3px 10px;border-radius:20px;font-weight:500}
+.ck-badge.on{background:rgba(30,215,96,.1);color:#4ade80}
+.ck-badge.off{background:var(--bg3);color:var(--text3)}
+.upd-out{display:none;margin-top:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text2);white-space:pre-wrap;max-height:90px;overflow-y:auto;font-family:monospace}
+
+/* YT tracked items */
+.yt-item{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s}
+.yt-item:hover{background:var(--bg3)}
+.yt-icon{width:36px;height:36px;border-radius:8px;background:rgba(255,51,51,.1);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.yt-icon svg{width:16px;height:16px}
+
+/* Spinner */
+.spin{width:13px;height:13px;border:2px solid rgba(255,255,255,.15);border-top-color:currentColor;border-radius:50%;animation:rot .6s linear infinite;display:inline-block;flex-shrink:0}
+@keyframes rot{to{transform:rotate(360deg)}}
+
+/* Empty state */
+.empty{padding:32px 16px;text-align:center;color:var(--text3);font-size:12px}
+.empty-icon{font-size:24px;margin-bottom:8px;opacity:.5}
+
+/* Callback */
+#cb-ov{display:none;position:fixed;inset:0;background:rgba(13,13,18,.95);z-index:300;align-items:center;justify-content:center;flex-direction:column;gap:14px}
+#cb-ov.show{display:flex}
+#cb-ov .cb-title{font-family:var(--font2);font-size:22px;font-weight:600}
+#cb-ov .cb-sub{font-size:13px;color:var(--text2)}
+
+/* Divider between sections */
+.section-gap{height:14px}
+</style>
+</head>
+<body>
+
+<div id="cb-ov">
+  <svg width="40" height="40" viewBox="0 0 24 24" fill="var(--sp)"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
+  <div class="cb-title">Connecting to Spotify…</div>
+  <div class="cb-sub">Just a moment while we authenticate</div>
+  <div class="spin" style="width:20px;height:20px;border-color:rgba(30,215,96,.2);border-top-color:var(--sp)"></div>
+</div>
+
+<!-- Navidrome modal -->
+<div class="modal-ov" id="nd-modal">
+  <div class="modal">
+    <div class="modal-hd">
+      <div class="modal-title" style="color:var(--nd)">Navidrome</div>
+      <button class="modal-close" onclick="closeNdModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-hint">Connect to your Navidrome server. SpotiDrome will trigger a library scan and sync playlists automatically after each download.</div>
+      <div class="field"><label>Server URL</label><input id="nd-url" type="url" placeholder="http://192.168.1.100:4533"></div>
+      <div class="field"><label>Username</label><input id="nd-user" type="text" placeholder="admin"></div>
+      <div class="field"><label>Password</label><input id="nd-pass" type="password" placeholder="••••••••"></div>
+      <div id="nd-conn-st"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="testNd()">Test Connection</button>
+      <button class="btn btn-nd" onclick="saveNd()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Schedule modal -->
+<div class="modal-ov" id="schedule-modal">
+  <div class="modal">
+    <div class="modal-hd">
+      <div class="modal-title">Auto-sync Schedule</div>
+      <button class="modal-close" onclick="closeScheduleModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-hint">Automatically re-sync all tracked playlists. Only downloads new tracks added since last sync.</div>
+      <div class="field">
+        <label>Status</label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <label class="toggle"><input type="checkbox" id="sch-enabled" checked><span class="toggle-sl"></span></label>
+          <span id="sch-enabled-label" style="font-size:13px;font-weight:500">Enabled</span>
+        </label>
+      </div>
+      <div class="field">
+        <label>Type</label>
+        <div class="radio-group">
+          <label class="radio-opt"><input type="radio" name="sch-mode" value="time" checked> Daily at time</label>
+          <label class="radio-opt"><input type="radio" name="sch-mode" value="interval"> Every X hours</label>
+        </div>
+      </div>
+      <div class="field" id="sch-time-field">
+        <label>Time (UTC)</label>
+        <select id="sch-hour">
+          <option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option>
+          <option value="3" selected>03:00</option><option value="4">04:00</option><option value="5">05:00</option>
+          <option value="6">06:00</option><option value="7">07:00</option><option value="8">08:00</option>
+          <option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option>
+          <option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option>
+          <option value="15">15:00</option><option value="16">16:00</option><option value="17">17:00</option>
+          <option value="18">18:00</option><option value="19">19:00</option><option value="20">20:00</option>
+          <option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option>
+        </select>
+      </div>
+      <div class="field" id="sch-interval-field" style="display:none">
+        <label>Interval</label>
+        <select id="sch-interval">
+          <option value="1">Every 1 hour</option><option value="2">Every 2 hours</option>
+          <option value="4">Every 4 hours</option><option value="6">Every 6 hours</option>
+          <option value="12">Every 12 hours</option><option value="24" selected>Every 24 hours</option>
+          <option value="48">Every 48 hours</option>
+        </select>
+      </div>
+      <div class="next-run-badge" id="sch-next-run">Loading…</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="runSyncNow()">▶ Run Now</button>
+      <button class="btn btn-nd" onclick="saveSchedule()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div class="modal-ov" id="settings-modal">
+  <div class="modal" style="max-width:480px">
+    <div class="modal-hd">
+      <div class="modal-title">Settings</div>
+      <button class="modal-close" onclick="closeSettingsModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-sec">
+        <div class="settings-sec-title">yt-dlp</div>
+        <div class="settings-row">
+          <div><div class="settings-label">Current version</div><div class="settings-sub">Used for all downloads</div></div>
+          <span class="ver-badge" id="ytdlp-version">…</span>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-label">Update yt-dlp</div><div class="settings-sub">Fix broken YouTube downloads</div></div>
+          <button class="btn btn-ghost" id="btn-upd-ytdlp" onclick="updateYtdlp()">↑ Update</button>
+        </div>
+        <div class="upd-out" id="ytdlp-upd-out"></div>
+      </div>
+      <div style="height:1px;background:var(--border);margin:4px 0"></div>
+      <div class="settings-sec" style="margin-top:12px">
+        <div class="settings-sec-title">YouTube Cookies</div>
+        <div class="settings-row">
+          <div><div class="settings-label">Cookie status</div><div class="settings-sub">Reduces rate limiting</div></div>
+          <span class="ck-badge off" id="ck-badge">Not set</span>
+        </div>
+        <div class="field">
+          <label>Paste Netscape cookie file</label>
+          <textarea id="ck-content" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com	TRUE	/	FALSE	..."></textarea>
+          <div class="field-hint">Export from music.youtube.com using "Get cookies.txt LOCALLY" browser extension.</div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+          <button class="btn btn-ghost" onclick="deleteCookies()">Remove</button>
+          <button class="btn btn-primary" onclick="saveCookies()">Save Cookies</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="app">
+  <header>
+    <div class="logo">
+      <span class="sp">Spoti</span><span class="arr">→</span><span class="nd">Drome</span>
+    </div>
+    <div class="header-right">
+      <div class="pill settings-pill" onclick="openSettingsModal()">⚙ Settings</div>
+      <div class="pill" onclick="openScheduleModal()" id="schedule-pill">
+        <div class="dot" id="schedule-dot"></div>
+        <span id="schedule-pill-label">Auto-sync</span>
+      </div>
+      <div class="pill nd-pill" onclick="openNdModal()" id="nd-pill">
+        <div class="dot" id="nd-dot"></div>
+        <span id="nd-pill-label">Navidrome</span>
+      </div>
+      <div id="user-area"></div>
+    </div>
+  </header>
+
+  <div id="auth-screen" style="display:none">
+    <div class="auth-logo">
+      <svg viewBox="0 0 24 24" fill="var(--sp)"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
+    </div>
+    <div class="auth-title">Connect Spotify</div>
+    <div class="auth-sub">Link your Spotify account to browse playlists and download them to Navidrome.</div>
+    <a id="auth-link" href="#" class="btn-spotify">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
+      Login with Spotify
+    </a>
+  </div>
+
+  <div id="main-content" style="display:none">
+    <!-- YT Music bar -->
+    <div class="panel yt-panel" style="margin-bottom:14px">
+      <div class="panel-hd">
+        <span class="panel-title" style="display:flex;align-items:center;gap:7px">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="var(--yt)"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+          YouTube Music
+        </span>
+      </div>
+      <div class="yt-input-row">
+        <input class="yt-input" id="yt-url" type="url" placeholder="Paste a YouTube Music URL — track, album or playlist…">
+        <button class="btn-yt" id="btn-yt-fetch" onclick="ytFetch()">Fetch</button>
+      </div>
+      <div class="yt-preview" id="yt-preview">
+        <img class="yt-prev-thumb" id="yt-thumb" src="">
+        <div class="yt-prev-info">
+          <div style="display:flex;align-items:center">
+            <span class="yt-prev-title" id="yt-title"></span>
+            <span class="type-badge" id="yt-type-badge"></span>
+          </div>
+          <div class="yt-prev-meta" id="yt-meta"></div>
+        </div>
+        <button class="btn-yt" id="btn-yt-dl" onclick="ytDownload()" disabled>↓ Download</button>
+      </div>
+    </div>
+
+    <div class="main">
+      <!-- Left column -->
+      <div>
+        <div class="panel">
+          <div class="panel-hd">
+            <span class="panel-title">Playlists</span>
+            <span class="badge" id="playlist-count">—</span>
+          </div>
+          <div id="playlists-list"><div class="empty"><div class="spin"></div></div></div>
+        </div>
+
+        <!-- YT tracked -->
+        <div class="panel" id="yt-tracked-panel" style="margin-top:12px">
+          <div class="panel-hd">
+            <span class="panel-title" style="display:flex;align-items:center;gap:6px">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="var(--yt)"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+              YT Tracked
+            </span>
+            <span class="badge" id="yt-tracked-count">0</span>
+          </div>
+          <div id="yt-tracked-list"><div class="empty" style="padding:16px">No YT playlists tracked</div></div>
+        </div>
+
+        <!-- Sync health -->
+        <div class="panel" id="health-panel" style="margin-top:12px">
+          <div class="panel-hd">
+            <span class="panel-title">Sync Health</span>
+            <span class="badge" id="health-unknown-badge" title="Tracks tagged &quot;Unknown Album&quot; in Navidrome">—</span>
+          </div>
+          <div id="health-list"><div class="empty" style="padding:14px">Loading…</div></div>
+          <div class="health-dup-line" id="health-dup-line">Duplicate sweep: no run yet</div>
+        </div>
+      </div>
+
+      <!-- Right column -->
+      <div class="right">
+        <!-- Tracks panel -->
+        <div id="tracks-panel" class="panel">
+          <div class="tracks-hd">
+            <div>
+              <div class="tracks-title" id="selected-name"></div>
+              <div class="tracks-meta" id="selected-meta"></div>
+            </div>
+            <div class="tracks-actions">
+              <button class="btn btn-ghost" id="btn-refresh">↺</button>
+              <button class="btn btn-primary" id="btn-download" disabled>↓ Download All</button>
+            </div>
+          </div>
+          <div id="tracks-list"></div>
+          <div class="sync-row">
+            <label class="toggle"><input type="checkbox" id="toggle-sync" checked><span class="toggle-sl"></span></label>
+            <span class="sync-label">Sync to Navidrome</span>
+            <span class="sync-desc">— scan & create playlist after download</span>
+            <button class="btn btn-nd" style="margin-left:auto;padding:6px 10px;font-size:11px" onclick="openNdModal()">⚙ Configure</button>
+          </div>
+        </div>
+
+        <!-- Jobs panel -->
+        <div class="panel">
+          <div class="panel-hd">
+            <span class="panel-title">Download Jobs</span>
+            <span class="badge" id="jobs-count">0</span>
+          </div>
+          <div id="jobs-list"><div class="empty"><div class="empty-icon">↓</div>No downloads yet</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API='/api';
+let selectedPlaylist=null,allTracks=[],ytInfo=null;
+let _lastJobsHash='';
+
+const urlP=new URLSearchParams(window.location.search),code=urlP.get('code');
+if(code){
+  document.getElementById('cb-ov').classList.add('show');
+  fetch(`${API}/auth/callback?code=${code}`).then(r=>r.json()).then(()=>{window.history.replaceState({},'','/');document.getElementById('cb-ov').classList.remove('show');init();}).catch(()=>{document.getElementById('cb-ov').classList.remove('show');init();});
+}else{init();}
+
+async function init(){
+  await Promise.all([checkNd(),checkSchedule()]);
+  const res=await fetch(`${API}/auth/status`),d=await res.json();
+  if(d.authenticated){showMain(d);loadPlaylists();loadYtTracked();loadHealth();setInterval(renderJobs,2500);setInterval(loadYtTracked,10000);setInterval(loadHealth,30000);renderJobs();}
+  else{document.getElementById('auth-link').href=d.auth_url;document.getElementById('auth-screen').style.display='flex';}
+}
+
+async function checkNd(){
+  try{const r=await fetch(`${API}/navidrome/config`),c=await r.json();
+    const dot=document.getElementById('nd-dot'),lbl=document.getElementById('nd-pill-label');
+    if(c.configured){dot.classList.add('on');lbl.textContent=c.url.replace(/^https?:\/\//,'').split('/')[0];}
+    else{dot.classList.remove('on');lbl.textContent='Navidrome';}
+  }catch(e){}
+}
+
+async function checkSchedule(){
+  try{const r=await fetch(`${API}/schedule`),c=await r.json();
+    const dot=document.getElementById('schedule-dot'),lbl=document.getElementById('schedule-pill-label');
+    if(c.enabled){dot.classList.add('sp-on');lbl.textContent=c.mode==='interval'?`Every ${c.interval_hours}h`:`Daily ${String(c.hour).padStart(2,'0')}:00`;}
+    else{dot.classList.remove('sp-on');lbl.textContent='Auto-sync off';}
+  }catch(e){}
+}
+
+function showMain(u){
+  document.getElementById('main-content').style.display='block';
+  document.getElementById('auth-screen').style.display='none';
+  document.getElementById('user-area').innerHTML=`<div class="user-pill">${u.image?`<img src="${u.image}">`:''}  <span>${esc(u.user)}</span></div>`;
+}
+
+async function loadPlaylists(){
+  const r=await fetch(`${API}/playlists`),pls=await r.json();
+  document.getElementById('playlist-count').textContent=pls.length;
+  const list=document.getElementById('playlists-list');
+  if(!pls.length){list.innerHTML='<div class="empty">No playlists found</div>';return;}
+  list.innerHTML=pls.map(p=>`<div class="pl-item" data-id="${p.id}" onclick="selectPlaylist('${p.id}','${escA(p.name)}')">
+    <div class="pl-thumb">${p.image?`<img src="${p.image}" loading="lazy">`:'♪'}</div>
+    <div class="pl-info"><div class="pl-name">${esc(p.name)}</div><div class="pl-meta">${p.tracks} tracks · ${esc(p.owner)}</div></div>
+    ${p.tracked?'<div class="pl-tracked" title="Auto-sync enabled"></div>':''}
+  </div>`).join('');
+}
+
+async function selectPlaylist(id,name){
+  selectedPlaylist={id,name};allTracks=[];
+  document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
+  document.querySelector(`[data-id="${id}"]`)?.classList.add('active');
+  const panel=document.getElementById('tracks-panel');
+  panel.classList.add('visible');
+  document.getElementById('selected-name').textContent=name;
+  document.getElementById('selected-meta').textContent='Loading…';
+  document.getElementById('tracks-list').innerHTML='<div class="empty"><div class="spin"></div></div>';
+  document.getElementById('btn-download').disabled=true;
+  const r=await fetch(`${API}/playlist/${id}/tracks`);allTracks=await r.json();
+  document.getElementById('selected-meta').textContent=`${allTracks.length} tracks`;
+  document.getElementById('btn-download').disabled=false;
+  renderTracks();
+}
+
+function renderTracks(){
+  const list=document.getElementById('tracks-list');
+  if(!allTracks.length){list.innerHTML='<div class="empty">No tracks</div>';return;}
+  list.innerHTML=allTracks.map((t,i)=>`<div class="track-item">
+    <div class="track-num">${i+1}</div>
+    <div class="track-art">${t.image?`<img src="${t.image}" loading="lazy">`:''}</div>
+    <div class="track-info"><div class="track-name">${esc(t.name)}</div><div class="track-artist">${esc(t.artist)}</div></div>
+    <div class="track-dur">${fmt(t.duration_ms)}</div>
+  </div>`).join('');
+}
+
+document.getElementById('btn-download').addEventListener('click',async()=>{
+  if(!selectedPlaylist||!allTracks.length)return;
+  const sync=document.getElementById('toggle-sync').checked,btn=document.getElementById('btn-download');
+  btn.disabled=true;btn.innerHTML='<span class="spin"></span> Starting…';
+  await fetch(`${API}/download`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({playlist_name:selectedPlaylist.name,playlist_id:selectedPlaylist.id,tracks:allTracks,sync_navidrome:sync})});
+  btn.disabled=false;btn.innerHTML='↓ Download All';renderJobs();
+});
+
+document.getElementById('btn-refresh').addEventListener('click',()=>{if(selectedPlaylist)selectPlaylist(selectedPlaylist.id,selectedPlaylist.name);});
+
+async function renderJobs(){
+  const r=await fetch(`${API}/jobs`),jobs=await r.json();
+  const hash=JSON.stringify(jobs.map(j=>[j.id,j.status,j.current,j.downloaded,j.failed,j.current_track,(j.log||[]).length]));
+  if(hash===_lastJobsHash)return;_lastJobsHash=hash;
+  document.getElementById('jobs-count').textContent=jobs.length;
+  const list=document.getElementById('jobs-list');
+  if(!jobs.length){list.innerHTML='<div class="empty"><div class="empty-icon">↓</div>No downloads yet</div>';return;}
+  list.innerHTML=[...jobs].reverse().map(job=>{
+    const pct=job.total>0?Math.round(job.current/job.total*100):0;
+    const sc=job.status==='scanning',up=job.status==='uploading';
+    const logHtml=(job.log||[]).slice(-25).map(l=>{
+      const c=l.startsWith('✓')?'ok':l.startsWith('⏭')?'skip':(l.startsWith('🔄')||l.startsWith('🔍')||l.startsWith('✅'))?'nd':'err';
+      return`<div class="ll ${c}">${esc(l)}</div>`;
+    }).join('');
+    const ndR=job.nd_synced!==null?`<div class="nd-result">⬡ Navidrome playlist synced · ${job.nd_synced} tracks matched${job.nd_missing>0?` · <span style="color:#f87171">${job.nd_missing} not found</span>`:''}</div>`:'';
+    const trackLine=job.current_track&&job.status==='running'
+      ?`<div class="job-track"><span>${esc(job.current_track)}</span><button class="skip-btn" onclick="skipTrack('${job.id}')">⏭ Skip</button></div>`
+      :job.current_track?`<div class="job-track">${sc?'⬡':up?'↑':'▶'} ${esc(job.current_track)}</div>`:'';
+    return`<div class="job-card">
+      <div class="job-hd"><div class="job-name">${esc(job.playlist)}</div><div class="job-status ${job.status}">${job.status}</div></div>
+      <div class="prog-bar"><div class="prog-fill ${sc?'nd':up?'up':''}" style="width:${sc||up?100:pct}%"></div></div>
+      <div class="job-stats">Progress: <b>${job.current}/${job.total}</b> &nbsp; ✓ <b>${job.downloaded}</b> &nbsp; ✗ <b>${job.failed}</b></div>
+      ${trackLine}${ndR}
+      ${logHtml?`<div class="job-log">${logHtml}</div>`:''}
+    </div>`;
+  }).join('');
+  document.querySelectorAll('.job-log').forEach(el=>{el.scrollTop=el.scrollHeight;});
+}
+
+async function skipTrack(id){await fetch(`${API}/jobs/${id}/skip`,{method:'POST'});}
+
+// YT Music
+async function ytFetch(){
+  const url=document.getElementById('yt-url').value.trim();if(!url)return;
+  const btn=document.getElementById('btn-yt-fetch');
+  btn.disabled=true;btn.innerHTML='<span class="spin"></span>';
+  document.getElementById('yt-preview').classList.remove('show');
+  document.getElementById('btn-yt-dl').disabled=true;
+  try{
+    const r=await fetch(`${API}/ytmusic/info`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+    const d=await r.json();
+    if(d.error){alert('Error: '+d.error);return;}
+    ytInfo={...d,url};
+    document.getElementById('yt-title').textContent=d.title;
+    document.getElementById('yt-meta').textContent=`${d.uploader}${d.is_playlist?` · ${d.track_count} tracks`:''}`;
+    document.getElementById('yt-thumb').src=d.thumbnail||'';
+    const b=document.getElementById('yt-type-badge');
+    b.textContent=d.is_playlist?'PLAYLIST':'TRACK';
+    b.className='type-badge '+(d.is_playlist?'playlist':'track');
+    document.getElementById('yt-preview').classList.add('show');
+    document.getElementById('btn-yt-dl').disabled=false;
+  }catch(e){alert('Failed: '+e.message);}
+  finally{btn.disabled=false;btn.innerHTML='Fetch';}
+}
+
+async function ytDownload(){
+  if(!ytInfo)return;
+  const btn=document.getElementById('btn-yt-dl');
+  btn.disabled=true;btn.innerHTML='<span class="spin"></span>';
+  await fetch(`${API}/ytmusic/download`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url:ytInfo.url,playlist_name:ytInfo.title,is_playlist:ytInfo.is_playlist})});
+  document.getElementById('yt-url').value='';
+  document.getElementById('yt-preview').classList.remove('show');
+  ytInfo=null;btn.disabled=false;btn.innerHTML='↓ Download';
+  renderJobs();
+}
+
+document.getElementById('yt-url').addEventListener('keydown',e=>{if(e.key==='Enter')ytFetch();});
+
+// YT tracked
+async function loadYtTracked(){
+  try{
+    const r=await fetch(`${API}/tracked`),d=await r.json();
+    const yt=Object.values(d).filter(p=>p.id&&p.id.startsWith('yt_'));
+    document.getElementById('yt-tracked-count').textContent=yt.length;
+    const list=document.getElementById('yt-tracked-list');
+    if(!yt.length){list.innerHTML='<div class="empty" style="padding:14px">No YT playlists tracked</div>';return;}
+    list.innerHTML=yt.map(p=>`<div class="yt-item" onclick="syncYtPlaylist('${escA(p.id)}','${escA(p.name)}','${escA(p.url||'')}')">
+      <div class="yt-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="var(--yt)"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg></div>
+      <div class="pl-info"><div class="pl-name">${esc(p.name)}</div><div class="pl-meta">${p.tracks?p.tracks.length:0} tracks · ${p.last_synced?new Date(p.last_synced+'Z').toLocaleDateString():'never'}</div></div>
+      <button onclick="event.stopPropagation();removeYtTracked('${p.id}')" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:4px 6px" title="Remove">✕</button>
+    </div>`).join('');
+  }catch(e){}
+}
+
+async function syncYtPlaylist(id,name,url){if(!url){alert('No URL stored.');return;}
+  await fetch(`${API}/ytmusic/download`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,playlist_name:name,is_playlist:true})});
+  renderJobs();
+}
+async function removeYtTracked(id){await fetch(`${API}/tracked/${id}`,{method:'DELETE'});loadYtTracked();}
+
+async function loadHealth(){
+  try{
+    const r=await fetch(`${API}/health/summary`),d=await r.json();
+    const badge=document.getElementById('health-unknown-badge');
+    badge.textContent=(d.unknown_album_count??'—');
+    const list=document.getElementById('health-list');
+    if(!d.playlists||!d.playlists.length){
+      list.innerHTML='<div class="empty" style="padding:14px">No tracked playlists yet</div>';
+    }else{
+      list.innerHTML=d.playlists.map(p=>`<div class="yt-item" style="cursor:default">
+        <div class="pl-info">
+          <div class="pl-name">${esc(p.name||p.id)}</div>
+          <div class="pl-meta">${p.last_synced?new Date(p.last_synced+'Z').toLocaleDateString():'never'}${p.dead_link_count?` · ⚠ ${p.dead_link_count} dead link${p.dead_link_count>1?'s':''}`:''}</div>
+        </div>
+        <span class="health-pill ${p.last_status||'unknown'}">${esc(p.last_status||'unknown')}</span>
+      </div>`).join('');
+    }
+    const dr=d.duplicate_report||{};
+    document.getElementById('health-dup-line').textContent = dr.last_run
+      ? `Last duplicate sweep: ${(dr.removed||[]).length} removed · ${new Date(dr.last_run+'Z').toLocaleDateString()}`
+      : 'Duplicate sweep: no run yet';
+  }catch(e){}
+}
+
+// Navidrome modal
+function openNdModal(){
+  fetch(`${API}/navidrome/config`).then(r=>r.json()).then(c=>{if(c.configured){document.getElementById('nd-url').value=c.url;document.getElementById('nd-user').value=c.user;}});
+  document.getElementById('nd-modal').classList.add('show');
+}
+function closeNdModal(){document.getElementById('nd-modal').classList.remove('show');}
+async function testNd(){
+  const url=document.getElementById('nd-url').value.trim(),user=document.getElementById('nd-user').value.trim(),pass=document.getElementById('nd-pass').value.trim(),el=document.getElementById('nd-conn-st');
+  el.innerHTML='<div style="font-size:12px;color:var(--text2)">Testing…</div>';
+  try{const r=await fetch(`${API}/navidrome/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,user,password:pass})}),d=await r.json();
+    if(d.status==='ok'){el.innerHTML='<div class="conn-ok">✓ Connected successfully</div>';checkNd();}
+    else{el.innerHTML=`<div class="conn-err">✗ ${esc(d.error)}</div>`;}
+  }catch(e){el.innerHTML=`<div class="conn-err">✗ ${esc(e.message)}</div>`;}
+}
+async function saveNd(){await testNd();if(document.getElementById('nd-conn-st').querySelector('.conn-ok'))setTimeout(closeNdModal,600);}
+
+// Schedule modal
+function openScheduleModal(){
+  fetch(`${API}/schedule`).then(r=>r.json()).then(c=>{
+    document.getElementById('sch-enabled').checked=c.enabled;
+    document.getElementById('sch-enabled-label').textContent=c.enabled?'Enabled':'Disabled';
+    document.getElementById('sch-hour').value=c.hour||3;
+    document.getElementById('sch-interval').value=c.interval_hours||24;
+    document.querySelectorAll('input[name="sch-mode"]').forEach(r=>{r.checked=r.value===(c.mode||'time');});
+    toggleSchMode(c.mode||'time');
+    document.getElementById('sch-next-run').textContent=c.next_run?`Next sync: ${c.next_run}`:'Auto-sync is disabled';
+  });
+  document.getElementById('schedule-modal').classList.add('show');
+}
+function closeScheduleModal(){document.getElementById('schedule-modal').classList.remove('show');}
+function toggleSchMode(m){
+  document.getElementById('sch-time-field').style.display=m==='time'?'flex':'none';
+  document.getElementById('sch-interval-field').style.display=m==='interval'?'flex':'none';
+}
+document.querySelectorAll('input[name="sch-mode"]').forEach(r=>{r.addEventListener('change',()=>toggleSchMode(r.value));});
+document.getElementById('sch-enabled').addEventListener('change',function(){document.getElementById('sch-enabled-label').textContent=this.checked?'Enabled':'Disabled';});
+async function saveSchedule(){
+  const mode=document.querySelector('input[name="sch-mode"]:checked').value;
+  await fetch(`${API}/schedule`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({enabled:document.getElementById('sch-enabled').checked,mode,hour:parseInt(document.getElementById('sch-hour').value),interval_hours:parseInt(document.getElementById('sch-interval').value)})});
+  checkSchedule();closeScheduleModal();
+}
+async function runSyncNow(){await fetch(`${API}/schedule/run`,{method:'POST'});closeScheduleModal();setTimeout(renderJobs,1000);}
+
+// Settings modal
+function openSettingsModal(){loadYtdlpVersion();loadCookieStatus();document.getElementById('settings-modal').classList.add('show');}
+function closeSettingsModal(){document.getElementById('settings-modal').classList.remove('show');}
+async function loadYtdlpVersion(){try{const r=await fetch(`${API}/ytdlp/version`),d=await r.json();document.getElementById('ytdlp-version').textContent=d.version||'Unknown';}catch(e){}}
+async function updateYtdlp(){
+  const btn=document.getElementById('btn-upd-ytdlp'),out=document.getElementById('ytdlp-upd-out');
+  btn.disabled=true;btn.innerHTML='<span class="spin"></span>';out.style.display='none';
+  try{const r=await fetch(`${API}/ytdlp/update`,{method:'POST'}),d=await r.json();out.style.display='block';out.textContent=d.output||d.error||'Done';await loadYtdlpVersion();}
+  catch(e){out.style.display='block';out.textContent='Error: '+e.message;}
+  finally{btn.disabled=false;btn.innerHTML='↑ Update';}
+}
+async function loadCookieStatus(){
+  try{const r=await fetch(`${API}/cookies/status`),d=await r.json();
+    const b=document.getElementById('ck-badge');
+    if(d.configured){b.textContent=`Active · ${d.modified}`;b.className='ck-badge on';}
+    else{b.textContent='Not set';b.className='ck-badge off';}
+  }catch(e){}
+}
+async function saveCookies(){
+  const v=document.getElementById('ck-content').value.trim();if(!v){alert('Paste cookie file first.');return;}
+  const r=await fetch(`${API}/cookies/upload`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:v})});
+  const d=await r.json();if(d.error){alert('Error: '+d.error);return;}
+  document.getElementById('ck-content').value='';await loadCookieStatus();alert('✓ Cookies saved!');
+}
+async function deleteCookies(){if(!confirm('Remove cookies?'))return;await fetch(`${API}/cookies/delete`,{method:'DELETE'});await loadCookieStatus();}
+
+// Utils
+function fmt(ms){const s=Math.round(ms/1000);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function escA(s){return String(s).replace(/'/g,"\\'");}
+</script>
+</body>
+</html>

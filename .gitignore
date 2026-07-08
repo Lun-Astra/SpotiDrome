@@ -1,0 +1,7 @@
+.env
+.claude/
+__pycache__/
+*.pyc
+music/
+node_modules/
+.DS_Store

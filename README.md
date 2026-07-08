@@ -36,5 +36,4 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
 
 ## Notes
 
-- The `patch-*.sh` / `fix-download.sh` files at the repo root are historical one-off scripts used to incrementally patch earlier versions of `app.py` / `index.html` in place — they aren't part of the running app and are kept for reference only.
 - Runtime state (tracked playlists, job history, dead-link/duplicate reports, schedule config) lives under `~/.ssh/` on the host, not in this repository.

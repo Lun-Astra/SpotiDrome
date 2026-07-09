@@ -314,10 +314,13 @@ def nd_sync_playlist(playlist_name, tracks, cfg, job_id=None):
         log("⚠ No tracks found in Navidrome yet")
         return 0, len(tracks)
     pl_id, created = nd_get_or_create_playlist(playlist_name, cfg)
-    for i in range(0, len(song_ids), 50):
-        batch = song_ids[i:i+50]
+    existing = nd_subsonic("getPlaylist", cfg=cfg, id=pl_id)
+    existing_ids = {e["id"] for e in existing.get("playlist", {}).get("entry", [])}
+    new_ids = [sid for sid in dict.fromkeys(song_ids) if sid not in existing_ids]
+    for i in range(0, len(new_ids), 50):
+        batch = new_ids[i:i+50]
         nd_subsonic("updatePlaylist", cfg=cfg, playlistId=pl_id, songIdToAdd=batch)
-    log(f"✅ {'Created' if created else 'Updated'} playlist '{playlist_name}' — {len(song_ids)} tracks")
+    log(f"✅ {'Created' if created else 'Updated'} playlist '{playlist_name}' — {len(new_ids)} new track(s), {len(song_ids)} matched total")
     if not_found:
         log(f"⚠ {len(not_found)} track(s) not matched")
     return len(song_ids), len(not_found)

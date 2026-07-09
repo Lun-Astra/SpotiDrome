@@ -27,6 +27,7 @@ SYNC_HEALTH_FILE      = "/root/.ssh/sync_health.json"
 
 jobs = {}
 job_lock = threading.Lock()
+nd_playlist_lock = threading.Lock()
 
 def save_jobs():
     try:
@@ -266,15 +267,23 @@ def nd_search_songs(query, cfg):
         return []
 
 def nd_get_or_create_playlist(name, cfg):
-    try:
-        data = nd_subsonic("getPlaylists", cfg=cfg)
-        for pl in data.get("playlists", {}).get("playlist", []):
-            if pl["name"].lower() == name.lower():
-                return pl["id"], False
-    except Exception:
-        pass
-    data = nd_subsonic("createPlaylist", cfg=cfg, name=name)
-    return data.get("playlist", {}).get("id"), True
+    with nd_playlist_lock:
+        last_err = None
+        for attempt in range(3):
+            try:
+                data = nd_subsonic("getPlaylists", cfg=cfg)
+                for pl in data.get("playlists", {}).get("playlist", []):
+                    if pl["name"].lower() == name.lower():
+                        return pl["id"], False
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(2)
+        if last_err is not None:
+            raise ValueError(f"Could not list Navidrome playlists: {last_err}")
+        data = nd_subsonic("createPlaylist", cfg=cfg, name=name)
+        return data.get("playlist", {}).get("id"), True
 
 def nd_sync_playlist(playlist_name, tracks, cfg, job_id=None):
     def log(msg):

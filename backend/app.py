@@ -618,6 +618,11 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 jobs[job_id]["failed"] += 1
         elif rc == 0:
             flac_path = out_template.replace('.%(ext)s', '.flac')
+            if not os.path.exists(flac_path):
+                with job_lock:
+                    jobs[job_id]["log"].append(f"✗ Failed (file missing after download): {track['artist']} - {track['name']}")
+                    jobs[job_id]["failed"] += 1
+                continue
             source_url = extract_resolved_url(stdout)
             track["source_url"] = source_url
             fix_tags(flac_path, track['name'], track['artist'], track['album'],
@@ -826,6 +831,11 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 jobs[job_id]["failed"] += 1
         elif rc == 0:
             flac_path = out_template.replace(".%(ext)s", ".flac")
+            if not os.path.exists(flac_path):
+                with job_lock:
+                    jobs[job_id]["log"].append(f"✗ Failed (file missing after download): {artist} - {title}")
+                    jobs[job_id]["failed"] += 1
+                continue
             fix_tags(flac_path, title, artist, album, source_url=track_url)
             new_album, flac_path = maybe_correct_album(
                 flac_path, title, artist, album, playlist_name, track_url, local_dir)

@@ -6,7 +6,7 @@ from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, COMM, error as ID3Error
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, COMM, error as ID3Error
 
 app = Flask(__name__)
 CORS(app)
@@ -380,7 +380,9 @@ def fetch_playlist_tracks(sp, playlist_id):
             if not t or t.get("is_local"): continue
             tracks.append({"id": t["id"], "name": t["name"],
                            "artist": ", ".join(a["name"] for a in t["artists"] if a.get("name")),
-                           "album": t["album"]["name"], "duration_ms": t["duration_ms"],
+                           "album": t["album"]["name"],
+                           "album_artist": ", ".join(a["name"] for a in t["album"]["artists"] if a.get("name")),
+                           "duration_ms": t["duration_ms"],
                            "image": t["album"]["images"][0]["url"] if t["album"].get("images") else None})
         if not batch["next"]: break
         offset += 100
@@ -391,13 +393,15 @@ def fetch_playlist_tracks(sp, playlist_id):
 def sanitize(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name)
 
-def fix_tags(filepath, title, artist, album, source_url=None):
+def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None):
+    album_artist = album_artist or artist
     try:
         if filepath.endswith('.flac'):
             tags = FLAC(filepath)
             tags["title"] = [title]
             tags["artist"] = [artist]
             tags["album"] = [album]
+            tags["albumartist"] = [album_artist]
             if source_url:
                 tags["comment"] = [source_url]
             tags.save()
@@ -409,6 +413,7 @@ def fix_tags(filepath, title, artist, album, source_url=None):
             tags["TIT2"] = TIT2(encoding=3, text=title)
             tags["TPE1"] = TPE1(encoding=3, text=artist)
             tags["TALB"] = TALB(encoding=3, text=album)
+            tags["TPE2"] = TPE2(encoding=3, text=album_artist)
             if source_url:
                 tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=source_url)
             tags.save(filepath)
@@ -441,7 +446,7 @@ def lookup_real_album(url, timeout=15):
     except Exception:
         return None
 
-def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_url, local_dir):
+def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_url, local_dir, album_artist=None):
     """If album looks like a placeholder (empty/'Unknown Album'/the playlist name
     itself), look up the real album via yt-dlp and move the file into the
     corrected album folder. Returns (album, flac_path), updated if corrected."""
@@ -457,7 +462,7 @@ def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_u
         new_path = os.path.join(new_album_dir, os.path.basename(flac_path))
         if os.path.abspath(new_path) != os.path.abspath(flac_path):
             shutil.move(flac_path, new_path)
-        fix_tags(new_path, title, artist, real_album, source_url=source_url)
+        fix_tags(new_path, title, artist, real_album, album_artist=album_artist, source_url=source_url)
         return real_album, new_path
     except Exception as e:
         print(f"Album correction failed for {flac_path}: {e}")
@@ -615,10 +620,11 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
             flac_path = out_template.replace('.%(ext)s', '.flac')
             source_url = extract_resolved_url(stdout)
             track["source_url"] = source_url
-            fix_tags(flac_path, track['name'], track['artist'], track['album'], source_url=source_url)
+            fix_tags(flac_path, track['name'], track['artist'], track['album'],
+                     album_artist=track.get('album_artist'), source_url=source_url)
             new_album, flac_path = maybe_correct_album(
                 flac_path, track['name'], track['artist'], track['album'],
-                playlist_name, source_url, local_dir)
+                playlist_name, source_url, local_dir, album_artist=track.get('album_artist'))
             if new_album != track['album']:
                 with job_lock:
                     jobs[job_id]["log"].append(f"🏷 Corrected album: {track['album']} → {new_album}")

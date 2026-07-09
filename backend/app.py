@@ -12,6 +12,9 @@ app = Flask(__name__)
 CORS(app)
 
 DOWNLOAD_DIR          = "/downloads"
+YTDLP_POT_ARGS        = ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://bgutil-pot:4416",
+                          "--extractor-args", "youtube:player_client=mweb",
+                          "--remote-components", "ejs:github"]
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8080/callback")
@@ -600,8 +603,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                "--retries", "1", "--fragment-retries", "1", "--extractor-retries", "1",
                "--concurrent-fragments", "1", "--socket-timeout", "10",
                "--sleep-interval", "2", "--max-sleep-interval", "4",
-               "--no-progress", "--print", "%(webpage_url)s",
-               ] + cookies_args + [f"ytsearch1:{track['artist']} - {track['name']} audio"]
+               "--no-progress", "--print", "before_dl:%(webpage_url)s",
+               ] + YTDLP_POT_ARGS + cookies_args + [f"ytsearch1:{track['artist']} - {track['name']} audio"]
 
         rc, killed, stdout = run_yt_dlp(cmd, job_id, f"{track['artist']} - {track['name']}", timeout=30)
 
@@ -814,7 +817,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                "--concurrent-fragments", "1", "--socket-timeout", "10",
                "--sleep-interval", "2", "--max-sleep-interval", "4",
                "--no-progress",
-               ] + cookies_args + [track_url]
+               ] + YTDLP_POT_ARGS + cookies_args + [track_url]
 
         rc, killed, _stdout = run_yt_dlp(cmd, job_id, f"{artist} - {title}", timeout=30)
 

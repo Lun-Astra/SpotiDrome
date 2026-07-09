@@ -1,9 +1,9 @@
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y \
-    ffmpeg curl rsync openssh-client \
+    ffmpeg curl rsync openssh-client unzip \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp
+ENV DENO_INSTALL=/usr/local
+RUN curl -fsSL https://deno.land/install.sh | sh
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

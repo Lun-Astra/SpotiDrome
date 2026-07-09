@@ -8,10 +8,16 @@ services:
       - backend
     restart: unless-stopped
 
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+
   backend:
     build: ./backend
     ports:
       - "5000:5000"
+    depends_on:
+      - bgutil-pot
     environment:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}

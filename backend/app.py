@@ -393,6 +393,10 @@ def fetch_playlist_tracks(sp, playlist_id):
 def sanitize(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name)
 
+def primary_artist(artist):
+    """First name in a comma-joined multi-artist string, for search queries."""
+    return artist.split(",")[0].strip()
+
 def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None):
     album_artist = album_artist or artist
     try:
@@ -427,6 +431,41 @@ def extract_resolved_url(stdout):
         if line.startswith("http://") or line.startswith("https://"):
             return line
     return None
+
+def find_best_youtube_match(query, expected_name, expected_duration_sec, n=5, timeout=20):
+    """Search YouTube and return (webpage_url, title) for the first candidate
+    whose title plausibly matches expected_name and whose duration is close
+    to expected_duration_sec. Returns (None, None) if nothing qualifies."""
+    cmd = ["yt-dlp", "--default-search", "https://music.youtube.com/search?q=",
+           "--dump-json", "--flat-playlist", "--no-playlist",
+           ] + YTDLP_POT_ARGS + [f"ytsearch{n}:{query}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None, None
+
+    name_words = [w for w in re.findall(r"\w+", expected_name.lower()) if len(w) > 2]
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        title = (entry.get("title") or "").lower()
+        duration = entry.get("duration") or 0
+
+        title_ok = expected_name.lower() in title or (
+            name_words and sum(1 for w in name_words if w in title) / len(name_words) >= 0.6)
+        duration_ok = True
+        if expected_duration_sec and duration:
+            duration_ok = abs(duration - expected_duration_sec) <= max(20, expected_duration_sec * 0.25)
+
+        if title_ok and duration_ok:
+            return entry.get("webpage_url") or entry.get("url"), entry.get("title")
+    return None, None
 
 BAD_ALBUM_VALUES = {"", "unknown album"}
 
@@ -595,16 +634,25 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
         if skip:
             continue
 
+        query = f"{primary_artist(track['artist'])} - {track['name']} audio"
+        expected_duration_sec = (track.get('duration_ms') or 0) / 1000
+        video_url, _matched_title = find_best_youtube_match(query, track['name'], expected_duration_sec)
+        if not video_url:
+            with job_lock:
+                jobs[job_id]["log"].append(f"✗ No confident match found: {track['artist']} - {track['name']}")
+                jobs[job_id]["failed"] += 1
+            continue
+
         cookies_args = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else []
-        cmd = ["yt-dlp", "--default-search", "https://music.youtube.com/search?q=",
+        cmd = ["yt-dlp",
                "-x", "--audio-format", "flac", "--audio-quality", "0",
                "--add-metadata", "--embed-thumbnail", "--output", out_template,
-               "--no-playlist", "--match-filter", "duration > 60",
+               "--no-playlist",
                "--retries", "1", "--fragment-retries", "1", "--extractor-retries", "1",
                "--concurrent-fragments", "1", "--socket-timeout", "10",
                "--sleep-interval", "2", "--max-sleep-interval", "4",
                "--no-progress", "--print", "before_dl:%(webpage_url)s",
-               ] + YTDLP_POT_ARGS + cookies_args + [f"ytsearch1:{track['artist']} - {track['name']} audio"]
+               ] + YTDLP_POT_ARGS + cookies_args + [video_url]
 
         rc, killed, stdout = run_yt_dlp(cmd, job_id, f"{track['artist']} - {track['name']}", timeout=30)
 

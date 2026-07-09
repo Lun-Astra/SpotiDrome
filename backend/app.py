@@ -313,10 +313,7 @@ def nd_sync_playlist(playlist_name, tracks, cfg, job_id=None):
     pl_id, created = nd_get_or_create_playlist(playlist_name, cfg)
     for i in range(0, len(song_ids), 50):
         batch = song_ids[i:i+50]
-        params = {"playlistId": pl_id}
-        for j, sid in enumerate(batch):
-            params[f"songIdToAdd[{j}]"] = sid
-        nd_subsonic("updatePlaylist", cfg=cfg, **params)
+        nd_subsonic("updatePlaylist", cfg=cfg, playlistId=pl_id, songIdToAdd=batch)
     log(f"✅ {'Created' if created else 'Updated'} playlist '{playlist_name}' — {len(song_ids)} tracks")
     if not_found:
         log(f"⚠ {len(not_found)} track(s) not matched")

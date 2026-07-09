@@ -50,10 +50,7 @@ def get_playlist_songs(cfg, playlist_id):
 def add_songs(cfg, playlist_id, song_ids):
     for i in range(0, len(song_ids), BATCH_SIZE):
         batch = song_ids[i:i + BATCH_SIZE]
-        params = {"playlistId": playlist_id}
-        for j, sid in enumerate(batch):
-            params[f"songIdToAdd[{j}]"] = sid
-        subsonic(cfg, "updatePlaylist", **params)
+        subsonic(cfg, "updatePlaylist", playlistId=playlist_id, songIdToAdd=batch)
 
 
 def delete_playlist(cfg, playlist_id):

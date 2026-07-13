@@ -981,7 +981,11 @@ def auto_sync_worker():
     if not tracked:
         print("[auto-sync] No tracked playlists, skipping.")
         return
-    sp, _ = get_sp()
+    try:
+        sp, _ = get_sp()
+    except Exception as e:
+        print(f"[auto-sync] Spotify auth failed, skipping Spotify playlists this run: {e}")
+        sp = None
 
     for playlist_id, info in tracked.items():
         playlist_name = info["name"]

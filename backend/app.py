@@ -599,13 +599,15 @@ def _search_yt_dlp(search_term, expected_title, expected_artist, expected_durati
             best, best_score = {"url": url, "title": entry.get("title")}, score
     return best
 
-def find_best_track_source(track):
-    """Try, in order: YouTube Music songs, YouTube Music videos, plain
-    YouTube, SoundCloud. Returns (url, matched_title, provider_label) for the
-    first confident match, or (None, None, None) if nothing qualifies on any
-    provider. Each provider is scored independently on title similarity,
-    artist match, and duration closeness — no provider's result #1 is ever
-    taken blindly."""
+def iter_track_candidates(track):
+    """Yield (url, matched_title, provider_label) candidates across
+    providers, in order: YouTube Music songs, YouTube Music videos, plain
+    YouTube, SoundCloud. Each provider is only queried once the caller keeps
+    asking for more — i.e. once the previous candidate's *download* (not
+    just its search match) has failed — so the common case (first candidate
+    downloads fine) pays no extra search cost. Each candidate is still
+    scored independently on title similarity, artist match, and duration
+    closeness before being yielded; nothing is ever taken blindly."""
     expected_title = track.get("name") or ""
     expected_artist = track.get("artist") or ""
     expected_duration_sec = (track.get("duration_ms") or 0) / 1000
@@ -614,21 +616,19 @@ def find_best_track_source(track):
 
     best = _search_ytmusic(query, "songs", expected_title, expected_artist, expected_duration_sec)
     if best:
-        return f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music"
+        yield f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music"
 
     best = _search_ytmusic(query, "videos", expected_title, expected_artist, expected_duration_sec)
     if best:
-        return f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music (video)"
+        yield f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music (video)"
 
     best = _search_yt_dlp(f"ytsearch8:{query} audio", expected_title, expected_artist, expected_duration_sec)
     if best:
-        return best["url"], best["title"], "YouTube"
+        yield best["url"], best["title"], "YouTube"
 
     best = _search_yt_dlp(f"scsearch8:{query}", expected_title, expected_artist, expected_duration_sec)
     if best:
-        return best["url"], best["title"], "SoundCloud"
-
-    return None, None, None
+        yield best["url"], best["title"], "SoundCloud"
 
 BAD_ALBUM_VALUES = {"", "unknown album"}
 
@@ -751,6 +751,25 @@ def run_yt_dlp(cmd, job_id, label, timeout=30):
     decode = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
     return proc.returncode, None, decode(stdout), decode(stderr)
 
+def _download_via_yt_dlp(video_url, out_template, job_id, label, use_cookies):
+    """Run the actual -x flac download for one candidate URL. PO-token
+    extractor args are YouTube-specific and meaningless (harmlessly ignored)
+    for other extractors, but are gated to YouTube URLs for clarity; cookies
+    are opt-in per attempt so callers can retry the same URL without them."""
+    is_youtube_url = "youtube.com" in video_url or "youtu.be" in video_url
+    pot_args = YTDLP_POT_ARGS if is_youtube_url else []
+    cookies_args = ["--cookies", COOKIES_FILE] if (use_cookies and os.path.exists(COOKIES_FILE)) else []
+    cmd = ["yt-dlp",
+           "-x", "--audio-format", "flac", "--audio-quality", "0",
+           "--add-metadata", "--embed-thumbnail", "--output", out_template,
+           "--no-playlist",
+           "--retries", "1", "--fragment-retries", "1", "--extractor-retries", "1",
+           "--concurrent-fragments", "1", "--socket-timeout", "10",
+           "--sleep-interval", "2", "--max-sleep-interval", "4",
+           "--no-progress", "--print", "before_dl:%(webpage_url)s",
+           ] + pot_args + cookies_args + [video_url]
+    return run_yt_dlp(cmd, job_id, label, timeout=30)
+
 # ─── Spotify download worker ──────────────────────────────────────────────────
 
 def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidrome=True):
@@ -813,68 +832,77 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
         if skip:
             continue
 
-        video_url, _matched_title, provider = find_best_track_source(track)
-        if not video_url:
-            with job_lock:
-                jobs[job_id]["log"].append(
-                    f"✗ No confident match found (tried YouTube Music, YouTube, SoundCloud): "
-                    f"{track['artist']} - {track['name']}")
-                jobs[job_id]["failed"] += 1
-            continue
+        label = f"{track['artist']} - {track['name']}"
+        attempts_tried = []
+        last_reason = None
+        outcome = None  # "success" | "skipped" | None (exhausted)
 
-        is_youtube_url = "youtube.com" in video_url or "youtu.be" in video_url
-        pot_args = YTDLP_POT_ARGS if is_youtube_url else []
-        cookies_args = ["--cookies", COOKIES_FILE] if (is_youtube_url and os.path.exists(COOKIES_FILE)) else []
-        cmd = ["yt-dlp",
-               "-x", "--audio-format", "flac", "--audio-quality", "0",
-               "--add-metadata", "--embed-thumbnail", "--output", out_template,
-               "--no-playlist",
-               "--retries", "1", "--fragment-retries", "1", "--extractor-retries", "1",
-               "--concurrent-fragments", "1", "--socket-timeout", "10",
-               "--sleep-interval", "2", "--max-sleep-interval", "4",
-               "--no-progress", "--print", "before_dl:%(webpage_url)s",
-               ] + pot_args + cookies_args + [video_url]
+        for video_url, _matched_title, provider in iter_track_candidates(track):
+            attempts_tried.append(provider)
+            is_youtube_url = "youtube.com" in video_url or "youtu.be" in video_url
+            use_cookies = is_youtube_url and os.path.exists(COOKIES_FILE)
 
-        rc, killed, stdout, stderr = run_yt_dlp(cmd, job_id, f"{track['artist']} - {track['name']}", timeout=30)
+            rc, killed, stdout, stderr = _download_via_yt_dlp(
+                video_url, out_template, job_id, label, use_cookies=use_cookies)
 
-        if killed == "skipped":
-            with job_lock:
-                jobs[job_id]["log"].append(f"⏭ Manually skipped: {track['artist']} - {track['name']}")
-                jobs[job_id]["failed"] += 1
-        elif killed == "timeout":
-            with job_lock:
-                jobs[job_id]["log"].append(f"✗ Timeout (30s, via {provider}): {track['artist']} - {track['name']}")
-                jobs[job_id]["failed"] += 1
-        elif rc == 0:
-            flac_path = out_template.replace('.%(ext)s', '.flac')
-            if not os.path.exists(flac_path):
+            # A stale/mismatched cookies.txt causing an outright 403 is a known
+            # failure mode — retry the same candidate once without cookies
+            # before giving up on it.
+            if use_cookies and killed is None and rc != 0 and "403" in (stderr or ""):
                 with job_lock:
-                    jobs[job_id]["log"].append(f"✗ Failed (file missing after download): {track['artist']} - {track['name']}")
-                    jobs[job_id]["failed"] += 1
+                    jobs[job_id]["log"].append(f"↻ Retrying without cookies after 403: {label}")
+                rc, killed, stdout, stderr = _download_via_yt_dlp(
+                    video_url, out_template, job_id, label, use_cookies=False)
+
+            if killed == "skipped":
+                outcome = "skipped"
+                break
+            if killed == "timeout":
+                last_reason = f"timeout after 30s via {provider}"
                 continue
-            source_url = extract_resolved_url(stdout)
-            track["source_url"] = source_url
-            fix_tags(flac_path, track['name'], track['artist'], track['album'],
-                     album_artist=track.get('album_artist'), source_url=source_url)
-            new_album, flac_path = maybe_correct_album(
-                flac_path, track['name'], track['artist'], track['album'],
-                playlist_name, source_url, local_dir, album_artist=track.get('album_artist'))
-            if new_album != track['album']:
+            if rc == 0:
+                flac_path = out_template.replace('.%(ext)s', '.flac')
+                if not os.path.exists(flac_path):
+                    last_reason = f"file missing after download, via {provider}"
+                    continue
+                source_url = extract_resolved_url(stdout)
+                track["source_url"] = source_url
+                fix_tags(flac_path, track['name'], track['artist'], track['album'],
+                         album_artist=track.get('album_artist'), source_url=source_url)
+                new_album, flac_path = maybe_correct_album(
+                    flac_path, track['name'], track['artist'], track['album'],
+                    playlist_name, source_url, local_dir, album_artist=track.get('album_artist'))
+                if new_album != track['album']:
+                    with job_lock:
+                        jobs[job_id]["log"].append(f"🏷 Corrected album: {track['album']} → {new_album}")
+                    track['album'] = new_album
+                newly_downloaded.append(track)
+                all_synced_tracks.append(track)
                 with job_lock:
-                    jobs[job_id]["log"].append(f"🏷 Corrected album: {track['album']} → {new_album}")
-                track['album'] = new_album
-            newly_downloaded.append(track)
-            all_synced_tracks.append(track)
+                    jobs[job_id]["log"].append(f"✓ Downloaded via {provider}: {label}")
+                    jobs[job_id]["downloaded"] += 1
+                if len(newly_downloaded) % 50 == 0 and ssh_cfg:
+                    batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(all_synced_tracks), job_id)
+                    newly_downloaded.clear()
+                outcome = "success"
+                break
+            else:
+                last_reason = f"{_extract_yt_dlp_error(stderr) or f'yt-dlp exited with code {rc}'}, via {provider}"
+                continue
+
+        if outcome == "skipped":
             with job_lock:
-                jobs[job_id]["log"].append(f"✓ Downloaded via {provider}: {track['artist']} - {track['name']}")
-                jobs[job_id]["downloaded"] += 1
-            if len(newly_downloaded) % 50 == 0 and ssh_cfg:
-                batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(all_synced_tracks), job_id)
-                newly_downloaded.clear()
-        else:
-            reason = _extract_yt_dlp_error(stderr) or f"yt-dlp exited with code {rc}"
+                jobs[job_id]["log"].append(f"⏭ Manually skipped: {label}")
+                jobs[job_id]["failed"] += 1
+        elif outcome != "success":
             with job_lock:
-                jobs[job_id]["log"].append(f"✗ Failed ({reason}, via {provider}): {track['artist']} - {track['name']}")
+                if not attempts_tried:
+                    jobs[job_id]["log"].append(
+                        f"✗ No confident match found (tried YouTube Music, YouTube, SoundCloud): {label}")
+                else:
+                    jobs[job_id]["log"].append(
+                        f"✗ Failed after {len(attempts_tried)} source(s) tried "
+                        f"[{', '.join(attempts_tried)}] — last error: {last_reason}: {label}")
                 jobs[job_id]["failed"] += 1
 
     if playlist_id and all_synced_tracks:
@@ -1037,19 +1065,30 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
         if skip:
             continue
 
-        cookies_args = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else []
-        cmd = ["yt-dlp",
-               "-x", "--audio-format", "flac", "--audio-quality", "0",
-               "--add-metadata", "--embed-thumbnail",
-               "--output", out_template,
-               "--no-playlist" if not is_playlist else "--yes-playlist",
-               "--retries", "1", "--fragment-retries", "1", "--extractor-retries", "1",
-               "--concurrent-fragments", "1", "--socket-timeout", "10",
-               "--sleep-interval", "2", "--max-sleep-interval", "4",
-               "--no-progress",
-               ] + YTDLP_POT_ARGS + cookies_args + [track_url]
+        def _yt_music_download_cmd(use_cookies):
+            cookies_args = ["--cookies", COOKIES_FILE] if (use_cookies and os.path.exists(COOKIES_FILE)) else []
+            return ["yt-dlp",
+                    "-x", "--audio-format", "flac", "--audio-quality", "0",
+                    "--add-metadata", "--embed-thumbnail",
+                    "--output", out_template,
+                    "--no-playlist" if not is_playlist else "--yes-playlist",
+                    "--retries", "1", "--fragment-retries", "1", "--extractor-retries", "1",
+                    "--concurrent-fragments", "1", "--socket-timeout", "10",
+                    "--sleep-interval", "2", "--max-sleep-interval", "4",
+                    "--no-progress",
+                    ] + YTDLP_POT_ARGS + cookies_args + [track_url]
 
-        rc, killed, _stdout, stderr = run_yt_dlp(cmd, job_id, f"{artist} - {title}", timeout=30)
+        used_cookies = os.path.exists(COOKIES_FILE)
+        rc, killed, _stdout, stderr = run_yt_dlp(
+            _yt_music_download_cmd(used_cookies), job_id, f"{artist} - {title}", timeout=30)
+
+        # A stale/mismatched cookies.txt causing an outright 403 is a known
+        # failure mode — retry once without cookies before giving up.
+        if used_cookies and killed is None and rc != 0 and "403" in (stderr or ""):
+            with job_lock:
+                jobs[job_id]["log"].append(f"↻ Retrying without cookies after 403: {artist} - {title}")
+            rc, killed, _stdout, stderr = run_yt_dlp(
+                _yt_music_download_cmd(False), job_id, f"{artist} - {title}", timeout=30)
 
         if killed == "skipped":
             with job_lock:

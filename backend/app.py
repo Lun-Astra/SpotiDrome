@@ -1,5 +1,6 @@
-import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex
+import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import requests as http
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -7,6 +8,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, COMM, error as ID3Error
+from ytmusicapi import YTMusic
 
 app = Flask(__name__)
 CORS(app)
@@ -435,21 +437,155 @@ def extract_resolved_url(stdout):
             return line
     return None
 
-def find_best_youtube_match(query, expected_name, expected_duration_sec, n=5, timeout=20):
-    """Search YouTube and return (webpage_url, title) for the first candidate
-    whose title plausibly matches expected_name and whose duration is close
-    to expected_duration_sec. Returns (None, None) if nothing qualifies."""
-    cmd = ["yt-dlp", "--default-search", "https://music.youtube.com/search?q=",
-           "--dump-json", "--flat-playlist", "--no-playlist",
-           ] + YTDLP_POT_ARGS + [f"ytsearch{n}:{query}"]
+# ─── Track matching (multi-provider search) ──────────────────────────────────
+# Order matters: YouTube Music's own "songs" category is queried first because
+# it is YouTube's *own* classification of a result as an actual released track —
+# podcasts, episodes, reactions, etc. simply cannot appear there, unlike a plain
+# YouTube search or a generic ytsearch against music.youtube.com's search page
+# (the old approach), which mixes every content type together and relied on
+# fragile title-text heuristics to sort music from everything else.
+
+NOT_MUSIC_KEYWORDS = (
+    "podcast", "episode", "interview", "reaction", "react to", "review",
+    "breakdown", "explained", "documentary", "trailer", "teaser",
+    "behind the scenes", "tier list", "top 10", "top ten", "compilation",
+    "let's play", "gameplay", "unboxing", "vlog", "asmr", "full episode",
+)
+
+YTMUSIC_OFFICIAL_VIDEO_TYPES = {"MUSIC_VIDEO_TYPE_ATV", "MUSIC_VIDEO_TYPE_OMV"}
+
+_ytmusic_client = None
+_ytmusic_disabled = False
+
+def _get_ytmusic():
+    """Lazily construct a shared YTMusic client. If construction ever fails
+    (e.g. no network at startup), disable it for the rest of the process
+    instead of retrying on every single track."""
+    global _ytmusic_client, _ytmusic_disabled
+    if _ytmusic_disabled:
+        return None
+    if _ytmusic_client is None:
+        try:
+            _ytmusic_client = YTMusic()
+        except Exception as e:
+            print(f"[ytmusic] init failed, disabling YT Music search: {e}", file=sys.stderr)
+            _ytmusic_disabled = True
+            return None
+    return _ytmusic_client
+
+def _normalize_title(s):
+    s = (s or "").lower()
+    s = re.sub(r"\(feat\.?[^)]*\)|\[feat\.?[^\]]*\]", "", s)
+    s = re.sub(r"\((remaster(ed)?[^)]*|official[^)]*|lyric[^)]*|audio)\)", "", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _title_ok(candidate_title, expected_title):
+    cand_n = _normalize_title(candidate_title)
+    exp_n = _normalize_title(expected_title)
+    if not exp_n or not cand_n:
+        return False
+    if exp_n in cand_n:
+        return True
+    if difflib.SequenceMatcher(None, cand_n, exp_n).ratio() >= 0.72:
+        return True
+    words = [w for w in exp_n.split() if len(w) > 2]
+    return bool(words) and sum(1 for w in words if w in cand_n) / len(words) >= 0.6
+
+def _artist_ok(candidate_names, expected_artist):
+    """candidate_names: list of strings that might contain the artist name
+    (channel/uploader name, and/or the candidate title itself, since plain
+    YouTube uploads often encode the artist only in the title)."""
+    expected_tokens = [t.strip().lower() for t in
+                        re.split(r",|&|/| x | vs\.? | feat\.?| featuring ", expected_artist or "")
+                        if t.strip()]
+    if not expected_tokens:
+        return True
+    haystack = " | ".join(re.sub(r"\s*-\s*topic$", "", (n or "").lower()) for n in candidate_names)
+    for tok in expected_tokens:
+        if tok in haystack:
+            return True
+        for part in haystack.split(" | "):
+            if part and difflib.SequenceMatcher(None, tok, part).ratio() >= 0.8:
+                return True
+    return False
+
+def _looks_like_non_music(candidate_title, expected_title):
+    cand_l = (candidate_title or "").lower()
+    exp_l = (expected_title or "").lower()
+    return any(kw in cand_l and kw not in exp_l for kw in NOT_MUSIC_KEYWORDS)
+
+def _duration_close(candidate_sec, expected_sec, pct=0.15, floor=15):
+    if not expected_sec:
+        return True  # nothing to compare against — don't penalize
+    if not candidate_sec:
+        return False  # we DO have an expected duration; an unknown one is not "close enough"
+    return abs(candidate_sec - expected_sec) <= max(floor, expected_sec * pct)
+
+def _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec):
+    title = entry.get("title") or ""
+    artists = [a.get("name", "") for a in (entry.get("artists") or [])]
+    duration_sec = entry.get("duration_seconds") or 0
+    if _looks_like_non_music(title, expected_title):
+        return None
+    if not _title_ok(title, expected_title):
+        return None
+    if not _artist_ok(artists, expected_artist):
+        return None
+    if not _duration_close(duration_sec, expected_duration_sec):
+        return None
+    score = difflib.SequenceMatcher(None, _normalize_title(title), _normalize_title(expected_title)).ratio()
+    if entry.get("videoType") in YTMUSIC_OFFICIAL_VIDEO_TYPES:
+        score += 0.15
+    return score
+
+def _score_generic_entry(entry, expected_title, expected_artist, expected_duration_sec):
+    title = entry.get("title") or ""
+    channel = entry.get("channel") or entry.get("uploader") or ""
+    duration_sec = entry.get("duration") or 0
+    if _looks_like_non_music(title, expected_title):
+        return None
+    if not _title_ok(title, expected_title):
+        return None
+    if not _artist_ok([channel, title], expected_artist):
+        return None
+    if not _duration_close(duration_sec, expected_duration_sec):
+        return None
+    return difflib.SequenceMatcher(None, _normalize_title(title), _normalize_title(expected_title)).ratio()
+
+def _search_ytmusic(query, filter_type, expected_title, expected_artist, expected_duration_sec,
+                     limit=8, timeout=15):
+    ytm = _get_ytmusic()
+    if not ytm:
+        return None
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(ytm.search, query, filter=filter_type, limit=limit)
+        results = future.result(timeout=timeout)
+    except Exception:
+        return None
+    finally:
+        executor.shutdown(wait=False)
+
+    best, best_score = None, 0.0
+    for entry in results or []:
+        score = _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec)
+        if score is not None and score > best_score:
+            best, best_score = entry, score
+    return best
+
+def _search_yt_dlp(search_term, expected_title, expected_artist, expected_duration_sec, timeout=20):
+    pot_args = YTDLP_POT_ARGS if search_term.startswith("ytsearch") else []
+    cmd = ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist"] + pot_args + [search_term]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, None
+        return None
     if result.returncode != 0 or not result.stdout.strip():
-        return None, None
+        return None
 
-    name_words = [w for w in re.findall(r"\w+", expected_name.lower()) if len(w) > 2]
+    best, best_score = None, 0.0
     for line in result.stdout.strip().split("\n"):
         if not line.strip():
             continue
@@ -457,18 +593,42 @@ def find_best_youtube_match(query, expected_name, expected_duration_sec, n=5, ti
             entry = json.loads(line)
         except Exception:
             continue
-        title = (entry.get("title") or "").lower()
-        duration = entry.get("duration") or 0
+        score = _score_generic_entry(entry, expected_title, expected_artist, expected_duration_sec)
+        if score is not None and score > best_score:
+            url = entry.get("webpage_url") or entry.get("url")
+            best, best_score = {"url": url, "title": entry.get("title")}, score
+    return best
 
-        title_ok = expected_name.lower() in title or (
-            name_words and sum(1 for w in name_words if w in title) / len(name_words) >= 0.6)
-        duration_ok = True
-        if expected_duration_sec and duration:
-            duration_ok = abs(duration - expected_duration_sec) <= max(20, expected_duration_sec * 0.25)
+def find_best_track_source(track):
+    """Try, in order: YouTube Music songs, YouTube Music videos, plain
+    YouTube, SoundCloud. Returns (url, matched_title, provider_label) for the
+    first confident match, or (None, None, None) if nothing qualifies on any
+    provider. Each provider is scored independently on title similarity,
+    artist match, and duration closeness — no provider's result #1 is ever
+    taken blindly."""
+    expected_title = track.get("name") or ""
+    expected_artist = track.get("artist") or ""
+    expected_duration_sec = (track.get("duration_ms") or 0) / 1000
+    artist_for_query = primary_artist(expected_artist)
+    query = f"{artist_for_query} {expected_title}".strip()
 
-        if title_ok and duration_ok:
-            return entry.get("webpage_url") or entry.get("url"), entry.get("title")
-    return None, None
+    best = _search_ytmusic(query, "songs", expected_title, expected_artist, expected_duration_sec)
+    if best:
+        return f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music"
+
+    best = _search_ytmusic(query, "videos", expected_title, expected_artist, expected_duration_sec)
+    if best:
+        return f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music (video)"
+
+    best = _search_yt_dlp(f"ytsearch8:{query} audio", expected_title, expected_artist, expected_duration_sec)
+    if best:
+        return best["url"], best["title"], "YouTube"
+
+    best = _search_yt_dlp(f"scsearch8:{query}", expected_title, expected_artist, expected_duration_sec)
+    if best:
+        return best["url"], best["title"], "SoundCloud"
+
+    return None, None, None
 
 BAD_ALBUM_VALUES = {"", "unknown album"}
 
@@ -637,16 +797,18 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
         if skip:
             continue
 
-        query = f"{primary_artist(track['artist'])} - {track['name']} audio"
-        expected_duration_sec = (track.get('duration_ms') or 0) / 1000
-        video_url, _matched_title = find_best_youtube_match(query, track['name'], expected_duration_sec)
+        video_url, _matched_title, provider = find_best_track_source(track)
         if not video_url:
             with job_lock:
-                jobs[job_id]["log"].append(f"✗ No confident match found: {track['artist']} - {track['name']}")
+                jobs[job_id]["log"].append(
+                    f"✗ No confident match found (tried YouTube Music, YouTube, SoundCloud): "
+                    f"{track['artist']} - {track['name']}")
                 jobs[job_id]["failed"] += 1
             continue
 
-        cookies_args = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else []
+        is_youtube_url = "youtube.com" in video_url or "youtu.be" in video_url
+        pot_args = YTDLP_POT_ARGS if is_youtube_url else []
+        cookies_args = ["--cookies", COOKIES_FILE] if (is_youtube_url and os.path.exists(COOKIES_FILE)) else []
         cmd = ["yt-dlp",
                "-x", "--audio-format", "flac", "--audio-quality", "0",
                "--add-metadata", "--embed-thumbnail", "--output", out_template,
@@ -655,7 +817,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                "--concurrent-fragments", "1", "--socket-timeout", "10",
                "--sleep-interval", "2", "--max-sleep-interval", "4",
                "--no-progress", "--print", "before_dl:%(webpage_url)s",
-               ] + YTDLP_POT_ARGS + cookies_args + [video_url]
+               ] + pot_args + cookies_args + [video_url]
 
         rc, killed, stdout = run_yt_dlp(cmd, job_id, f"{track['artist']} - {track['name']}", timeout=30)
 
@@ -688,7 +850,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
             newly_downloaded.append(track)
             all_synced_tracks.append(track)
             with job_lock:
-                jobs[job_id]["log"].append(f"✓ Downloaded: {track['artist']} - {track['name']}")
+                jobs[job_id]["log"].append(f"✓ Downloaded via {provider}: {track['artist']} - {track['name']}")
                 jobs[job_id]["downloaded"] += 1
             if len(newly_downloaded) % 50 == 0 and ssh_cfg:
                 batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(all_synced_tracks), job_id)

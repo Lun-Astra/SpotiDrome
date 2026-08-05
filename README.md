@@ -5,6 +5,7 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
 ## Features
 
 - **Spotify playlist sync** — authenticate with Spotify, browse your playlists, download any of them as FLAC.
+- **Multi-provider matching** — each track is searched against YouTube Music's own "Songs" catalog first (so podcasts/episodes/reactions can never be picked, since YouTube Music itself excludes them from that category), then YouTube Music's "Videos" category, then a plain YouTube search, then SoundCloud — falling through providers until a candidate's title, artist, and duration all plausibly match. Nothing is ever taken as "result #1" on blind faith.
 - **YouTube Music support** — paste a track, album, or playlist URL directly.
 - **Automatic Navidrome sync** — after each download, triggers a library scan and creates/updates a matching playlist in Navidrome via the Subsonic API.
 - **Scheduled auto-sync** — tracked playlists re-sync automatically on a daily or interval schedule, downloading only new tracks.

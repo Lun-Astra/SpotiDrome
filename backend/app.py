@@ -679,6 +679,21 @@ def reap_zombies():
     except ChildProcessError:
         pass
 
+def _extract_yt_dlp_error(stderr):
+    """Pull the most useful single-line reason out of yt-dlp's stderr — the
+    last 'ERROR:' line if there is one (that's yt-dlp's own summary of why it
+    gave up), else the last non-empty line of output. Returns None if stderr
+    is empty."""
+    if not stderr:
+        return None
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    if not lines:
+        return None
+    error_lines = [l for l in lines if l.startswith("ERROR:")]
+    reason = error_lines[-1] if error_lines else lines[-1]
+    reason = re.sub(r"^ERROR:\s*", "", reason)
+    return reason[:200]
+
 def run_yt_dlp(cmd, job_id, label, timeout=30):
     """
     Run a yt-dlp command with:
@@ -686,7 +701,7 @@ def run_yt_dlp(cmd, job_id, label, timeout=30):
     - Hard wall-clock deadline
     - Skip flag support
     - Full process group kill on timeout/skip
-    Returns (returncode, killed_reason, stdout) where killed_reason is None on success
+    Returns (returncode, killed_reason, stdout, stderr) where killed_reason is None on success
     """
     def _set_limits():
         os.setsid()
@@ -722,7 +737,7 @@ def run_yt_dlp(cmd, job_id, label, timeout=30):
                 pass
         proc.wait()
         reap_zombies()
-        return None, killed_reason, ""
+        return None, killed_reason, "", ""
 
     # Process finished naturally
     try:
@@ -730,10 +745,11 @@ def run_yt_dlp(cmd, job_id, label, timeout=30):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        return None, "timeout", ""
+        return None, "timeout", "", ""
 
     reap_zombies()
-    return proc.returncode, None, (stdout.decode("utf-8", "replace") if isinstance(stdout, bytes) else (stdout or ""))
+    decode = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+    return proc.returncode, None, decode(stdout), decode(stderr)
 
 # ─── Spotify download worker ──────────────────────────────────────────────────
 
@@ -819,7 +835,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                "--no-progress", "--print", "before_dl:%(webpage_url)s",
                ] + pot_args + cookies_args + [video_url]
 
-        rc, killed, stdout = run_yt_dlp(cmd, job_id, f"{track['artist']} - {track['name']}", timeout=30)
+        rc, killed, stdout, stderr = run_yt_dlp(cmd, job_id, f"{track['artist']} - {track['name']}", timeout=30)
 
         if killed == "skipped":
             with job_lock:
@@ -827,7 +843,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 jobs[job_id]["failed"] += 1
         elif killed == "timeout":
             with job_lock:
-                jobs[job_id]["log"].append(f"✗ Timeout: {track['artist']} - {track['name']}")
+                jobs[job_id]["log"].append(f"✗ Timeout (30s, via {provider}): {track['artist']} - {track['name']}")
                 jobs[job_id]["failed"] += 1
         elif rc == 0:
             flac_path = out_template.replace('.%(ext)s', '.flac')
@@ -856,8 +872,9 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(all_synced_tracks), job_id)
                 newly_downloaded.clear()
         else:
+            reason = _extract_yt_dlp_error(stderr) or f"yt-dlp exited with code {rc}"
             with job_lock:
-                jobs[job_id]["log"].append(f"✗ Failed: {track['artist']} - {track['name']}")
+                jobs[job_id]["log"].append(f"✗ Failed ({reason}, via {provider}): {track['artist']} - {track['name']}")
                 jobs[job_id]["failed"] += 1
 
     if playlist_id and all_synced_tracks:
@@ -1032,7 +1049,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                "--no-progress",
                ] + YTDLP_POT_ARGS + cookies_args + [track_url]
 
-        rc, killed, _stdout = run_yt_dlp(cmd, job_id, f"{artist} - {title}", timeout=30)
+        rc, killed, _stdout, stderr = run_yt_dlp(cmd, job_id, f"{artist} - {title}", timeout=30)
 
         if killed == "skipped":
             with job_lock:
@@ -1040,7 +1057,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 jobs[job_id]["failed"] += 1
         elif killed == "timeout":
             with job_lock:
-                jobs[job_id]["log"].append(f"✗ Timeout: {artist} - {title}")
+                jobs[job_id]["log"].append(f"✗ Timeout (30s): {artist} - {title}")
                 jobs[job_id]["failed"] += 1
         elif rc == 0:
             flac_path = out_template.replace(".%(ext)s", ".flac")
@@ -1065,8 +1082,9 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
             if len(downloaded_tracks) % 50 == 0 and ssh_cfg:
                 batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(downloaded_tracks), job_id)
         else:
+            reason = _extract_yt_dlp_error(stderr) or f"yt-dlp exited with code {rc}"
             with job_lock:
-                jobs[job_id]["log"].append(f"✗ Failed: {artist} - {title}")
+                jobs[job_id]["log"].append(f"✗ Failed ({reason}): {artist} - {title}")
                 jobs[job_id]["failed"] += 1
 
     if is_playlist and yt_track_list:

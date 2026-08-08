@@ -14,9 +14,13 @@ app = Flask(__name__)
 CORS(app)
 
 DOWNLOAD_DIR          = "/downloads"
-YTDLP_POT_ARGS        = ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://bgutil-pot:4416",
-                          "--extractor-args", "youtube:player_client=mweb",
-                          "--remote-components", "ejs:github"]
+
+def _pot_args_for_client(player_client):
+    return ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://bgutil-pot:4416",
+            "--extractor-args", f"youtube:player_client={player_client}",
+            "--remote-components", "ejs:github"]
+
+YTDLP_POT_ARGS        = _pot_args_for_client("mweb")
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8080/callback")
@@ -833,13 +837,18 @@ def run_yt_dlp(cmd, job_id, label, timeout=30):
     decode = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
     return proc.returncode, None, decode(stdout), decode(stderr)
 
-def _download_via_yt_dlp(video_url, out_template, job_id, label, use_cookies):
+def _download_via_yt_dlp(video_url, out_template, job_id, label, use_cookies, player_client=None):
     """Run the actual -x flac download for one candidate URL. PO-token
     extractor args are YouTube-specific and meaningless (harmlessly ignored)
     for other extractors, but are gated to YouTube URLs for clarity; cookies
-    are opt-in per attempt so callers can retry the same URL without them."""
+    are opt-in per attempt so callers can retry the same URL without them.
+    player_client overrides the default 'mweb' client (see the android-client
+    fallback in download_worker for why that's ever needed)."""
     is_youtube_url = "youtube.com" in video_url or "youtu.be" in video_url
-    pot_args = YTDLP_POT_ARGS if is_youtube_url else []
+    if is_youtube_url:
+        pot_args = _pot_args_for_client(player_client) if player_client else YTDLP_POT_ARGS
+    else:
+        pot_args = []
     cookies_args = ["--cookies", COOKIES_FILE] if (use_cookies and os.path.exists(COOKIES_FILE)) else []
     cmd = ["yt-dlp",
            "-x", "--audio-format", "flac", "--audio-quality", "0",
@@ -942,6 +951,22 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 rc, killed, stdout, stderr = _download_via_yt_dlp(
                     video_url, out_template, job_id, label, use_cookies=False)
 
+            # YouTube's mweb client is increasingly hit with a probabilistic 403
+            # on the actual media fetch, independent of cookies, as part of its
+            # ongoing anti-bot enforcement — same video, same everything, just
+            # fails sometimes. Last resort before giving up on this candidate:
+            # retry via the android client, which reliably routes around it —
+            # at the cost of a real quality drop (legacy itag 18, ~96kbps AAC)
+            # since android's proper adaptive audio streams are themselves
+            # currently blocked by a separate YouTube-side SABR restriction.
+            used_android_fallback = False
+            if is_youtube_url and killed is None and rc != 0 and "403" in (stderr or ""):
+                used_android_fallback = True
+                with job_lock:
+                    jobs[job_id]["log"].append(f"↻ Retrying via android client (lower quality) after repeated 403: {label}")
+                rc, killed, stdout, stderr = _download_via_yt_dlp(
+                    video_url, out_template, job_id, label, use_cookies=False, player_client="android")
+
             if killed == "skipped":
                 outcome = "skipped"
                 break
@@ -968,8 +993,9 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 newly_downloaded.append(track)
                 all_synced_tracks.append(track)
                 clear_failed_track(track['artist'], track['name'])
+                quality_note = " ⚠ lower quality (android fallback)" if used_android_fallback else ""
                 with job_lock:
-                    jobs[job_id]["log"].append(f"✓ Downloaded via {provider}: {label}")
+                    jobs[job_id]["log"].append(f"✓ Downloaded via {provider}{quality_note}: {label}")
                     jobs[job_id]["downloaded"] += 1
                 if len(newly_downloaded) % 50 == 0 and ssh_cfg:
                     batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(all_synced_tracks), job_id)
@@ -1165,8 +1191,9 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
         if skip:
             continue
 
-        def _yt_music_download_cmd(use_cookies):
+        def _yt_music_download_cmd(use_cookies, player_client=None):
             cookies_args = ["--cookies", COOKIES_FILE] if (use_cookies and os.path.exists(COOKIES_FILE)) else []
+            pot_args = _pot_args_for_client(player_client) if player_client else YTDLP_POT_ARGS
             return ["yt-dlp",
                     "-x", "--audio-format", "flac", "--audio-quality", "0",
                     "--add-metadata", "--embed-thumbnail",
@@ -1176,7 +1203,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                     "--concurrent-fragments", "1", "--socket-timeout", "10",
                     "--sleep-interval", "2", "--max-sleep-interval", "4",
                     "--no-progress",
-                    ] + YTDLP_POT_ARGS + cookies_args + [track_url]
+                    ] + pot_args + cookies_args + [track_url]
 
         used_cookies = os.path.exists(COOKIES_FILE)
         rc, killed, _stdout, stderr = run_yt_dlp(
@@ -1189,6 +1216,17 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 jobs[job_id]["log"].append(f"↻ Retrying without cookies after 403: {artist} - {title}")
             rc, killed, _stdout, stderr = run_yt_dlp(
                 _yt_music_download_cmd(False), job_id, f"{artist} - {title}", timeout=30)
+
+        # Same probabilistic mweb 403 as the Spotify path — last resort before
+        # giving up, retry via the android client (lower audio quality, but
+        # far more likely to succeed; see download_worker for the full story).
+        used_android_fallback = False
+        if killed is None and rc != 0 and "403" in (stderr or ""):
+            used_android_fallback = True
+            with job_lock:
+                jobs[job_id]["log"].append(f"↻ Retrying via android client (lower quality) after repeated 403: {artist} - {title}")
+            rc, killed, _stdout, stderr = run_yt_dlp(
+                _yt_music_download_cmd(False, player_client="android"), job_id, f"{artist} - {title}", timeout=30)
 
         failed_track_stub = {"artist": artist, "name": title, "album": album,
                               "album_artist": None, "duration_ms": 0}
@@ -1223,8 +1261,9 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
             downloaded_tracks.append(t)
             yt_track_list.append(t)
             clear_failed_track(artist, title)
+            quality_note = " ⚠ lower quality (android fallback)" if used_android_fallback else ""
             with job_lock:
-                jobs[job_id]["log"].append(f"✓ Downloaded: {artist} - {title}")
+                jobs[job_id]["log"].append(f"✓ Downloaded{quality_note}: {artist} - {title}")
                 jobs[job_id]["downloaded"] += 1
             if len(downloaded_tracks) % 50 == 0 and ssh_cfg:
                 batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(downloaded_tracks), job_id)
@@ -2152,6 +2191,14 @@ def retry_failed_track():
         rc, killed, stdout, stderr = _download_via_yt_dlp(
             url, out_template, tmp_job_id, f"{artist} - {title}", use_cookies=False)
 
+    used_android_fallback = False
+    if is_youtube_url and killed is None and rc != 0 and "403" in (stderr or ""):
+        used_android_fallback = True
+        with job_lock:
+            jobs[tmp_job_id]["log"].append("↻ Retrying via android client (lower quality) after repeated 403")
+        rc, killed, stdout, stderr = _download_via_yt_dlp(
+            url, out_template, tmp_job_id, f"{artist} - {title}", use_cookies=False, player_client="android")
+
     with job_lock:
         jobs[tmp_job_id]["status"] = "done"
 
@@ -2192,6 +2239,8 @@ def retry_failed_track():
 
     message = f"Downloaded (album: {new_album})"
     message += " and synced to Navidrome" if synced_to_navidrome else " — no SSH configured, file left in local storage"
+    if used_android_fallback:
+        message += " — ⚠ lower quality (android fallback after repeated YouTube 403s)"
     return jsonify({"success": True, "message": message})
 
 # ─── Sync health routes ────────────────────────────────────────────────────────

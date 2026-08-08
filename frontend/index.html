@@ -420,17 +420,6 @@ header{
           <button class="btn btn-primary" onclick="saveCookies()">Save Cookies</button>
         </div>
       </div>
-      <div style="height:1px;background:var(--border);margin:4px 0"></div>
-      <div class="settings-sec" style="margin-top:12px">
-        <div class="settings-sec-title">Library</div>
-        <div class="settings-row">
-          <div><div class="settings-label">Relabel genres</div><div class="settings-sub">Look up each artist's real genre on Spotify and rewrite just that tag on every existing track — in place on the Navidrome host, nothing is re-downloaded or otherwise touched.</div></div>
-        </div>
-        <div style="display:flex;justify-content:flex-end;margin-top:8px">
-          <button class="btn btn-nd" id="btn-relabel-genres" onclick="relabelGenres()">🏷 Relabel All Genres</button>
-        </div>
-        <div class="field-hint" style="margin-top:6px">Progress shows up in the Download Jobs panel like any other job.</div>
-      </div>
     </div>
   </div>
 </div>
@@ -527,6 +516,10 @@ header{
           </div>
           <div id="health-list"><div class="empty" style="padding:14px">Loading…</div></div>
           <div class="health-dup-line" id="health-dup-line">Duplicate sweep: no run yet</div>
+          <div class="health-dup-line" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+            <span>Relabel every track's genre from Spotify (falls back to YouTube if Spotify has none) — updates tags in place, nothing is re-downloaded.</span>
+            <button class="btn btn-nd" id="btn-relabel-genres" onclick="relabelGenres()" style="flex-shrink:0">🏷 Relabel Genres</button>
+          </div>
         </div>
       </div>
 
@@ -866,14 +859,14 @@ async function saveCookies(){
 async function deleteCookies(){if(!confirm('Remove cookies?'))return;await fetch(`${API}/cookies/delete`,{method:'DELETE'});await loadCookieStatus();}
 
 async function relabelGenres(){
-  if(!confirm('Scan the whole library and relabel genres from Spotify? This can take a while for a large library — progress shows up in Download Jobs.'))return;
+  if(!confirm('Scan the whole library and relabel genres (Spotify, falling back to YouTube)? This can take a while for a large library — progress shows up in Download Jobs.'))return;
   const btn=document.getElementById('btn-relabel-genres');
   btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
   try{
     const r=await fetch(`${API}/library/retag-genres`,{method:'POST'});
     const d=await r.json();
     if(!r.ok){alert('Error: '+(d.error||'Could not start')+(d.auth_url?'\n\nReconnect Spotify first.':''));return;}
-    closeSettingsModal();renderJobs();
+    renderJobs();
   }catch(e){alert('Failed: '+e.message);}
   finally{btn.disabled=false;btn.innerHTML=orig;}
 }

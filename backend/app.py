@@ -464,14 +464,71 @@ def primary_artist(artist):
 _genre_cache = {}
 _genre_cache_lock = threading.Lock()
 
+# Spotify's artist genre data is real but inconsistently populated — plenty
+# of legitimate, popular artists just have an empty genres list, regardless
+# of how well-known they are. When that happens, fall back to checking a
+# matching YouTube Music upload's own video tags for one that IS a genre
+# name — uploaders/labels do sometimes tag their videos with a genre as a
+# standalone keyword (e.g. Billie Eilish's official upload is tagged
+# "Alternative"). This only matches a *whole* tag exactly, never a substring
+# of a longer phrase — freeform tags/descriptions routinely contain ordinary
+# English words like "house" or "soul" with nothing to do with genre (e.g.
+# a Netflix tie-in tag mentioning "The Fall Of The House Of Usher"), and a
+# naive substring search on those is a false-positive machine.
+YT_GENRE_KEYWORDS = {
+    "drum and bass", "drum n bass", "dnb", "death metal", "black metal",
+    "thrash metal", "heavy metal", "nu metal", "metalcore", "deathcore",
+    "hard rock", "soft rock", "hip hop", "hip-hop", "r&b", "rnb", "k-pop",
+    "j-pop", "new age", "synthwave", "lo-fi", "lofi", "drill", "grime",
+    "rock", "pop", "metal", "rap", "soul", "jazz", "blues", "country",
+    "folk", "classical", "electronic", "house", "techno", "trance",
+    "dubstep", "reggae", "ska", "punk", "indie", "alternative", "grunge",
+    "emo", "funk", "disco", "gospel", "ambient", "edm", "garage", "opera",
+    "latin", "soundtrack",
+}
+
+def lookup_genre_from_youtube(artist):
+    """Best-effort fallback genre source when Spotify has nothing for this
+    artist: search YouTube Music for them and check whether any of the top
+    few results has a video tag that IS a genre name. Much noisier than
+    Spotify's own genre taxonomy — most official uploads don't self-tag
+    with genre at all — so this often comes up empty too; that's expected,
+    not a bug."""
+    key = primary_artist(artist).strip()
+    if not key:
+        return None
+    cmd = ["yt-dlp", "--dump-json", "--no-playlist",
+           "--default-search", "https://music.youtube.com/search?q=",
+           f"ytsearch3:{key}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+    except Exception:
+        return None
+
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            info = json.loads(line)
+        except Exception:
+            continue
+        for tag in (info.get("tags") or []):
+            normalized = re.sub(r"[^a-z0-9&\- ]", "", tag.lower()).strip()
+            if normalized in YT_GENRE_KEYWORDS:
+                return normalized.title()
+    return None
+
 def lookup_genre(sp, artist):
     """Look up a real, specific genre (e.g. 'Metal', 'Nu Metal', 'Synthwave')
-    for an artist via Spotify's catalog, since yt-dlp's embedded YouTube
-    metadata just labels every music upload's genre as generic 'Music'.
+    for an artist — Spotify's catalog first, falling back to YouTube's tags
+    when Spotify has nothing — since yt-dlp's embedded YouTube metadata on
+    its own just labels every music upload's genre as generic 'Music'.
     Cached per artist name for the life of the process — most playlists hit
-    the same artist many times over. Returns None if Spotify isn't
-    authenticated or no genre is on file for the artist."""
-    if not sp or not artist:
+    the same artist many times over. Returns None if neither source has
+    anything usable."""
+    if not artist:
         return None
     key = primary_artist(artist).lower()
     if not key:
@@ -480,15 +537,21 @@ def lookup_genre(sp, artist):
         if key in _genre_cache:
             return _genre_cache[key]
     genre = None
-    try:
-        result = sp.search(q=f"artist:{key}", type="artist", limit=1)
-        items = result.get("artists", {}).get("items", [])
-        if items:
-            genres = items[0].get("genres") or []
-            if genres:
-                genre = genres[0].title()
-    except Exception as e:
-        print(f"[genre] lookup failed for {artist!r}: {e}", file=sys.stderr)
+    if sp:
+        try:
+            result = sp.search(q=f"artist:{key}", type="artist", limit=1)
+            items = result.get("artists", {}).get("items", [])
+            if items:
+                genres = items[0].get("genres") or []
+                if genres:
+                    genre = genres[0].title()
+        except Exception as e:
+            print(f"[genre] Spotify lookup failed for {artist!r}: {e}", file=sys.stderr)
+    if not genre:
+        try:
+            genre = lookup_genre_from_youtube(artist)
+        except Exception as e:
+            print(f"[genre] YouTube fallback lookup failed for {artist!r}: {e}", file=sys.stderr)
     with _genre_cache_lock:
         _genre_cache[key] = genre
     return genre

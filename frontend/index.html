@@ -66,6 +66,7 @@ header{
 .dot{width:7px;height:7px;border-radius:50%;background:var(--text3);flex-shrink:0}
 .dot.on{background:var(--nd);box-shadow:0 0 0 2px rgba(139,92,246,.2)}
 .dot.sp-on{background:var(--sp);box-shadow:0 0 0 2px rgba(30,215,96,.2)}
+.dot.err{background:#f87171;box-shadow:0 0 0 2px rgba(248,113,113,.2)}
 .user-pill{display:flex;align-items:center;gap:8px;padding:5px 12px 5px 5px;border-radius:40px;background:var(--bg3);border:1px solid var(--border)}
 .user-pill img{width:26px;height:26px;border-radius:50%;object-fit:cover}
 .user-pill span{font-size:12px;font-weight:500;color:var(--text2)}
@@ -429,6 +430,10 @@ header{
       <span class="sp">Spoti</span><span class="arr">→</span><span class="nd">Drome</span>
     </div>
     <div class="header-right">
+      <a class="pill" href="/failed.html" id="failed-pill" style="text-decoration:none">
+        <div class="dot" id="failed-dot"></div>
+        <span id="failed-pill-label">Failed Downloads</span>
+      </a>
       <div class="pill settings-pill" onclick="openSettingsModal()">⚙ Settings</div>
       <div class="pill" onclick="openScheduleModal()" id="schedule-pill">
         <div class="dot" id="schedule-dot"></div>
@@ -562,10 +567,18 @@ if(code){
 }else{init();}
 
 async function init(){
-  await Promise.all([checkNd(),checkSchedule()]);
+  await Promise.all([checkNd(),checkSchedule(),checkFailed()]);
   const res=await fetch(`${API}/auth/status`),d=await res.json();
-  if(d.authenticated){showMain(d);loadPlaylists();loadYtTracked();loadHealth();setInterval(renderJobs,2500);setInterval(loadYtTracked,10000);setInterval(loadHealth,30000);renderJobs();}
+  if(d.authenticated){showMain(d);loadPlaylists();loadYtTracked();loadHealth();setInterval(renderJobs,2500);setInterval(loadYtTracked,10000);setInterval(loadHealth,30000);setInterval(checkFailed,30000);renderJobs();}
   else{document.getElementById('auth-link').href=d.auth_url;document.getElementById('auth-screen').style.display='flex';}
+}
+
+async function checkFailed(){
+  try{const r=await fetch(`${API}/failed`),items=await r.json();
+    const dot=document.getElementById('failed-dot'),lbl=document.getElementById('failed-pill-label');
+    if(items.length){dot.classList.add('err');lbl.textContent=`Failed Downloads (${items.length})`;}
+    else{dot.classList.remove('err');lbl.textContent='Failed Downloads';}
+  }catch(e){}
 }
 
 async function checkNd(){

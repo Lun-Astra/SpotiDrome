@@ -7,7 +7,7 @@ from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, COMM, error as ID3Error
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, error as ID3Error
 from ytmusicapi import YTMusic
 
 app = Flask(__name__)
@@ -29,6 +29,7 @@ DEAD_LINKS_FILE       = "/root/.ssh/dead_links.json"
 IGNORED_TRACKS_FILE   = "/root/.ssh/ignored_tracks.json"
 DUPLICATE_REPORT_FILE = "/root/.ssh/duplicate_report.json"
 SYNC_HEALTH_FILE      = "/root/.ssh/sync_health.json"
+FAILED_TRACKS_FILE    = "/root/.ssh/failed_tracks.json"
 
 jobs = {}
 job_lock = threading.Lock()
@@ -85,6 +86,51 @@ def save_ignored_tracks(data):
 
 def is_track_ignored(artist, title):
     return track_ignore_key(artist, title) in load_ignored_tracks()
+
+# ─── Failed downloads (manual-retry queue) ──────────────────────────────────
+
+failed_tracks_lock = threading.Lock()
+
+def load_failed_tracks():
+    try:
+        with open(FAILED_TRACKS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_failed_tracks(data):
+    with open(FAILED_TRACKS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def record_failed_track(track, playlist_id, playlist_name, reason):
+    """Remember a track that failed every download attempt, so it can be
+    listed on the Failed Downloads page and retried later with a manually
+    supplied link. Keyed the same way as the permanent-ignore list, so a
+    later successful download or an explicit ignore both naturally
+    supersede it."""
+    key = track_ignore_key(track.get("artist"), track.get("name"))
+    with failed_tracks_lock:
+        data = load_failed_tracks()
+        data[key] = {
+            "artist": track.get("artist"),
+            "name": track.get("name"),
+            "album": track.get("album"),
+            "album_artist": track.get("album_artist"),
+            "duration_ms": track.get("duration_ms", 0),
+            "playlist_id": playlist_id,
+            "playlist_name": playlist_name,
+            "reason": reason,
+            "last_attempt": datetime.utcnow().isoformat(),
+        }
+        save_failed_tracks(data)
+
+def clear_failed_track(artist, name):
+    key = track_ignore_key(artist, name)
+    with failed_tracks_lock:
+        data = load_failed_tracks()
+        if key in data:
+            del data[key]
+            save_failed_tracks(data)
 
 def track_playlist(playlist_id, playlist_name, tracks):
     data = load_tracked()
@@ -402,7 +448,39 @@ def primary_artist(artist):
     """First name in a comma-joined multi-artist string, for search queries."""
     return artist.split(",")[0].strip()
 
-def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None):
+_genre_cache = {}
+_genre_cache_lock = threading.Lock()
+
+def lookup_genre(sp, artist):
+    """Look up a real, specific genre (e.g. 'Metal', 'Nu Metal', 'Synthwave')
+    for an artist via Spotify's catalog, since yt-dlp's embedded YouTube
+    metadata just labels every music upload's genre as generic 'Music'.
+    Cached per artist name for the life of the process — most playlists hit
+    the same artist many times over. Returns None if Spotify isn't
+    authenticated or no genre is on file for the artist."""
+    if not sp or not artist:
+        return None
+    key = primary_artist(artist).lower()
+    if not key:
+        return None
+    with _genre_cache_lock:
+        if key in _genre_cache:
+            return _genre_cache[key]
+    genre = None
+    try:
+        result = sp.search(q=f"artist:{key}", type="artist", limit=1)
+        items = result.get("artists", {}).get("items", [])
+        if items:
+            genres = items[0].get("genres") or []
+            if genres:
+                genre = genres[0].title()
+    except Exception as e:
+        print(f"[genre] lookup failed for {artist!r}: {e}", file=sys.stderr)
+    with _genre_cache_lock:
+        _genre_cache[key] = genre
+    return genre
+
+def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None, genre=None):
     album_artist = album_artist or artist
     try:
         if filepath.endswith('.flac'):
@@ -413,6 +491,8 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None)
             tags["albumartist"] = [album_artist]
             if source_url:
                 tags["comment"] = [source_url]
+            if genre:
+                tags["genre"] = [genre]
             tags.save()
         else:
             try:
@@ -425,6 +505,8 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None)
             tags["TPE2"] = TPE2(encoding=3, text=album_artist)
             if source_url:
                 tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=source_url)
+            if genre:
+                tags["TCON"] = TCON(encoding=3, text=genre)
             tags.save(filepath)
     except Exception as e:
         print(f"Tag fix failed for {filepath}: {e}")
@@ -781,6 +863,12 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
     local_dir = os.path.join(DOWNLOAD_DIR, sanitize(playlist_name))
     os.makedirs(local_dir, exist_ok=True)
 
+    try:  # for genre lookups only — downloads still proceed if Spotify auth is unavailable
+        sp, _ = get_sp()
+    except Exception as e:
+        print(f"[genre] Spotify auth unavailable, skipping genre lookups: {e}", file=sys.stderr)
+        sp = None
+
     all_synced_tracks = []
     newly_downloaded = []
 
@@ -867,8 +955,9 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                     continue
                 source_url = extract_resolved_url(stdout)
                 track["source_url"] = source_url
+                genre = lookup_genre(sp, track['artist'])
                 fix_tags(flac_path, track['name'], track['artist'], track['album'],
-                         album_artist=track.get('album_artist'), source_url=source_url)
+                         album_artist=track.get('album_artist'), source_url=source_url, genre=genre)
                 new_album, flac_path = maybe_correct_album(
                     flac_path, track['name'], track['artist'], track['album'],
                     playlist_name, source_url, local_dir, album_artist=track.get('album_artist'))
@@ -878,6 +967,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                     track['album'] = new_album
                 newly_downloaded.append(track)
                 all_synced_tracks.append(track)
+                clear_failed_track(track['artist'], track['name'])
                 with job_lock:
                     jobs[job_id]["log"].append(f"✓ Downloaded via {provider}: {label}")
                     jobs[job_id]["downloaded"] += 1
@@ -895,10 +985,14 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 jobs[job_id]["log"].append(f"⏭ Manually skipped: {label}")
                 jobs[job_id]["failed"] += 1
         elif outcome != "success":
+            if not attempts_tried:
+                reason = "no confident match found on any provider (tried YouTube Music, YouTube, SoundCloud)"
+            else:
+                reason = f"failed after {len(attempts_tried)} source(s) tried [{', '.join(attempts_tried)}] — {last_reason}"
+            record_failed_track(track, playlist_id, playlist_name, reason)
             with job_lock:
                 if not attempts_tried:
-                    jobs[job_id]["log"].append(
-                        f"✗ No confident match found (tried YouTube Music, YouTube, SoundCloud): {label}")
+                    jobs[job_id]["log"].append(f"✗ No confident match found (tried YouTube Music, YouTube, SoundCloud): {label}")
                 else:
                     jobs[job_id]["log"].append(
                         f"✗ Failed after {len(attempts_tried)} source(s) tried "
@@ -988,6 +1082,12 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
     nd_cfg = load_nd_config()
     local_dir = os.path.join(DOWNLOAD_DIR, sanitize(playlist_name))
     os.makedirs(local_dir, exist_ok=True)
+
+    try:  # for genre lookups only — downloads still proceed if Spotify auth is unavailable
+        sp, _ = get_sp()
+    except Exception as e:
+        print(f"[genre] Spotify auth unavailable, skipping genre lookups: {e}", file=sys.stderr)
+        sp = None
 
     with job_lock:
         jobs[job_id]["current_track"] = "Fetching track list from YouTube Music…"
@@ -1090,22 +1190,29 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
             rc, killed, _stdout, stderr = run_yt_dlp(
                 _yt_music_download_cmd(False), job_id, f"{artist} - {title}", timeout=30)
 
+        failed_track_stub = {"artist": artist, "name": title, "album": album,
+                              "album_artist": None, "duration_ms": 0}
+        failed_playlist_id = yt_playlist_id(url) if is_playlist else None
+
         if killed == "skipped":
             with job_lock:
                 jobs[job_id]["log"].append(f"⏭ Manually skipped: {artist} - {title}")
                 jobs[job_id]["failed"] += 1
         elif killed == "timeout":
+            record_failed_track(failed_track_stub, failed_playlist_id, playlist_name, "timeout after 30s")
             with job_lock:
                 jobs[job_id]["log"].append(f"✗ Timeout (30s): {artist} - {title}")
                 jobs[job_id]["failed"] += 1
         elif rc == 0:
             flac_path = out_template.replace(".%(ext)s", ".flac")
             if not os.path.exists(flac_path):
+                record_failed_track(failed_track_stub, failed_playlist_id, playlist_name, "file missing after download")
                 with job_lock:
                     jobs[job_id]["log"].append(f"✗ Failed (file missing after download): {artist} - {title}")
                     jobs[job_id]["failed"] += 1
                 continue
-            fix_tags(flac_path, title, artist, album, source_url=track_url)
+            genre = lookup_genre(sp, artist)
+            fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
             new_album, flac_path = maybe_correct_album(
                 flac_path, title, artist, album, playlist_name, track_url, local_dir)
             if new_album != album:
@@ -1115,6 +1222,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 t["album"] = new_album
             downloaded_tracks.append(t)
             yt_track_list.append(t)
+            clear_failed_track(artist, title)
             with job_lock:
                 jobs[job_id]["log"].append(f"✓ Downloaded: {artist} - {title}")
                 jobs[job_id]["downloaded"] += 1
@@ -1122,6 +1230,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(downloaded_tracks), job_id)
         else:
             reason = _extract_yt_dlp_error(stderr) or f"yt-dlp exited with code {rc}"
+            record_failed_track(failed_track_stub, failed_playlist_id, playlist_name, reason)
             with job_lock:
                 jobs[job_id]["log"].append(f"✗ Failed ({reason}): {artist} - {title}")
                 jobs[job_id]["failed"] += 1
@@ -1978,6 +2087,112 @@ def remove_ignored_track():
     ignored.pop(key, None)
     save_ignored_tracks(ignored)
     return jsonify({"status": "ok"})
+
+# ─── Failed downloads (manual-retry) ───────────────────────────────────────────
+
+@app.route("/failed")
+def list_failed_tracks_route():
+    data = load_failed_tracks()
+    result = [{**entry, "key": key} for key, entry in data.items()
+              if not is_track_ignored(entry.get("artist"), entry.get("name"))]
+    result.sort(key=lambda e: e.get("last_attempt") or "", reverse=True)
+    return jsonify(result)
+
+@app.route("/failed/dismiss", methods=["POST"])
+def dismiss_failed_track():
+    key = (request.json or {}).get("key", "")
+    if not key:
+        return jsonify({"error": "key required"}), 400
+    with failed_tracks_lock:
+        data = load_failed_tracks()
+        data.pop(key, None)
+        save_failed_tracks(data)
+    return jsonify({"status": "ok"})
+
+@app.route("/failed/retry", methods=["POST"])
+def retry_failed_track():
+    body = request.json or {}
+    key = body.get("key", "")
+    url = (body.get("url") or "").strip()
+    if not key or not url:
+        return jsonify({"error": "key and url required"}), 400
+
+    entry = load_failed_tracks().get(key)
+    if not entry:
+        return jsonify({"error": "Unknown failed track (it may already be resolved)"}), 404
+
+    artist, title = entry.get("artist", ""), entry.get("name", "")
+    album = entry.get("album") or "Unknown Album"
+    album_artist = entry.get("album_artist")
+    playlist_name = entry.get("playlist_name") or "Manual Downloads"
+    ssh_cfg = load_ssh_config()
+    nd_cfg = load_nd_config()
+
+    local_dir = os.path.join(DOWNLOAD_DIR, sanitize(playlist_name))
+    album_dir = os.path.join(local_dir, sanitize(album))
+    os.makedirs(album_dir, exist_ok=True)
+    filename = sanitize(f"{artist} - {title}")
+    out_template = os.path.join(album_dir, f"{filename}.%(ext)s")
+
+    tmp_job_id = f"manual_retry_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[tmp_job_id] = {"id": tmp_job_id, "playlist": f"[Manual retry] {playlist_name}",
+                            "status": "running", "total": 1, "current": 1,
+                            "downloaded": 0, "failed": 0, "nd_synced": None, "nd_missing": None,
+                            "current_track": f"{artist} - {title}", "log": []}
+
+    is_youtube_url = "youtube.com" in url or "youtu.be" in url
+    use_cookies = is_youtube_url and os.path.exists(COOKIES_FILE)
+    rc, killed, stdout, stderr = _download_via_yt_dlp(
+        url, out_template, tmp_job_id, f"{artist} - {title}", use_cookies=use_cookies)
+
+    if use_cookies and killed is None and rc != 0 and "403" in (stderr or ""):
+        with job_lock:
+            jobs[tmp_job_id]["log"].append("↻ Retrying without cookies after 403")
+        rc, killed, stdout, stderr = _download_via_yt_dlp(
+            url, out_template, tmp_job_id, f"{artist} - {title}", use_cookies=False)
+
+    with job_lock:
+        jobs[tmp_job_id]["status"] = "done"
+
+    if killed == "timeout":
+        return jsonify({"success": False, "message": "Download timed out after 30s"})
+    if killed == "skipped":
+        return jsonify({"success": False, "message": "Download was skipped"})
+    if rc != 0:
+        reason = _extract_yt_dlp_error(stderr) or f"yt-dlp exited with code {rc}"
+        return jsonify({"success": False, "message": reason})
+
+    flac_path = out_template.replace(".%(ext)s", ".flac")
+    if not os.path.exists(flac_path):
+        return jsonify({"success": False, "message": "File missing after download"})
+
+    source_url = extract_resolved_url(stdout) or url
+    try:
+        sp, _ = get_sp()
+    except Exception:
+        sp = None
+    genre = lookup_genre(sp, artist)
+    fix_tags(flac_path, title, artist, album, album_artist=album_artist,
+             source_url=source_url, genre=genre)
+    new_album, flac_path = maybe_correct_album(
+        flac_path, title, artist, album, playlist_name, source_url, local_dir, album_artist=album_artist)
+
+    synced_to_navidrome = False
+    if ssh_cfg:
+        retried_track = {"id": key, "name": title, "artist": artist, "album": new_album,
+                          "album_artist": album_artist, "duration_ms": entry.get("duration_ms", 0),
+                          "image": None, "source_url": source_url}
+        batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, [retried_track], tmp_job_id)
+        synced_to_navidrome = True
+
+    clear_failed_track(artist, title)
+    with job_lock:
+        jobs[tmp_job_id]["downloaded"] = 1
+
+    message = f"Downloaded (album: {new_album})"
+    message += " and synced to Navidrome" if synced_to_navidrome else " — no SSH configured, file left in local storage"
+    return jsonify({"success": True, "message": message})
 
 # ─── Sync health routes ────────────────────────────────────────────────────────
 

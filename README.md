@@ -10,6 +10,8 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
 - **Automatic Navidrome sync** — after each download, triggers a library scan and creates/updates a matching playlist in Navidrome via the Subsonic API.
 - **Scheduled auto-sync** — tracked playlists re-sync automatically on a daily or interval schedule, downloading only new tracks.
 - **Automatic tag correction** — if a downloaded track's album tag comes back empty or generic ("Unknown Album", or the playlist's own name), SpotiDrome looks up the real album via `yt-dlp` and re-files the track before it ever reaches Navidrome.
+- **Real genre tags** — YouTube's embedded metadata labels every music upload's genre as generic "Music"; SpotiDrome looks up the artist's actual genre (e.g. "Metal", "Synthwave") via the Spotify catalog and tags the file with that instead.
+- **Failed Downloads page** — a dedicated page listing every track that couldn't be matched or downloaded automatically, with its failure reason. Paste a direct YouTube/YouTube Music/SoundCloud link for any of them to download it manually — it's tagged, filed, and synced to Navidrome exactly like a normal download.
 - **Dead-link detection** — a background job periodically checks whether each track's source YouTube video still resolves, and flags any that don't (never auto-deletes).
 - **Duplicate cleanup** — a background sweep finds files that trace back to the exact same source video (via an embedded comment tag) and removes the smaller duplicate, then lets Navidrome's own scanner reconcile the change.
 - **Permanent track ignore list** — mark a track (e.g. one that's region- or age-restricted and can't be fetched) to be skipped on all future syncs instead of showing up as a repeated failure.

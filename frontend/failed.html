@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpotiDrome — Failed Downloads</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d0d12;
+  --bg2: #13131a;
+  --bg3: #1a1a24;
+  --bg4: #22222e;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --sp: #1ed760;
+  --nd: #8b5cf6;
+  --yt: #ff3333;
+  --amber: #f59e0b;
+  --red: #f87171;
+  --text: #f0f0f8;
+  --text2: #9090b0;
+  --text3: #5a5a7a;
+  --r: 10px;
+  --r2: 14px;
+  --font: 'Inter', sans-serif;
+  --font2: 'Space Grotesk', sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;
+  background-image:radial-gradient(circle at 20% 20%, rgba(139,92,246,0.06) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, rgba(30,215,96,0.04) 0%, transparent 50%),
+    linear-gradient(var(--border) 1px,transparent 1px),
+    linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:100% 100%,100% 100%,32px 32px,32px 32px;
+  pointer-events:none;z-index:0}
+.app{position:relative;z-index:1;max-width:900px;margin:0 auto;padding:0 20px 80px}
+header{display:flex;align-items:center;justify-content:space-between;padding:20px 0 24px;border-bottom:1px solid var(--border);margin-bottom:24px;flex-wrap:wrap;gap:12px}
+.logo{font-family:var(--font2);font-size:24px;font-weight:700;letter-spacing:-0.5px;display:flex;align-items:center;gap:2px}
+.logo .sp{color:var(--sp)}
+.logo .arr{color:var(--text3);margin:0 4px;font-weight:400}
+.logo .nd{color:var(--nd)}
+.back-link{display:inline-flex;align-items:center;gap:6px;color:var(--text2);text-decoration:none;font-size:13px;font-weight:500;padding:6px 12px;border-radius:40px;background:var(--bg3);border:1px solid var(--border);transition:all .15s}
+.back-link:hover{border-color:var(--border2);color:var(--text)}
+.page-title{font-family:var(--font2);font-size:22px;font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:10px}
+.page-sub{color:var(--text2);font-size:13px;margin-bottom:20px}
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--text3);font-weight:500}
+.badge.count{background:rgba(248,113,113,.12);color:var(--red);border-color:rgba(248,113,113,.2)}
+
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden}
+.panel-hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+.panel-title{font-family:var(--font2);font-size:12px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text2)}
+
+.btn{display:inline-flex;align-items:center;gap:6px;font-family:var(--font);font-size:12px;font-weight:500;padding:8px 14px;border-radius:var(--r);border:none;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-primary{background:var(--sp);color:#000}
+.btn-primary:hover{box-shadow:0 4px 12px rgba(30,215,96,.3);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--border2);color:var(--text)}
+
+.fail-item{padding:14px 16px;border-bottom:1px solid var(--border)}
+.fail-item:last-child{border-bottom:none}
+.fail-hd{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
+.fail-name{font-size:14px;font-weight:600}
+.fail-artist{font-size:12px;color:var(--text2);margin-top:2px}
+.fail-meta{font-size:11px;color:var(--text3);margin-top:6px;line-height:1.6}
+.fail-reason{color:var(--red);opacity:.85}
+.dismiss-btn{background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:2px 6px;flex-shrink:0;transition:color .15s}
+.dismiss-btn:hover{color:var(--red)}
+
+.fail-actions{display:flex;gap:8px;margin-top:4px}
+.fail-url{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-family:var(--font);font-size:12px;padding:8px 12px;outline:none;transition:border-color .15s}
+.fail-url:focus{border-color:rgba(139,92,246,.5)}
+.fail-url::placeholder{color:var(--text3)}
+.fail-result{font-size:11px;margin-top:8px;display:none;padding:7px 10px;border-radius:6px}
+.fail-result.ok{display:block;background:rgba(30,215,96,.1);border:1px solid rgba(30,215,96,.2);color:#4ade80}
+.fail-result.err{display:block;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:var(--red)}
+
+.spin{width:13px;height:13px;border:2px solid rgba(255,255,255,.15);border-top-color:currentColor;border-radius:50%;animation:rot .6s linear infinite;display:inline-block;flex-shrink:0}
+@keyframes rot{to{transform:rotate(360deg)}}
+.empty{padding:40px 16px;text-align:center;color:var(--text3);font-size:13px}
+.empty-icon{font-size:28px;margin-bottom:10px}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header>
+    <div class="logo"><span class="sp">Spoti</span><span class="arr">→</span><span class="nd">Drome</span></div>
+    <a class="back-link" href="/">← Back to library</a>
+  </header>
+
+  <div class="page-title">⚠ Failed Downloads <span class="badge count" id="fail-count">—</span></div>
+  <div class="page-sub">Tracks that couldn't be found or downloaded automatically. Paste a direct YouTube, YouTube Music, or SoundCloud link to retry one manually.</div>
+
+  <div class="panel">
+    <div class="panel-hd">
+      <span class="panel-title">Needs attention</span>
+      <button class="btn btn-ghost" onclick="loadFailed()">↺ Refresh</button>
+    </div>
+    <div id="fail-list"><div class="empty"><div class="spin"></div></div></div>
+  </div>
+</div>
+
+<script>
+const API='/api';
+let refreshTimer=null;
+
+async function loadFailed(){
+  if(anyInputFocused())return; // don't clobber someone mid-paste
+  try{
+    const r=await fetch(`${API}/failed`),items=await r.json();
+    document.getElementById('fail-count').textContent=items.length;
+    const list=document.getElementById('fail-list');
+    if(!items.length){
+      list.innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing failed — everything downloaded fine.</div>';
+      return;
+    }
+    list.innerHTML=items.map(it=>`<div class="fail-item" data-key="${escA(it.key)}">
+      <div class="fail-hd">
+        <div>
+          <div class="fail-name">${esc(it.name||'Unknown title')}</div>
+          <div class="fail-artist">${esc(it.artist||'Unknown artist')}</div>
+          <div class="fail-meta">
+            ${it.album?`Album: ${esc(it.album)} · `:''}${it.playlist_name?`From: ${esc(it.playlist_name)} · `:''}${it.last_attempt?`Last tried: ${new Date(it.last_attempt+'Z').toLocaleString()}`:''}
+            <br><span class="fail-reason">${esc(it.reason||'Unknown error')}</span>
+          </div>
+        </div>
+        <button class="dismiss-btn" title="Dismiss" onclick="dismissFailed('${escA(it.key)}')">✕</button>
+      </div>
+      <div class="fail-actions">
+        <input class="fail-url" type="url" placeholder="Paste a YouTube / YouTube Music / SoundCloud link…">
+        <button class="btn btn-primary" onclick="retryFailed('${escA(it.key)}',this)">↓ Retry</button>
+      </div>
+      <div class="fail-result"></div>
+    </div>`).join('');
+  }catch(e){
+    document.getElementById('fail-list').innerHTML=`<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+  }
+}
+
+function anyInputFocused(){
+  const active=document.activeElement;
+  return active && active.classList && active.classList.contains('fail-url') && active.value.trim().length>0;
+}
+
+async function retryFailed(key,btn){
+  const item=btn.closest('.fail-item');
+  const input=item.querySelector('.fail-url');
+  const url=input.value.trim();
+  const resultEl=item.querySelector('.fail-result');
+  if(!url){resultEl.className='fail-result err';resultEl.textContent='Paste a link first.';return;}
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span>';
+  resultEl.className='fail-result';resultEl.textContent='';
+  try{
+    const r=await fetch(`${API}/failed/retry`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,url})});
+    const d=await r.json();
+    if(d.success){
+      resultEl.className='fail-result ok';resultEl.textContent='✓ '+d.message;
+      setTimeout(()=>{item.style.transition='opacity .3s';item.style.opacity='0';setTimeout(()=>{item.remove();updateCountAfterRemoval();},300);},900);
+    }else{
+      resultEl.className='fail-result err';resultEl.textContent='✗ '+(d.message||d.error||'Download failed');
+      btn.disabled=false;btn.innerHTML=orig;
+    }
+  }catch(e){
+    resultEl.className='fail-result err';resultEl.textContent='✗ '+e.message;
+    btn.disabled=false;btn.innerHTML=orig;
+  }
+}
+
+async function dismissFailed(key){
+  const item=document.querySelector(`.fail-item[data-key="${cssEscape(key)}"]`);
+  await fetch(`${API}/failed/dismiss`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+  if(item){item.remove();updateCountAfterRemoval();}
+}
+
+function updateCountAfterRemoval(){
+  const remaining=document.querySelectorAll('.fail-item').length;
+  document.getElementById('fail-count').textContent=remaining;
+  if(!remaining)document.getElementById('fail-list').innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing failed — everything downloaded fine.</div>';
+}
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function escA(s){return String(s).replace(/'/g,"\\'");}
+function cssEscape(s){return String(s).replace(/["\\]/g,'\\$&');}
+
+loadFailed();
+refreshTimer=setInterval(loadFailed,20000);
+</script>
+</body>
+</html>

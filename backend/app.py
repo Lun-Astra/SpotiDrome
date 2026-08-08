@@ -40,19 +40,38 @@ job_lock = threading.Lock()
 nd_playlist_lock = threading.Lock()
 
 def save_jobs():
+    """Write atomically (temp file + rename) so a crash or a concurrent
+    reader can never observe a half-written file — that torn read is
+    exactly what used to make load_jobs() (see below) fall back to an
+    empty dict, which a subsequent save would then happily make permanent."""
     try:
-        with open(JOBS_FILE, "w") as f:
+        tmp_path = f"{JOBS_FILE}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(jobs, f)
-    except Exception:
-        pass
+        os.replace(tmp_path, JOBS_FILE)
+    except Exception as e:
+        print(f"[jobs] Failed to save {JOBS_FILE}: {e}", file=sys.stderr)
 
 def load_jobs():
+    """Only reset to an empty dict when the file genuinely doesn't exist
+    yet (first run). If it exists but fails to read/parse, that's a real
+    problem — corruption, a torn read, whatever — and silently treating it
+    as "no jobs" is how a single bad read used to turn into permanent data
+    loss the moment anything next called save_jobs(). Keep whatever's
+    already in memory instead and log loudly."""
     global jobs
+    if not os.path.exists(JOBS_FILE):
+        jobs = {}
+        return
     try:
         with open(JOBS_FILE) as f:
-            jobs = json.load(f)
-    except Exception:
-        jobs = {}
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+        jobs = data
+    except Exception as e:
+        print(f"[jobs] Failed to load {JOBS_FILE}, keeping in-memory state "
+              f"({len(jobs)} job(s)) rather than wiping it: {e}", file=sys.stderr)
 
 load_jobs()
 
@@ -520,14 +539,23 @@ def lookup_genre_from_youtube(artist):
                 return normalized.title()
     return None
 
-def lookup_genre(sp, artist):
+def lookup_genre(artist):
     """Look up a real, specific genre (e.g. 'Metal', 'Nu Metal', 'Synthwave')
     for an artist — Spotify's catalog first, falling back to YouTube's tags
     when Spotify has nothing — since yt-dlp's embedded YouTube metadata on
     its own just labels every music upload's genre as generic 'Music'.
     Cached per artist name for the life of the process — most playlists hit
     the same artist many times over. Returns None if neither source has
-    anything usable."""
+    anything usable.
+
+    Fetches a fresh Spotify client via get_sp() on every call rather than
+    taking one as a parameter: a Spotify access token is only valid for
+    about an hour, and a long-running job (a big library relabel can run
+    for tens of minutes to hours) that grabbed sp once at the start would
+    otherwise start silently 401ing partway through — miscounting artists
+    Spotify genuinely does have data for as "no genre match". get_sp() is
+    cheap when the cached token isn't expired (just a local file read), so
+    calling it per-lookup costs nothing in the common case."""
     if not artist:
         return None
     key = primary_artist(artist).lower()
@@ -537,6 +565,10 @@ def lookup_genre(sp, artist):
         if key in _genre_cache:
             return _genre_cache[key]
     genre = None
+    try:
+        sp, _ = get_sp()
+    except Exception:
+        sp = None
     if sp:
         try:
             result = sp.search(q=f"artist:{key}", type="artist", limit=1)
@@ -944,12 +976,6 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
     local_dir = os.path.join(DOWNLOAD_DIR, sanitize(playlist_name))
     os.makedirs(local_dir, exist_ok=True)
 
-    try:  # for genre lookups only — downloads still proceed if Spotify auth is unavailable
-        sp, _ = get_sp()
-    except Exception as e:
-        print(f"[genre] Spotify auth unavailable, skipping genre lookups: {e}", file=sys.stderr)
-        sp = None
-
     all_synced_tracks = []
     newly_downloaded = []
 
@@ -1052,7 +1078,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                     continue
                 source_url = extract_resolved_url(stdout)
                 track["source_url"] = source_url
-                genre = lookup_genre(sp, track['artist'])
+                genre = lookup_genre(track['artist'])
                 fix_tags(flac_path, track['name'], track['artist'], track['album'],
                          album_artist=track.get('album_artist'), source_url=source_url, genre=genre)
                 new_album, flac_path = maybe_correct_album(
@@ -1180,12 +1206,6 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
     nd_cfg = load_nd_config()
     local_dir = os.path.join(DOWNLOAD_DIR, sanitize(playlist_name))
     os.makedirs(local_dir, exist_ok=True)
-
-    try:  # for genre lookups only — downloads still proceed if Spotify auth is unavailable
-        sp, _ = get_sp()
-    except Exception as e:
-        print(f"[genre] Spotify auth unavailable, skipping genre lookups: {e}", file=sys.stderr)
-        sp = None
 
     with job_lock:
         jobs[job_id]["current_track"] = "Fetching track list from YouTube Music…"
@@ -1321,7 +1341,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                     jobs[job_id]["log"].append(f"✗ Failed (file missing after download): {artist} - {title}")
                     jobs[job_id]["failed"] += 1
                 continue
-            genre = lookup_genre(sp, artist)
+            genre = lookup_genre(artist)
             fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
             new_album, flac_path = maybe_correct_album(
                 flac_path, title, artist, album, playlist_name, track_url, local_dir)
@@ -1786,7 +1806,7 @@ def genre_relabel_worker(job_id):
                 jobs[job_id]["log"].append(f"⏭ Skipped: {artist or '(unknown artist)'}")
             continue
 
-        new_genre = lookup_genre(sp, artist)
+        new_genre = lookup_genre(artist)
         if not new_genre:
             no_genre_found += len(group)
             continue
@@ -2499,11 +2519,7 @@ def retry_failed_track():
         return jsonify({"success": False, "message": "File missing after download"})
 
     source_url = extract_resolved_url(stdout) or url
-    try:
-        sp, _ = get_sp()
-    except Exception:
-        sp = None
-    genre = lookup_genre(sp, artist)
+    genre = lookup_genre(artist)
     fix_tags(flac_path, title, artist, album, album_artist=album_artist,
              source_url=source_url, genre=genre)
     new_album, flac_path = maybe_correct_album(

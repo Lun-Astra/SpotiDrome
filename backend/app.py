@@ -1779,6 +1779,7 @@ def genre_relabel_worker(job_id):
             nd_wait_for_scan(nd_cfg, timeout=300)
 
     with job_lock:
+        jobs[job_id]["current"] = len(files)  # apply-phase batching only tracks len(updates), not the full scan total
         jobs[job_id]["status"] = "done"
         jobs[job_id]["current_track"] = None
         save_jobs()

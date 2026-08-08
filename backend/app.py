@@ -423,7 +423,16 @@ def get_sp():
     if not token:
         return None, auth.get_authorize_url()
     if auth.is_token_expired(token):
-        token = auth.refresh_access_token(token["refresh_token"])
+        try:
+            token = auth.refresh_access_token(token["refresh_token"])
+        except Exception as e:
+            # A transient hiccup here (network blip, momentary 5xx from
+            # Spotify) used to propagate as an unhandled exception straight
+            # out of every route that calls get_sp() unguarded — surfacing
+            # as a raw 500 to the frontend instead of a normal "please
+            # reconnect" state. Treat it the same as "not authenticated".
+            print(f"[spotify] Token refresh failed: {e}", file=sys.stderr)
+            return None, auth.get_authorize_url()
     return spotipy.Spotify(auth=token["access_token"]), None
 
 def fetch_playlist_tracks(sp, playlist_id):

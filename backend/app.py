@@ -1595,6 +1595,194 @@ def duplicate_scan_loop():
 
 threading.Thread(target=duplicate_scan_loop, daemon=True).start()
 
+# ─── Genre relabeling (retag existing library in place) ────────────────────
+# Runs entirely on the Navidrome host over SSH, the same way the dedupe sweep
+# above does — no file is ever transferred, moved, or re-downloaded. Only the
+# GENRE/TCON tag of files that need it gets rewritten in place; everything
+# else about the library (paths, playlists, other tags, the audio itself)
+# is untouched.
+
+_GENRE_SCAN_REMOTE_SCRIPT = r'''
+import json, os, sys
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, error as ID3Error
+
+MUSIC = sys.argv[1]
+out = []
+for root, dirs, files in os.walk(MUSIC):
+    for f in files:
+        p = os.path.join(root, f)
+        try:
+            if f.endswith(".flac"):
+                tags = FLAC(p)
+                artist = (tags.get("artist") or [""])[0]
+                genre = (tags.get("genre") or [""])[0]
+            elif f.endswith(".mp3"):
+                tags = ID3(p)
+                artist = str(tags.get("TPE1", ""))
+                genre = str(tags.get("TCON", ""))
+            else:
+                continue
+        except Exception:
+            continue
+        out.append({"path": p, "artist": artist, "genre": genre})
+print(json.dumps(out))
+'''
+
+_GENRE_APPLY_REMOTE_SCRIPT = r'''
+import json, sys
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TCON, error as ID3Error
+
+updates = json.load(sys.stdin)
+updated, failed = 0, []
+for item in updates:
+    p, genre = item["path"], item["genre"]
+    try:
+        if p.endswith(".flac"):
+            tags = FLAC(p)
+            tags["genre"] = [genre]
+            tags.save()
+        elif p.endswith(".mp3"):
+            try:
+                tags = ID3(p)
+            except ID3Error:
+                tags = ID3()
+            tags["TCON"] = TCON(encoding=3, text=genre)
+            tags.save(p)
+        else:
+            continue
+        updated += 1
+    except Exception:
+        failed.append(p)
+print(json.dumps({"updated": updated, "failed": failed}))
+'''
+
+def _ssh_cmd(ssh_cfg, remote_command):
+    return ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(ssh_cfg["port"]),
+            "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+            f"{ssh_cfg['user']}@{ssh_cfg['host']}", remote_command]
+
+def genre_relabel_worker(job_id):
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+
+    ssh_cfg = load_ssh_config()
+    nd_cfg = load_nd_config()
+    if not ssh_cfg:
+        with job_lock:
+            jobs[job_id]["log"].append("✗ SSH not configured")
+            jobs[job_id]["status"] = "done"
+        return
+    try:
+        sp, _ = get_sp()
+    except Exception:
+        sp = None
+    if not sp:
+        with job_lock:
+            jobs[job_id]["log"].append("✗ Spotify not authenticated — can't look up genres")
+            jobs[job_id]["status"] = "done"
+        return
+
+    with job_lock:
+        jobs[job_id]["current_track"] = "Scanning library on the Navidrome host…"
+    scan_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_GENRE_SCAN_REMOTE_SCRIPT)} "
+                                  f"{shlex.quote(ssh_cfg['music_path'])}")
+    try:
+        result = subprocess.run(scan_cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            raise ValueError(result.stderr[-500:])
+        files = json.loads(result.stdout.strip() or "[]")
+    except Exception as e:
+        with job_lock:
+            jobs[job_id]["log"].append(f"✗ Failed to scan library: {e}")
+            jobs[job_id]["status"] = "done"
+        return
+
+    with job_lock:
+        jobs[job_id]["total"] = len(files)
+        jobs[job_id]["log"].append(f"ℹ Scanned {len(files)} file(s) on the Navidrome host")
+
+    # Group by artist — each unique artist only hits the Spotify lookup once
+    # regardless of how many of their tracks are in the library.
+    by_artist = {}
+    for f in files:
+        by_artist.setdefault(f["artist"], []).append(f)
+
+    updates, processed, already_correct, no_genre_found = [], 0, 0, 0
+    for artist, group in by_artist.items():
+        processed += len(group)
+        with job_lock:
+            jobs[job_id]["current"] = processed
+            jobs[job_id]["current_track"] = f"Looking up genre for {artist or '(unknown artist)'}…"
+            skip = jobs[job_id].get("skip_current", False)
+            if skip:
+                jobs[job_id]["skip_current"] = False
+        if skip:
+            with job_lock:
+                jobs[job_id]["log"].append(f"⏭ Skipped: {artist or '(unknown artist)'}")
+            continue
+
+        new_genre = lookup_genre(sp, artist)
+        if not new_genre:
+            no_genre_found += len(group)
+            continue
+        for f in group:
+            if (f.get("genre") or "").strip().lower() == new_genre.lower():
+                already_correct += 1
+                continue
+            updates.append({"path": f["path"], "genre": new_genre})
+
+    with job_lock:
+        jobs[job_id]["log"].append(
+            f"ℹ {len(updates)} file(s) need a genre update, {already_correct} already correct, "
+            f"{no_genre_found} had no genre match on Spotify")
+
+    applied, failed = 0, 0
+    if updates:
+        with job_lock:
+            jobs[job_id]["current_track"] = f"Writing {len(updates)} genre tag(s) on the Navidrome host…"
+        BATCH = 200
+        for i in range(0, len(updates), BATCH):
+            batch = updates[i:i + BATCH]
+            apply_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_GENRE_APPLY_REMOTE_SCRIPT)}")
+            try:
+                result = subprocess.run(apply_cmd, input=json.dumps(batch),
+                                         capture_output=True, text=True, timeout=120)
+                if result.returncode != 0:
+                    raise ValueError(result.stderr[-500:])
+                summary = json.loads(result.stdout.strip() or "{}")
+                applied += summary.get("updated", 0)
+                failed += len(summary.get("failed", []))
+            except Exception as e:
+                failed += len(batch)
+                with job_lock:
+                    jobs[job_id]["log"].append(f"✗ Batch write failed ({len(batch)} file(s)): {e}")
+                continue
+            with job_lock:
+                jobs[job_id]["current"] = min(len(files), i + BATCH)
+                jobs[job_id]["downloaded"] = applied
+                jobs[job_id]["failed"] = failed
+                jobs[job_id]["log"].append(f"🏷 Retagged {applied}/{len(updates)} so far…")
+
+    with job_lock:
+        jobs[job_id]["log"].append(f"✅ Done: {applied} genre tag(s) updated, {failed} failed")
+
+    if applied and nd_cfg:
+        with job_lock:
+            jobs[job_id]["status"] = "scanning"
+            jobs[job_id]["current_track"] = "Triggering Navidrome library scan…"
+        ok, msg = nd_trigger_scan(nd_cfg)
+        with job_lock:
+            jobs[job_id]["log"].append(f"🔄 {msg}")
+        if ok:
+            nd_wait_for_scan(nd_cfg, timeout=300)
+
+    with job_lock:
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["current_track"] = None
+        save_jobs()
+
 # ─── Sync health ────────────────────────────────────────────────────────────
 
 def load_sync_health():
@@ -1834,6 +2022,29 @@ def ytmusic_download():
                         "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
     threading.Thread(target=ytmusic_download_worker,
                      args=(job_id, url, playlist_name, is_playlist), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/library/retag-genres", methods=["POST"])
+def retag_genres():
+    """Relabel genre tags across the whole existing library in place — scans
+    and rewrites files directly on the Navidrome host over SSH, never
+    re-downloading or otherwise touching anything but the genre tag."""
+    ssh_cfg = load_ssh_config()
+    if not ssh_cfg:
+        return jsonify({"error": "SSH not configured"}), 400
+    try:
+        sp, url = get_sp()
+    except Exception:
+        sp, url = None, None
+    if not sp:
+        return jsonify({"error": "Spotify not authenticated", "auth_url": url}), 401
+
+    job_id = f"genre_relabel_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Genre Relabel] Library", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0,
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+    threading.Thread(target=genre_relabel_worker, args=(job_id,), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 

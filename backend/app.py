@@ -40,6 +40,8 @@ JOBS_FILE             = "/root/.ssh/jobs.json"
 DEAD_LINKS_FILE       = "/root/.ssh/dead_links.json"
 IGNORED_TRACKS_FILE   = "/root/.ssh/ignored_tracks.json"
 DUPLICATE_REPORT_FILE = "/root/.ssh/duplicate_report.json"
+TITLE_DUPLICATE_REPORT_FILE = "/root/.ssh/title_duplicate_report.json"
+MAX_TITLE_DEDUPE_PER_RUN = 150  # safety cap — see scan_and_dedupe_by_title
 SYNC_HEALTH_FILE      = "/root/.ssh/sync_health.json"
 FAILED_TRACKS_FILE    = "/root/.ssh/failed_tracks.json"
 
@@ -1447,50 +1449,57 @@ def auto_sync_worker():
     print("[auto-sync] Starting nightly sync…")
     tracked = load_tracked()
     if not tracked:
-        print("[auto-sync] No tracked playlists, skipping.")
-        return
+        print("[auto-sync] No tracked playlists to sync.")
+    else:
+        try:
+            sp, _ = get_sp()
+        except Exception as e:
+            print(f"[auto-sync] Spotify auth failed, skipping Spotify playlists this run: {e}")
+            sp = None
+
+        for playlist_id, info in tracked.items():
+            playlist_name = info["name"]
+            print(f"[auto-sync] Syncing: {playlist_name}")
+            job_id = f"auto_{int(time.time()*1000)}"
+
+            # YouTube playlist (id starts with yt_)
+            if playlist_id.startswith("yt_"):
+                # Reconstruct original URL from stored tracks
+                url = info.get("url")
+                if not url:
+                    print(f"[auto-sync] No URL stored for {playlist_name}, skipping.")
+                    continue
+                with job_lock:
+                    jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
+                                    "status": "pending", "total": 0, "current": 0,
+                                    "downloaded": 0, "failed": 0, "nd_synced": None,
+                                    "nd_missing": None, "current_track": None, "log": []}
+                ytmusic_download_worker(job_id, url, playlist_name, is_playlist=True)
+            else:
+                # Spotify playlist
+                if not sp:
+                    print("[auto-sync] Spotify not authenticated, skipping Spotify playlists.")
+                    continue
+                try:
+                    tracks = fetch_playlist_tracks(sp, playlist_id)
+                except Exception as e:
+                    print(f"[auto-sync] Failed to fetch tracks for {playlist_name}: {e}")
+                    continue
+                with job_lock:
+                    jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
+                                    "status": "pending", "total": len(tracks), "current": 0,
+                                    "downloaded": 0, "failed": 0, "nd_synced": None,
+                                    "nd_missing": None, "current_track": None, "log": []}
+                download_worker(job_id, tracks, playlist_name, playlist_id=playlist_id, sync_navidrome=True)
+
+            time.sleep(5)
+
+    print("[auto-sync] Running nightly title/artist duplicate sweep…")
     try:
-        sp, _ = get_sp()
+        scan_and_dedupe_by_title(load_ssh_config(), load_nd_config())
     except Exception as e:
-        print(f"[auto-sync] Spotify auth failed, skipping Spotify playlists this run: {e}")
-        sp = None
+        print(f"[auto-sync] Title duplicate sweep failed: {e}", file=sys.stderr)
 
-    for playlist_id, info in tracked.items():
-        playlist_name = info["name"]
-        print(f"[auto-sync] Syncing: {playlist_name}")
-        job_id = f"auto_{int(time.time()*1000)}"
-
-        # YouTube playlist (id starts with yt_)
-        if playlist_id.startswith("yt_"):
-            # Reconstruct original URL from stored tracks
-            url = info.get("url")
-            if not url:
-                print(f"[auto-sync] No URL stored for {playlist_name}, skipping.")
-                continue
-            with job_lock:
-                jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
-                                "status": "pending", "total": 0, "current": 0,
-                                "downloaded": 0, "failed": 0, "nd_synced": None,
-                                "nd_missing": None, "current_track": None, "log": []}
-            ytmusic_download_worker(job_id, url, playlist_name, is_playlist=True)
-        else:
-            # Spotify playlist
-            if not sp:
-                print("[auto-sync] Spotify not authenticated, skipping Spotify playlists.")
-                continue
-            try:
-                tracks = fetch_playlist_tracks(sp, playlist_id)
-            except Exception as e:
-                print(f"[auto-sync] Failed to fetch tracks for {playlist_name}: {e}")
-                continue
-            with job_lock:
-                jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
-                                "status": "pending", "total": len(tracks), "current": 0,
-                                "downloaded": 0, "failed": 0, "nd_synced": None,
-                                "nd_missing": None, "current_track": None, "log": []}
-            download_worker(job_id, tracks, playlist_name, playlist_id=playlist_id, sync_navidrome=True)
-
-        time.sleep(5)
     print("[auto-sync] Nightly sync complete.")
 
 def load_schedule_config():
@@ -1686,6 +1695,166 @@ def duplicate_scan_loop():
         time.sleep(7 * 24 * 3600)
 
 threading.Thread(target=duplicate_scan_loop, daemon=True).start()
+
+# ─── Title/artist duplicate sweep (nightly, part of the 3am auto-sync) ────────
+# The dedupe above only catches files that share the exact same *source
+# video* (via the embedded comment tag) — it can't see two files of the
+# same song that came from two different YouTube uploads (e.g. one synced
+# normally through a playlist, one requested through Jamidrome from a
+# different video of the same track). This sweep instead reads every
+# file's own TITLE/ARTIST tags, groups by normalized title, and within
+# each group clusters by fuzzy artist similarity — catching duplicates
+# regardless of which video they were sourced from.
+
+def load_title_duplicate_report():
+    try:
+        with open(TITLE_DUPLICATE_REPORT_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"last_run": None, "removed": [], "error": None}
+
+def save_title_duplicate_report(data):
+    with open(TITLE_DUPLICATE_REPORT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _artist_somewhat_matches(a, b, threshold=0.6):
+    a_n = re.sub(r"[^\w\s]", " ", (a or "").lower()).strip()
+    b_n = re.sub(r"[^\w\s]", " ", (b or "").lower()).strip()
+    a_n = re.sub(r"\s+", " ", a_n)
+    b_n = re.sub(r"\s+", " ", b_n)
+    if not a_n or not b_n:
+        return False
+    if a_n == b_n or a_n in b_n or b_n in a_n:
+        return True
+    return difflib.SequenceMatcher(None, a_n, b_n).ratio() >= threshold
+
+_TITLE_DEDUPE_SCAN_SCRIPT = r'''
+import json, os, sys
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, error as ID3Error
+
+MUSIC = sys.argv[1]
+out = []
+for root, dirs, files in os.walk(MUSIC):
+    for f in files:
+        p = os.path.join(root, f)
+        try:
+            if f.endswith(".flac"):
+                tags = FLAC(p)
+                title = (tags.get("title") or [""])[0]
+                artist = (tags.get("artist") or [""])[0]
+            elif f.endswith(".mp3"):
+                tags = ID3(p)
+                title = str(tags.get("TIT2", ""))
+                artist = str(tags.get("TPE1", ""))
+            else:
+                continue
+            size = os.path.getsize(p)
+        except Exception:
+            continue
+        if title and artist:
+            out.append({"path": p, "title": title, "artist": artist, "size": size})
+print(json.dumps(out))
+'''
+
+def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
+    """Removes the smaller file(s) from each title+artist duplicate
+    cluster found across the whole library, then adds each removed
+    track's own artist/title to the permanent ignore list — same as a
+    user manually marking it ignored — so a future playlist sync or jam
+    request doesn't just re-download the very duplicate just removed."""
+    if not ssh_cfg:
+        report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": "SSH not configured"}
+        save_title_duplicate_report(report)
+        return report
+
+    cmd = ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(ssh_cfg["port"]),
+           "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+           f"{ssh_cfg['user']}@{ssh_cfg['host']}",
+           f"python3 -c {shlex.quote(_TITLE_DEDUPE_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": result.stderr[-300:]}
+            save_title_duplicate_report(report)
+            return report
+        files = json.loads(result.stdout.strip() or "[]")
+    except Exception as e:
+        report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": str(e)}
+        save_title_duplicate_report(report)
+        return report
+
+    by_title = {}
+    for f in files:
+        key = _normalize_title(f["title"])
+        if key:
+            by_title.setdefault(key, []).append(f)
+
+    # Build the full removal plan before touching anything — this runs
+    # unattended every night with no human review, so a safety cap on how
+    # much a single run can ever remove matters more here than in a
+    # manually-triggered sweep. A few dozen is a perfectly normal first-run
+    # backlog (two download tools writing into the same library will
+    # accumulate some overlap); anything far beyond that in one night is
+    # more likely a bug than a real duplicate wave, and should stop for a
+    # human to look rather than silently mass-delete.
+    plan = []
+    for group in by_title.values():
+        if len(group) < 2:
+            continue
+        # Cluster within this title group by fuzzy artist match — same
+        # title with genuinely different artists (two different songs
+        # that happen to share a name) must never be merged.
+        clusters = []
+        for f in group:
+            for cluster in clusters:
+                if _artist_somewhat_matches(f["artist"], cluster[0]["artist"]):
+                    cluster.append(f)
+                    break
+            else:
+                clusters.append([f])
+
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            cluster.sort(key=lambda x: x["size"], reverse=True)
+            keep, dupes = cluster[0], cluster[1:]
+            for d in dupes:
+                plan.append((keep, d))
+
+    if len(plan) > MAX_TITLE_DEDUPE_PER_RUN:
+        report = {"last_run": datetime.utcnow().isoformat(), "removed": [],
+                   "error": f"Safety cap hit: {len(plan)} would be removed in one run "
+                            f"(max {MAX_TITLE_DEDUPE_PER_RUN}) — skipped entirely for a human to check first."}
+        save_title_duplicate_report(report)
+        print(f"[title-dedupe] {report['error']}", file=sys.stderr)
+        return report
+
+    removed = []
+    for keep, d in plan:
+        rm_cmd = ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(ssh_cfg["port"]),
+                  "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                  f"{ssh_cfg['user']}@{ssh_cfg['host']}",
+                  f"rm -f -- {shlex.quote(d['path'])}"]
+        rm_result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
+        if rm_result.returncode != 0:
+            continue
+        removed.append({"path": d["path"], "size": d["size"], "title": d["title"],
+                         "artist": d["artist"], "kept": keep["path"]})
+        key = track_ignore_key(d["artist"], d["title"])
+        ignored = load_ignored_tracks()
+        ignored[key] = {"artist": d["artist"], "title": d["title"],
+                         "added_at": datetime.utcnow().isoformat(),
+                         "reason": f"Auto-removed as a duplicate of {keep['path']}"}
+        save_ignored_tracks(ignored)
+
+    if removed and nd_cfg:
+        nd_trigger_scan(nd_cfg)
+
+    report = {"last_run": datetime.utcnow().isoformat(), "removed": removed, "error": None}
+    save_title_duplicate_report(report)
+    print(f"[title-dedupe] Removed {len(removed)} duplicate(s) by title/artist match, added to ignore list")
+    return report
 
 # ─── Genre relabeling (retag existing library in place) ────────────────────
 # Runs entirely on the Navidrome host over SSH, the same way the dedupe sweep
@@ -2823,6 +2992,7 @@ def health_summary():
         "playlists": playlists,
         "unknown_album_count": unknown_album_count,
         "duplicate_report": load_duplicate_report(),
+        "title_duplicate_report": load_title_duplicate_report(),
     })
 
 if __name__ == "__main__":

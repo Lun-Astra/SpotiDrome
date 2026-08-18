@@ -528,6 +528,7 @@ header{
           </div>
           <div id="health-list"><div class="empty" style="padding:14px">Loading…</div></div>
           <div class="health-dup-line" id="health-dup-line">Duplicate sweep: no run yet</div>
+          <div class="health-dup-line" id="health-title-dup-line">Title/artist dedupe: no run yet</div>
         </div>
       </div>
 
@@ -793,6 +794,10 @@ async function loadHealth(){
     document.getElementById('health-dup-line').textContent = dr.last_run
       ? `Last duplicate sweep: ${(dr.removed||[]).length} removed · ${new Date(dr.last_run+'Z').toLocaleDateString()}`
       : 'Duplicate sweep: no run yet';
+    const tdr=d.title_duplicate_report||{};
+    document.getElementById('health-title-dup-line').textContent = tdr.last_run
+      ? `Last title/artist dedupe: ${(tdr.removed||[]).length} removed${tdr.error?` · ⚠ ${esc(tdr.error)}`:''} · ${new Date(tdr.last_run+'Z').toLocaleDateString()}`
+      : 'Title/artist dedupe: no run yet';
   }catch(e){}
 }
 

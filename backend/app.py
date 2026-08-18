@@ -21,6 +21,14 @@ def _pot_args_for_client(player_client):
             "--remote-components", "ejs:github"]
 
 YTDLP_POT_ARGS        = _pot_args_for_client("mweb")
+# Sources (YouTube Music, YouTube, SoundCloud) are mastered at wildly
+# different loudness levels, so tracks land in the library at wildly
+# different volumes. Every download gets normalized to a single target
+# loudness on the way to FLAC via ffmpeg's loudnorm filter, single-pass
+# (no separate measure step, since that would mean downloading/decoding
+# the audio twice per track). -16 LUFS / -1.5dB true peak / 11 LU range
+# are the commonly recommended values for music (vs. -23 LUFS for broadcast).
+LOUDNORM_FILTER        = "loudnorm=I=-16:TP=-1.5:LRA=11"
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8080/callback")
@@ -956,6 +964,7 @@ def _download_via_yt_dlp(video_url, out_template, job_id, label, use_cookies, pl
     cookies_args = ["--cookies", COOKIES_FILE] if (use_cookies and os.path.exists(COOKIES_FILE)) else []
     cmd = ["yt-dlp",
            "-x", "--audio-format", "flac", "--audio-quality", "0",
+           "--postprocessor-args", f"ExtractAudio:-af {LOUDNORM_FILTER}",
            "--add-metadata", "--embed-thumbnail", "--output", out_template,
            "--no-playlist",
            "--retries", "1", "--fragment-retries", "1", "--extractor-retries", "1",

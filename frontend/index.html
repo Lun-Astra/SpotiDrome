@@ -420,6 +420,18 @@ header{
           <button class="btn btn-primary" onclick="saveCookies()">Save Cookies</button>
         </div>
       </div>
+      <div style="height:1px;background:var(--border);margin:4px 0"></div>
+      <div class="settings-sec" style="margin-top:12px">
+        <div class="settings-sec-title">Library Maintenance</div>
+        <div class="settings-row">
+          <div><div class="settings-label">Relabel Genres</div><div class="settings-sub">Rewrite every track's genre from Spotify (falls back to YouTube) — tags only, nothing re-downloaded</div></div>
+          <button class="btn btn-nd" id="btn-relabel-genres" onclick="relabelGenres()" style="flex-shrink:0">🏷 Relabel</button>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-label">Normalize Volume</div><div class="settings-sub">Even out loudness across the whole library to the same target new downloads use</div></div>
+          <button class="btn btn-nd" id="btn-normalize-volume" onclick="normalizeVolume()" style="flex-shrink:0">🔊 Normalize</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -516,10 +528,6 @@ header{
           </div>
           <div id="health-list"><div class="empty" style="padding:14px">Loading…</div></div>
           <div class="health-dup-line" id="health-dup-line">Duplicate sweep: no run yet</div>
-          <div class="health-dup-line" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-            <span>Relabel every track's genre from Spotify (falls back to YouTube if Spotify has none) — updates tags in place, nothing is re-downloaded.</span>
-            <button class="btn btn-nd" id="btn-relabel-genres" onclick="relabelGenres()" style="flex-shrink:0">🏷 Relabel Genres</button>
-          </div>
         </div>
       </div>
 
@@ -866,6 +874,19 @@ async function relabelGenres(){
     const r=await fetch(`${API}/library/retag-genres`,{method:'POST'});
     const d=await r.json();
     if(!r.ok){alert('Error: '+(d.error||'Could not start')+(d.auth_url?'\n\nReconnect Spotify first.':''));return;}
+    renderJobs();
+  }catch(e){alert('Failed: '+e.message);}
+  finally{btn.disabled=false;btn.innerHTML=orig;}
+}
+
+async function normalizeVolume(){
+  if(!confirm('Scan the whole library and normalize loudness across every track to a common target? Only tracks outside that target are re-encoded (tags and artwork are preserved) — this can take a while for a large library, progress shows up in Download Jobs.'))return;
+  const btn=document.getElementById('btn-normalize-volume');
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
+  try{
+    const r=await fetch(`${API}/library/normalize-volume`,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
     renderJobs();
   }catch(e){alert('Failed: '+e.message);}
   finally{btn.disabled=false;btn.innerHTML=orig;}

@@ -1876,6 +1876,215 @@ def genre_relabel_worker(job_id):
         jobs[job_id]["current_track"] = None
         save_jobs()
 
+# ─── Volume normalization (existing library) ───────────────────────────────
+# New downloads are already normalized on the way in (see LOUDNORM_FILTER /
+# _download_via_yt_dlp), but that does nothing for tracks that were
+# downloaded before that existed. This sweeps the whole library on the
+# Navidrome host over SSH — one file per SSH round trip, same as a genre
+# lookup — and only touches files whose measured loudness actually falls
+# outside the target, re-encoding those in place while preserving every
+# tag and embedded picture exactly as they were.
+#
+# Unlike the download-time normalization (single-pass, to avoid decoding
+# each track twice over the network), this runs measure-then-apply as two
+# real ffmpeg passes per file that needs it — decoding a file that's
+# already local to the Navidrome host is effectively free, and the two-pass
+# form is the more accurate way to hit the target loudness.
+_LOUDNORM_TARGET_I = float(re.search(r"I=(-?[\d.]+)", LOUDNORM_FILTER).group(1))
+_LOUDNORM_TOLERANCE_LU = 1.0  # skip files already within 1 LU of the target
+
+_LOUDNORM_ONE_FILE_SCRIPT = f'''
+import json, os, subprocess, sys, tempfile
+
+path = sys.argv[1]
+FILTER = {LOUDNORM_FILTER!r}
+TARGET_I = {_LOUDNORM_TARGET_I}
+TOLERANCE = {_LOUDNORM_TOLERANCE_LU}
+
+def done(action, **extra):
+    print(json.dumps({{"action": action, **extra}}))
+    sys.exit(0)
+
+def measure():
+    cmd = ["ffmpeg", "-i", path, "-af", FILTER + ":print_format=json", "-vn", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    start = r.stderr.rfind("{{")
+    end = r.stderr.find("}}", start) if start != -1 else -1
+    if start == -1 or end == -1:
+        return None
+    try:
+        return json.loads(r.stderr[start:end + 1])
+    except Exception:
+        return None
+
+ext = os.path.splitext(path)[1].lower()
+if ext not in (".flac", ".mp3"):
+    done("skipped", reason="unsupported format")
+
+summary = measure()
+if summary is None:
+    done("failed", reason="loudness measurement failed")
+
+try:
+    input_i = float(summary.get("input_i", "0"))
+except Exception:
+    input_i = 0.0
+
+if input_i == float("-inf") or abs(input_i - TARGET_I) <= TOLERANCE:
+    done("skipped", lufs=input_i)
+
+if ext == ".flac":
+    from mutagen.flac import FLAC
+    orig = FLAC(path)
+    pictures, vc = orig.pictures, (dict(orig.tags) if orig.tags else {{}})
+    codec_args = ["-c:a", "flac"]
+else:
+    from mutagen.id3 import ID3
+    try:
+        orig_id3 = ID3(path)
+    except Exception:
+        orig_id3 = None
+    codec_args = ["-c:a", "libmp3lame", "-q:a", "0"]
+
+fd, tmp_path = tempfile.mkstemp(suffix=ext, dir=os.path.dirname(path))
+os.close(fd)
+try:
+    cmd = (["ffmpeg", "-y", "-i", path, "-af", FILTER, "-map_metadata", "-1", "-vn"]
+           + codec_args + [tmp_path])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[-300:])
+    if ext == ".flac":
+        new_tags = FLAC(tmp_path)
+        for k, v in vc.items():
+            new_tags[k] = v
+        for pic in pictures:
+            new_tags.add_picture(pic)
+        new_tags.save()
+    elif orig_id3 is not None:
+        orig_id3.save(tmp_path)
+    os.replace(tmp_path, path)
+    done("normalized", lufs_before=input_i)
+except Exception as e:
+    try:
+        os.unlink(tmp_path)
+    except Exception:
+        pass
+    done("failed", reason=str(e)[:200])
+'''
+
+def volume_normalize_worker(job_id):
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+
+    ssh_cfg = load_ssh_config()
+    nd_cfg = load_nd_config()
+    if not ssh_cfg:
+        with job_lock:
+            jobs[job_id]["log"].append("✗ SSH not configured")
+            jobs[job_id]["status"] = "done"
+        return
+
+    with job_lock:
+        jobs[job_id]["current_track"] = "Listing library files on the Navidrome host…"
+    list_cmd = _ssh_cmd(ssh_cfg,
+        f"find {shlex.quote(ssh_cfg['music_path'])} "
+        f"\\( -iname '*.flac' -o -iname '*.mp3' \\) -type f -printf '%P\\n'")
+    try:
+        result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise ValueError(result.stderr[-500:])
+        rel_paths = [p for p in result.stdout.splitlines() if p.strip()]
+    except Exception as e:
+        with job_lock:
+            jobs[job_id]["log"].append(f"✗ Failed to list library: {e}")
+            jobs[job_id]["status"] = "done"
+        return
+
+    with job_lock:
+        jobs[job_id]["total"] = len(rel_paths)
+        jobs[job_id]["log"].append(f"ℹ Found {len(rel_paths)} file(s) on the Navidrome host")
+
+    normalized = failed = skipped = 0
+    for i, rel_path in enumerate(rel_paths):
+        remote_path = f"{ssh_cfg['music_path']}/{rel_path}"
+        with job_lock:
+            jobs[job_id]["current"] = i + 1
+            jobs[job_id]["current_track"] = rel_path
+            skip = jobs[job_id].get("skip_current", False)
+            if skip:
+                jobs[job_id]["skip_current"] = False
+        if skip:
+            skipped += 1
+            with job_lock:
+                jobs[job_id]["log"].append(f"⏭ Skipped: {rel_path}")
+            continue
+
+        cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_LOUDNORM_ONE_FILE_SCRIPT)} "
+                                 f"{shlex.quote(remote_path)}")
+        # run_yt_dlp is a generic "run this subprocess with skip/timeout
+        # supervision" helper despite the name — reused as-is here rather
+        # than renaming it just for this caller.
+        rc, killed, stdout, stderr = run_yt_dlp(cmd, job_id, rel_path, timeout=300)
+
+        if killed == "skipped":
+            skipped += 1
+            with job_lock:
+                jobs[job_id]["log"].append(f"⏭ Skipped: {rel_path}")
+            continue
+        if killed == "timeout":
+            failed += 1
+            with job_lock:
+                jobs[job_id]["log"].append(f"✗ Timed out: {rel_path}")
+            continue
+
+        try:
+            start = stdout.rfind("{")
+            evt = json.loads(stdout[start:]) if start != -1 else {}
+        except Exception:
+            evt = {}
+        action = evt.get("action")
+
+        if action == "normalized":
+            normalized += 1
+            lb = evt.get("lufs_before")
+            lb_str = f"{lb:.1f} LUFS" if isinstance(lb, (int, float)) else "?"
+            with job_lock:
+                jobs[job_id]["log"].append(f"🔊 Normalized: {rel_path} ({lb_str} → {_LOUDNORM_TARGET_I:.0f} LUFS)")
+        elif action == "skipped":
+            skipped += 1
+        elif action == "failed":
+            failed += 1
+            with job_lock:
+                jobs[job_id]["log"].append(f"✗ Failed: {rel_path} — {evt.get('reason', 'unknown error')}")
+        else:
+            failed += 1
+            with job_lock:
+                jobs[job_id]["log"].append(f"✗ Failed: {rel_path} — {_extract_yt_dlp_error(stderr) or 'no result'}")
+
+        with job_lock:
+            jobs[job_id]["downloaded"] = normalized
+            jobs[job_id]["failed"] = failed
+
+    with job_lock:
+        jobs[job_id]["log"].append(
+            f"✅ Done: {normalized} normalized, {skipped} already within target/skipped, {failed} failed")
+
+    if normalized and nd_cfg:
+        with job_lock:
+            jobs[job_id]["status"] = "scanning"
+            jobs[job_id]["current_track"] = "Triggering Navidrome library scan…"
+        ok, msg = nd_trigger_scan(nd_cfg)
+        with job_lock:
+            jobs[job_id]["log"].append(f"🔄 {msg}")
+        if ok:
+            nd_wait_for_scan(nd_cfg, timeout=300)
+
+    with job_lock:
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["current_track"] = None
+        save_jobs()
+
 # ─── Sync health ────────────────────────────────────────────────────────────
 
 def load_sync_health():
@@ -2138,6 +2347,24 @@ def retag_genres():
                         "total": 0, "current": 0, "downloaded": 0, "failed": 0,
                         "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
     threading.Thread(target=genre_relabel_worker, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/library/normalize-volume", methods=["POST"])
+def normalize_volume():
+    """Normalize loudness across the whole existing library in place —
+    measures each file's integrated loudness on the Navidrome host over SSH
+    and re-encodes (preserving every tag and embedded picture) only the
+    files that fall outside the same target new downloads already use."""
+    ssh_cfg = load_ssh_config()
+    if not ssh_cfg:
+        return jsonify({"error": "SSH not configured"}), 400
+
+    job_id = f"volume_normalize_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Volume Normalize] Library", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0,
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+    threading.Thread(target=volume_normalize_worker, args=(job_id,), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 

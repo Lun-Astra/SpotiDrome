@@ -1678,12 +1678,16 @@ def scan_and_dedupe_remote(ssh_cfg, nd_cfg):
                 removed.append({"path": f["path"], "size": f["size"], "video_id": vid})
 
     if removed and nd_cfg:
-        # Full scan, not a regular one — see the note in scan_and_dedupe_by_title;
-        # a regular scan doesn't reliably prune the now-missing file's entry,
-        # which is how this job left orphaned "husk" entries behind too.
-        ok, _msg = nd_trigger_scan(nd_cfg, full=True)
-        if ok:
-            nd_wait_for_scan(nd_cfg, timeout=300)
+        # A full scan alone isn't enough here — this Navidrome only ever
+        # flags a vanished file's row as missing=1, it doesn't delete it
+        # (that's why /cleanup/delete above resorts to a direct SQL DELETE
+        # too). Reuse that same proven approach: find every row whose file
+        # is actually gone and delete the row outright, which is what
+        # actually clears the "husk" left behind by the rm above.
+        try:
+            prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg)
+        except Exception as e:
+            print(f"[dedupe] Orphan prune after delete failed: {e}", file=sys.stderr)
 
     report = {"last_run": datetime.utcnow().isoformat(), "removed": removed, "error": None}
     save_duplicate_report(report)
@@ -1805,9 +1809,11 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
     deletions left an orphaned Navidrome entry behind (a "husk" — a
     library row pointing at a file that no longer exists), because the
     scan triggered after deleting was a regular scan rather than a full
-    one, and only a full scan actually prunes missing files here. Both
-    are fixed below: the artist match is stricter and now corroborated by
-    duration, and the post-delete scan is a full scan that's waited on."""
+    one — and it turns out even a full scan only flags a vanished file's
+    row as missing=1 here rather than deleting it. Both are fixed below:
+    the artist match is stricter and now corroborated by duration, and
+    the post-delete cleanup directly prunes the now-orphaned row(s)
+    instead of counting on any scan to do it."""
     prior = load_title_duplicate_report()
     history = prior.get("history", [])
 
@@ -1905,13 +1911,15 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
         save_ignored_tracks(ignored)
 
     if removed and nd_cfg:
-        # Must be a FULL scan, not a regular one — a regular scan doesn't
-        # reliably prune Navidrome's entry for a file that just vanished
-        # out from under it, which is exactly what left the earlier round
-        # of this job with orphaned "husk" entries in the library.
-        ok, _msg = nd_trigger_scan(nd_cfg, full=True)
-        if ok:
-            nd_wait_for_scan(nd_cfg, timeout=300)
+        # A full scan alone doesn't do it — this Navidrome only flags a
+        # vanished file's row as missing=1 rather than deleting it (same
+        # reason /cleanup/delete above resorts to a direct SQL DELETE).
+        # Reuse that proven approach: find every row whose file is
+        # actually gone and delete the row outright.
+        try:
+            prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg)
+        except Exception as e:
+            print(f"[title-dedupe] Orphan prune after delete failed: {e}", file=sys.stderr)
 
     report = {"last_run": datetime.utcnow().isoformat(), "removed": removed, "error": None, "history": history}
     save_title_duplicate_report(report)

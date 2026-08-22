@@ -431,6 +431,10 @@ header{
           <div><div class="settings-label">Normalize Volume</div><div class="settings-sub">Even out loudness across the whole library to the same target new downloads use</div></div>
           <button class="btn btn-nd" id="btn-normalize-volume" onclick="normalizeVolume()" style="flex-shrink:0">🔊 Normalize</button>
         </div>
+        <div class="settings-row">
+          <div><div class="settings-label">Fix Broken Entries</div><div class="settings-sub">Removes Navidrome library rows left behind by a file that's gone missing from disk — never deletes a real file, only the stale database row for one already gone</div></div>
+          <button class="btn btn-nd" id="btn-prune-orphans" onclick="pruneOrphans()" style="flex-shrink:0">🩹 Scan &amp; Fix</button>
+        </div>
       </div>
     </div>
   </div>
@@ -893,6 +897,24 @@ async function normalizeVolume(){
     const d=await r.json();
     if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
     renderJobs();
+  }catch(e){alert('Failed: '+e.message);}
+  finally{btn.disabled=false;btn.innerHTML=orig;}
+}
+
+async function pruneOrphans(){
+  const btn=document.getElementById('btn-prune-orphans');
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Scanning…';
+  try{
+    const r=await fetch(`${API}/library/orphans`);
+    const d=await r.json();
+    if(!r.ok){alert('Error: '+(d.error||'Scan failed'));return;}
+    if(!d.count){alert('✓ No broken entries found — library is clean.');return;}
+    if(!confirm(`Found ${d.count} Navidrome entr${d.count===1?'y':'ies'} pointing at a file that's missing from disk. Remove just those database rows (no files are touched — they're already gone) and do a full rescan?`))return;
+    btn.innerHTML='<span class="spin"></span> Fixing…';
+    const r2=await fetch(`${API}/library/orphans/prune`,{method:'POST'});
+    const d2=await r2.json();
+    if(!r2.ok){alert('Error: '+(d2.error||'Prune failed'));return;}
+    alert(`✓ Removed ${d2.pruned} broken entr${d2.pruned===1?'y':'ies'} and triggered a full library rescan.`);
   }catch(e){alert('Failed: '+e.message);}
   finally{btn.disabled=false;btn.innerHTML=orig;}
 }

@@ -1678,7 +1678,12 @@ def scan_and_dedupe_remote(ssh_cfg, nd_cfg):
                 removed.append({"path": f["path"], "size": f["size"], "video_id": vid})
 
     if removed and nd_cfg:
-        nd_trigger_scan(nd_cfg)
+        # Full scan, not a regular one — see the note in scan_and_dedupe_by_title;
+        # a regular scan doesn't reliably prune the now-missing file's entry,
+        # which is how this job left orphaned "husk" entries behind too.
+        ok, _msg = nd_trigger_scan(nd_cfg, full=True)
+        if ok:
+            nd_wait_for_scan(nd_cfg, timeout=300)
 
     report = {"last_run": datetime.utcnow().isoformat(), "removed": removed, "error": None}
     save_duplicate_report(report)
@@ -1709,27 +1714,53 @@ threading.Thread(target=duplicate_scan_loop, daemon=True).start()
 def load_title_duplicate_report():
     try:
         with open(TITLE_DUPLICATE_REPORT_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+            data.setdefault("history", [])
+            return data
     except Exception:
-        return {"last_run": None, "removed": [], "error": None}
+        return {"last_run": None, "removed": [], "error": None, "history": []}
 
 def save_title_duplicate_report(data):
     with open(TITLE_DUPLICATE_REPORT_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-def _artist_somewhat_matches(a, b, threshold=0.6):
+def _artist_somewhat_matches(a, b, threshold=0.85):
+    """Deliberately strict — this gates an *unattended* nightly delete, so a
+    false positive here means silently losing a real, distinct song. A raw
+    substring check (dropped from an earlier version) let short/generic
+    artist names match all sorts of unrelated collaborators; this now only
+    accepts a whole-word match (every word of the shorter name appears as a
+    whole word in the longer one) or a high overall similarity ratio."""
     a_n = re.sub(r"[^\w\s]", " ", (a or "").lower()).strip()
     b_n = re.sub(r"[^\w\s]", " ", (b or "").lower()).strip()
     a_n = re.sub(r"\s+", " ", a_n)
     b_n = re.sub(r"\s+", " ", b_n)
     if not a_n or not b_n:
         return False
-    if a_n == b_n or a_n in b_n or b_n in a_n:
+    if a_n == b_n:
+        return True
+    a_words, b_words = set(a_n.split()), set(b_n.split())
+    shorter, longer = (a_words, b_words) if len(a_words) <= len(b_words) else (b_words, a_words)
+    if shorter and shorter.issubset(longer):
         return True
     return difflib.SequenceMatcher(None, a_n, b_n).ratio() >= threshold
 
+def _duration_somewhat_matches(a, b, tolerance_sec=12, tolerance_pct=0.1):
+    """Extra corroborating signal for the title/artist dedupe sweep — two
+    files can share a normalized title and a plausible artist match while
+    still being genuinely different recordings (a short intro/reprise with
+    the same name as the full track, a different edit, etc.). Missing
+    duration data (0 or absent, e.g. an old scan before this field existed)
+    never blocks a match on its own — it just means duration adds nothing
+    for that pair."""
+    if not a or not b:
+        return True
+    diff = abs(a - b)
+    return diff <= tolerance_sec or diff <= max(a, b) * tolerance_pct
+
 _TITLE_DEDUPE_SCAN_SCRIPT = r'''
 import json, os, sys
+import mutagen
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, error as ID3Error
 
@@ -1750,21 +1781,38 @@ for root, dirs, files in os.walk(MUSIC):
             else:
                 continue
             size = os.path.getsize(p)
+            try:
+                duration = mutagen.File(p).info.length
+            except Exception:
+                duration = 0
         except Exception:
             continue
         if title and artist:
-            out.append({"path": p, "title": title, "artist": artist, "size": size})
+            out.append({"path": p, "title": title, "artist": artist, "size": size, "duration": duration})
 print(json.dumps(out))
 '''
 
 def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
-    """Removes the smaller file(s) from each title+artist duplicate
-    cluster found across the whole library, then adds each removed
-    track's own artist/title to the permanent ignore list — same as a
-    user manually marking it ignored — so a future playlist sync or jam
-    request doesn't just re-download the very duplicate just removed."""
+    """Removes the smaller file(s) from each title+artist(+duration)
+    duplicate cluster found across the whole library, then adds each
+    removed track's own artist/title to the permanent ignore list — same
+    as a user manually marking it ignored — so a future playlist sync or
+    jam request doesn't just re-download the very duplicate just removed.
+
+    2026-08-22: after this ran unattended for a couple of nights, a
+    library audit found real, distinct songs among the removed tracks
+    (the artist-match threshold was too loose) *and* every one of those
+    deletions left an orphaned Navidrome entry behind (a "husk" — a
+    library row pointing at a file that no longer exists), because the
+    scan triggered after deleting was a regular scan rather than a full
+    one, and only a full scan actually prunes missing files here. Both
+    are fixed below: the artist match is stricter and now corroborated by
+    duration, and the post-delete scan is a full scan that's waited on."""
+    prior = load_title_duplicate_report()
+    history = prior.get("history", [])
+
     if not ssh_cfg:
-        report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": "SSH not configured"}
+        report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": "SSH not configured", "history": history}
         save_title_duplicate_report(report)
         return report
 
@@ -1775,12 +1823,12 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
-            report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": result.stderr[-300:]}
+            report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": result.stderr[-300:], "history": history}
             save_title_duplicate_report(report)
             return report
         files = json.loads(result.stdout.strip() or "[]")
     except Exception as e:
-        report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": str(e)}
+        report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": str(e), "history": history}
         save_title_duplicate_report(report)
         return report
 
@@ -1802,13 +1850,18 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
     for group in by_title.values():
         if len(group) < 2:
             continue
-        # Cluster within this title group by fuzzy artist match — same
-        # title with genuinely different artists (two different songs
-        # that happen to share a name) must never be merged.
+        # Cluster within this title group by fuzzy artist match *and*
+        # duration — same title with a different artist, or a
+        # suspiciously different length, is never merged. Same title +
+        # plausible artist alone isn't enough; two of the three
+        # (title/artist/duration) agreeing loosely is how the last round
+        # of this let real, distinct songs get merged and deleted.
         clusters = []
         for f in group:
             for cluster in clusters:
-                if _artist_somewhat_matches(f["artist"], cluster[0]["artist"]):
+                anchor = cluster[0]
+                if (_artist_somewhat_matches(f["artist"], anchor["artist"]) and
+                        _duration_somewhat_matches(f.get("duration", 0), anchor.get("duration", 0))):
                     cluster.append(f)
                     break
             else:
@@ -1825,7 +1878,8 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
     if len(plan) > MAX_TITLE_DEDUPE_PER_RUN:
         report = {"last_run": datetime.utcnow().isoformat(), "removed": [],
                    "error": f"Safety cap hit: {len(plan)} would be removed in one run "
-                            f"(max {MAX_TITLE_DEDUPE_PER_RUN}) — skipped entirely for a human to check first."}
+                            f"(max {MAX_TITLE_DEDUPE_PER_RUN}) — skipped entirely for a human to check first.",
+                   "history": history}
         save_title_duplicate_report(report)
         print(f"[title-dedupe] {report['error']}", file=sys.stderr)
         return report
@@ -1839,8 +1893,10 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
         rm_result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
         if rm_result.returncode != 0:
             continue
-        removed.append({"path": d["path"], "size": d["size"], "title": d["title"],
-                         "artist": d["artist"], "kept": keep["path"]})
+        entry = {"path": d["path"], "size": d["size"], "title": d["title"],
+                 "artist": d["artist"], "kept": keep["path"], "removed_at": datetime.utcnow().isoformat()}
+        removed.append(entry)
+        history.append(entry)
         key = track_ignore_key(d["artist"], d["title"])
         ignored = load_ignored_tracks()
         ignored[key] = {"artist": d["artist"], "title": d["title"],
@@ -1849,11 +1905,17 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
         save_ignored_tracks(ignored)
 
     if removed and nd_cfg:
-        nd_trigger_scan(nd_cfg)
+        # Must be a FULL scan, not a regular one — a regular scan doesn't
+        # reliably prune Navidrome's entry for a file that just vanished
+        # out from under it, which is exactly what left the earlier round
+        # of this job with orphaned "husk" entries in the library.
+        ok, _msg = nd_trigger_scan(nd_cfg, full=True)
+        if ok:
+            nd_wait_for_scan(nd_cfg, timeout=300)
 
-    report = {"last_run": datetime.utcnow().isoformat(), "removed": removed, "error": None}
+    report = {"last_run": datetime.utcnow().isoformat(), "removed": removed, "error": None, "history": history}
     save_title_duplicate_report(report)
-    print(f"[title-dedupe] Removed {len(removed)} duplicate(s) by title/artist match, added to ignore list")
+    print(f"[title-dedupe] Removed {len(removed)} duplicate(s) by title/artist/duration match, added to ignore list")
     return report
 
 # ─── Genre relabeling (retag existing library in place) ────────────────────
@@ -1923,6 +1985,98 @@ def _ssh_cmd(ssh_cfg, remote_command):
     return ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(ssh_cfg["port"]),
             "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
             f"{ssh_cfg['user']}@{ssh_cfg['host']}", remote_command]
+
+# ─── Orphaned Navidrome entries ("husks") ──────────────────────────────────
+# A file deleted straight off disk (by either dedupe sweep above, or by hand)
+# leaves Navidrome's own database row behind unless a *full* scan runs
+# afterward — both sweeps now do that going forward, but this cleans up
+# whatever was already left behind by a run from before that fix, or by
+# anything else that ever removed a file without triggering one.
+_ORPHAN_SCAN_REMOTE_SCRIPT = r'''
+import sys
+music = sys.argv[1]
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    id_, path = line.split("\x01", 1)
+    full = path if path.startswith("/") else f"{music}/{path}"
+    import os
+    if not os.path.isfile(full):
+        print(id_)
+'''
+
+def find_orphaned_navidrome_entries(ssh_cfg):
+    """Returns [{'id':..., 'path':...}] for every media_file row whose file
+    no longer exists on disk. Read-only — deletes nothing."""
+    # SQLite's own char(1) inserts the delimiter directly in the query
+    # output, rather than relying on a shell-quoted -separator flag that
+    # would depend on the remote's login shell supporting ANSI-C quoting.
+    select_cmd = _ssh_cmd(ssh_cfg,
+        "sqlite3 /var/lib/navidrome/navidrome.db "
+        "\"SELECT id || char(1) || path FROM media_file;\"")
+    result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-300:] or "sqlite3 select failed")
+    rows = {}
+    for line in result.stdout.splitlines():
+        if "\x01" not in line:
+            continue
+        id_, path = line.split("\x01", 1)
+        rows[id_] = path
+
+    filter_cmd = _ssh_cmd(ssh_cfg,
+        f"python3 -c {shlex.quote(_ORPHAN_SCAN_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+    result = subprocess.run(filter_cmd, input=result.stdout, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-300:] or "orphan filter failed")
+    missing_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return [{"id": i, "path": rows.get(i, "")} for i in missing_ids]
+
+def prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg):
+    orphans = find_orphaned_navidrome_entries(ssh_cfg)
+    if not orphans:
+        return {"pruned": 0, "entries": [], "error": None}
+
+    ids_str = ",".join(f"'{o['id']}'" for o in orphans)
+    del_cmd = _ssh_cmd(ssh_cfg,
+        f"sqlite3 /var/lib/navidrome/navidrome.db \"DELETE FROM media_file WHERE id IN ({ids_str});\"")
+    result = subprocess.run(del_cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        return {"pruned": 0, "entries": [], "error": result.stderr[-300:]}
+
+    if nd_cfg:
+        ok, _msg = nd_trigger_scan(nd_cfg, full=True)
+        if ok:
+            nd_wait_for_scan(nd_cfg, timeout=300)
+
+    return {"pruned": len(orphans), "entries": orphans, "error": None}
+
+def _navidrome_has_close_match(title, artist, nd_cfg):
+    """True if Navidrome already has a song that's plausibly this same
+    title+artist, under whatever tags it actually has (which can differ
+    from the exact string being searched for — that's precisely how the
+    title/artist dedupe sweep above found it as a "duplicate" in the
+    first place). Used by the dedupe-undo recovery below so it doesn't
+    just re-download a fresh copy of something that already has a
+    surviving copy under slightly different tags."""
+    queries = {_normalize_title(title), f"{primary_artist(artist)} {title}", title}
+    seen_ids, candidates = set(), []
+    for q in queries:
+        if not q.strip():
+            continue
+        try:
+            data = nd_subsonic("search3", cfg=nd_cfg, query=q, songCount=25, albumCount=0, artistCount=0)
+        except Exception:
+            continue
+        for s in data.get("searchResult3", {}).get("song", []):
+            if s.get("id") not in seen_ids:
+                seen_ids.add(s.get("id"))
+                candidates.append(s)
+    for s in candidates:
+        if _title_ok(s.get("title", ""), title) and _artist_ok([s.get("artist", "")], artist):
+            return True
+    return False
 
 def genre_relabel_worker(job_id):
     with job_lock:
@@ -2535,6 +2689,79 @@ def normalize_volume():
                         "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
     threading.Thread(target=volume_normalize_worker, args=(job_id,), daemon=True).start()
     return jsonify({"job_id": job_id})
+
+@app.route("/library/redownload-removed", methods=["POST"])
+def redownload_removed():
+    """One-off recovery for the too-aggressive dedupe sweep: un-ignores
+    every track currently blocked because of it, and re-downloads whichever
+    of them don't already have a plausible live copy somewhere in Navidrome
+    under different tags (most of them do — it was usually just the entry
+    that went missing, not the song itself). Safe to call again later; a
+    clean ignore list just reports nothing to do."""
+    ssh_cfg = load_ssh_config()
+    nd_cfg = load_nd_config()
+    if not ssh_cfg:
+        return jsonify({"error": "SSH not configured"}), 400
+
+    ignored = load_ignored_tracks()
+    auto = [(k, v) for k, v in ignored.items() if str(v.get("reason", "")).startswith("Auto-removed")]
+    if not auto:
+        return jsonify({"queued": 0, "skipped": 0, "message": "Nothing to redownload"})
+
+    to_fetch, skipped = [], []
+    for i, (key, v) in enumerate(auto):
+        artist, title = v["artist"], v["title"]
+        if nd_cfg and _navidrome_has_close_match(title, artist, nd_cfg):
+            skipped.append({"artist": artist, "title": title})
+        else:
+            to_fetch.append({"id": f"recovered_{i}", "name": title, "artist": artist,
+                              "album": "", "album_artist": artist, "duration_ms": 0, "image": None})
+        del ignored[key]
+    save_ignored_tracks(ignored)
+
+    if not to_fetch:
+        return jsonify({"queued": 0, "skipped": len(skipped), "skipped_list": skipped,
+                         "message": "Every removed track already has a live match in Navidrome — nothing to redownload."})
+
+    job_id = f"recover_dedupe_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Recovered] Dedupe Undo", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0,
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+    threading.Thread(target=download_worker, args=(job_id, to_fetch, "Recovered Dedupe Undo", None, True),
+                     daemon=True).start()
+    return jsonify({"job_id": job_id, "queued": len(to_fetch), "skipped": len(skipped), "skipped_list": skipped})
+
+@app.route("/library/orphans", methods=["GET"])
+def library_orphans():
+    """Read-only: list Navidrome library entries whose backing file no
+    longer exists on disk (a "husk" left behind by a file deletion that
+    wasn't followed by a full library scan)."""
+    ssh_cfg = load_ssh_config()
+    if not ssh_cfg:
+        return jsonify({"error": "SSH not configured"}), 400
+    try:
+        orphans = find_orphaned_navidrome_entries(ssh_cfg)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"count": len(orphans), "entries": orphans})
+
+@app.route("/library/orphans/prune", methods=["POST"])
+def library_orphans_prune():
+    """Deletes the Navidrome database rows found by /library/orphans (never
+    touches disk — those files are already gone) and triggers a full scan
+    to reconcile. Safe to call repeatedly; a clean library just reports 0."""
+    ssh_cfg = load_ssh_config()
+    if not ssh_cfg:
+        return jsonify({"error": "SSH not configured"}), 400
+    nd_cfg = load_nd_config()
+    try:
+        result = prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    if result.get("error"):
+        return jsonify(result), 500
+    return jsonify(result)
 
 
 # ─── Cleanup routes ───────────────────────────────────────────────────────────

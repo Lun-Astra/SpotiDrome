@@ -1,6 +1,6 @@
-import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib
+import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib, uuid
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import requests as http
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -2057,22 +2057,55 @@ def find_orphaned_navidrome_entries(ssh_cfg):
 
 def prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg):
     orphans = find_orphaned_navidrome_entries(ssh_cfg)
-    if not orphans:
-        return {"pruned": 0, "entries": [], "error": None}
+    pruned_files = 0
+    file_error = None
+    if orphans:
+        ids_str = ",".join(f"'{o['id']}'" for o in orphans)
+        del_cmd = _ssh_cmd(ssh_cfg,
+            f"sqlite3 /var/lib/navidrome/navidrome.db \"DELETE FROM media_file WHERE id IN ({ids_str});\"")
+        result = subprocess.run(del_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            pruned_files = len(orphans)
+        else:
+            file_error = result.stderr[-300:]
 
-    ids_str = ",".join(f"'{o['id']}'" for o in orphans)
-    del_cmd = _ssh_cmd(ssh_cfg,
-        f"sqlite3 /var/lib/navidrome/navidrome.db \"DELETE FROM media_file WHERE id IN ({ids_str});\"")
-    result = subprocess.run(del_cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        return {"pruned": 0, "entries": [], "error": result.stderr[-300:]}
+    # Navidrome's own `album` table is a separate aggregate that doesn't
+    # get cleaned up alongside media_file either — found while building
+    # edition consolidation: ~8% of a real library turned out to be album
+    # rows with a real song_count on paper but zero actual media_file rows
+    # left pointing at them (from earlier deletions, before this function
+    # existed to do it properly). Same underlying pattern as the media_file
+    # husks above, just one table over — a scan alone doesn't reconcile it,
+    # only a direct delete does.
+    pruned_albums = 0
+    album_error = None
+    count_cmd = _ssh_cmd(ssh_cfg,
+        "sqlite3 /var/lib/navidrome/navidrome.db "
+        "\"SELECT COUNT(*) FROM album WHERE id NOT IN (SELECT DISTINCT album_id FROM media_file);\"")
+    result = subprocess.run(count_cmd, capture_output=True, text=True, timeout=20)
+    if result.returncode == 0:
+        try:
+            pruned_albums = int(result.stdout.strip())
+        except ValueError:
+            pruned_albums = 0
+        if pruned_albums:
+            del_cmd = _ssh_cmd(ssh_cfg,
+                "sqlite3 /var/lib/navidrome/navidrome.db "
+                "\"DELETE FROM album WHERE id NOT IN (SELECT DISTINCT album_id FROM media_file);\"")
+            result = subprocess.run(del_cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                pruned_albums = 0
+                album_error = result.stderr[-300:]
+    else:
+        album_error = result.stderr[-300:]
 
-    if nd_cfg:
+    if (pruned_files or pruned_albums) and nd_cfg:
         ok, _msg = nd_trigger_scan(nd_cfg, full=True)
         if ok:
             nd_wait_for_scan(nd_cfg, timeout=300)
 
-    return {"pruned": len(orphans), "entries": orphans, "error": None}
+    return {"pruned": pruned_files, "entries": orphans, "pruned_albums": pruned_albums,
+            "error": file_error or album_error}
 
 def _navidrome_has_close_match(title, artist, nd_cfg):
     """True if Navidrome already has a song that's plausibly this same
@@ -2224,37 +2257,42 @@ def genre_relabel_worker(job_id):
 # ─── Volume normalization (existing library) ───────────────────────────────
 # New downloads are already normalized on the way in (see LOUDNORM_FILTER /
 # _download_via_yt_dlp), but that does nothing for tracks that were
-# downloaded before that existed. This sweeps the whole library on the
-# Navidrome host over SSH — one file per SSH round trip, same as a genre
-# lookup — and only touches files whose measured loudness actually falls
-# outside the target, re-encoding those in place while preserving every
-# tag and embedded picture exactly as they were.
+# downloaded before that existed. This sweeps the whole library and only
+# touches files whose measured loudness actually falls outside the target,
+# re-encoding those in place while preserving every tag and embedded
+# picture exactly as they were.
 #
-# Unlike the download-time normalization (single-pass, to avoid decoding
-# each track twice over the network), this runs measure-then-apply as two
-# real ffmpeg passes per file that needs it — decoding a file that's
-# already local to the Navidrome host is effectively free, and the two-pass
-# form is the more accurate way to hit the target loudness.
+# 2026-08-27: this used to run entirely over SSH on the Navidrome host —
+# one Python process per file, doing both the measure and encode ffmpeg
+# passes remotely. Very slow in practice, and the reason turned out to be
+# the Navidrome host itself: it has exactly 1 CPU core and 1GB RAM, so
+# 3000+ files' worth of CPU-bound ffmpeg work was always going to run at
+# whatever a single core allows, one file after another, no matter how the
+# code was written. This container has 2 cores and isn't also trying to
+# stay responsive for live streaming at the same time — so the actual
+# audio work (both ffmpeg passes) now happens HERE instead, with 2 files
+# in flight at once to actually use both cores. Only a small download-then-
+# upload trip goes over SSH per file now, not the CPU-bound part.
 _LOUDNORM_TARGET_I = float(re.search(r"I=(-?[\d.]+)", LOUDNORM_FILTER).group(1))
 _LOUDNORM_TOLERANCE_LU = 1.0  # skip files already within 1 LU of the target
+NORMALIZE_TMP_DIR = os.path.join(DOWNLOAD_DIR, "_normalize_tmp")
+NORMALIZE_WORKERS = 2  # matches this container's own CPU limit (see docker-compose.yml) —
+                       # the Navidrome host has only 1 core, which was the actual bottleneck
 
-_LOUDNORM_ONE_FILE_SCRIPT = f'''
-import json, os, subprocess, sys, tempfile
 
-path = sys.argv[1]
-FILTER = {LOUDNORM_FILTER!r}
-TARGET_I = {_LOUDNORM_TARGET_I}
-TOLERANCE = {_LOUDNORM_TOLERANCE_LU}
+def _nice():
+    """preexec_fn for the local ffmpeg calls below — this container also
+    serves live web/stream requests while up to NORMALIZE_WORKERS of these
+    run, so the CPU-bound encode work shouldn't get to starve it."""
+    os.nice(10)
 
-def done(action, **extra):
-    print(json.dumps({{"action": action, **extra}}))
-    sys.exit(0)
 
-def measure():
-    cmd = ["ffmpeg", "-i", path, "-af", FILTER + ":print_format=json", "-vn", "-f", "null", "-"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    start = r.stderr.rfind("{{")
-    end = r.stderr.find("}}", start) if start != -1 else -1
+def _measure_loudness(local_path):
+    cmd = ["ffmpeg", "-i", local_path, "-af", LOUDNORM_FILTER + ":print_format=json",
+           "-vn", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, preexec_fn=_nice)
+    start = r.stderr.rfind("{")
+    end = r.stderr.find("}", start) if start != -1 else -1
     if start == -1 or end == -1:
         return None
     try:
@@ -2262,73 +2300,113 @@ def measure():
     except Exception:
         return None
 
-ext = os.path.splitext(path)[1].lower()
-if ext not in (".flac", ".mp3"):
-    done("skipped", reason="unsupported format")
 
-summary = measure()
-if summary is None:
-    done("failed", reason="loudness measurement failed")
+def _normalize_one_file_local(ssh_cfg, rel_path):
+    """Downloads one file, measures it, and — only if it's actually
+    outside the target — re-encodes it locally and uploads just the
+    result, finishing with the exact same safety properties the old
+    remote-only version had: a same-directory temp file on the Navidrome
+    side (so the final swap is an atomic same-filesystem rename, not a
+    cross-filesystem copy), permissions explicitly copied from the
+    original file rather than left at whatever a fresh file defaults to
+    (see the ~74%-of-the-library-unplayable incident this app already had
+    from getting exactly that wrong), and the original never touched
+    unless a full, verified replacement is ready. Returns a result dict
+    shaped like {"action": "normalized"|"skipped"|"failed", ...}."""
+    remote_path = f"{ssh_cfg['music_path']}/{rel_path}"
+    ext = os.path.splitext(rel_path)[1].lower()
+    if ext not in (".flac", ".mp3"):
+        return {"action": "skipped", "reason": "unsupported format", "rel_path": rel_path}
 
-try:
-    input_i = float(summary.get("input_i", "0"))
-except Exception:
-    input_i = 0.0
-
-if input_i == float("-inf") or abs(input_i - TARGET_I) <= TOLERANCE:
-    done("skipped", lufs=input_i)
-
-if ext == ".flac":
-    from mutagen.flac import FLAC
-    orig = FLAC(path)
-    pictures, vc = orig.pictures, (dict(orig.tags) if orig.tags else {{}})
-    codec_args = ["-c:a", "flac"]
-else:
-    from mutagen.id3 import ID3
+    os.makedirs(NORMALIZE_TMP_DIR, exist_ok=True)
+    local_in = os.path.join(NORMALIZE_TMP_DIR, f"{uuid.uuid4().hex}{ext}")
+    local_out = None
     try:
-        orig_id3 = ID3(path)
-    except Exception:
-        orig_id3 = None
-    codec_args = ["-c:a", "libmp3lame", "-q:a", "0"]
+        scp_down = ["scp", "-i", "/root/.ssh/id_rsa", "-P", str(ssh_cfg["port"]),
+                    "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                    f"{ssh_cfg['user']}@{ssh_cfg['host']}:{remote_path}", local_in]
+        r = subprocess.run(scp_down, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return {"action": "failed", "reason": f"download failed: {r.stderr[-200:]}", "rel_path": rel_path}
 
-fd, tmp_path = tempfile.mkstemp(suffix=ext, dir=os.path.dirname(path))
-os.close(fd)
-try:
-    cmd = (["ffmpeg", "-y", "-i", path, "-af", FILTER, "-map_metadata", "-1", "-vn"]
-           + codec_args + [tmp_path])
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=280)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr[-300:])
-    if ext == ".flac":
-        new_tags = FLAC(tmp_path)
-        for k, v in vc.items():
-            new_tags[k] = v
-        for pic in pictures:
-            new_tags.add_picture(pic)
-        new_tags.save()
-    elif orig_id3 is not None:
-        orig_id3.save(tmp_path)
-    # tempfile.mkstemp() deliberately creates its file mode 0600 (owner-only)
-    # — a sane default for an actual temp file, but this one is about to
-    # BECOME the real library file via the os.replace() below, and
-    # os.replace()/rename() does not change permission bits. Left as-is,
-    # every successfully-normalized file ends up owner-read-only — unreadable
-    # by whatever user Navidrome's own service actually runs as (not
-    # necessarily root, and wasn't here), which is exactly what made ~74% of
-    # a real library unplayable after a normalize run. Match the ORIGINAL
-    # file's mode rather than hardcoding one, so this keeps working
-    # correctly regardless of whatever permission convention a given
-    # library/host actually uses.
-    os.chmod(tmp_path, os.stat(path).st_mode)
-    os.replace(tmp_path, path)
-    done("normalized", lufs_before=input_i)
-except Exception as e:
-    try:
-        os.unlink(tmp_path)
-    except Exception:
-        pass
-    done("failed", reason=str(e)[:200])
-'''
+        summary = _measure_loudness(local_in)
+        if summary is None:
+            return {"action": "failed", "reason": "loudness measurement failed", "rel_path": rel_path}
+        try:
+            input_i = float(summary.get("input_i", "0"))
+        except Exception:
+            input_i = 0.0
+        if input_i == float("-inf") or abs(input_i - _LOUDNORM_TARGET_I) <= _LOUDNORM_TOLERANCE_LU:
+            return {"action": "skipped", "lufs": input_i, "rel_path": rel_path}
+
+        if ext == ".flac":
+            orig = FLAC(local_in)
+            pictures, vc = orig.pictures, (dict(orig.tags) if orig.tags else {})
+            codec_args = ["-c:a", "flac"]
+        else:
+            try:
+                orig_id3 = ID3(local_in)
+            except Exception:
+                orig_id3 = None
+            codec_args = ["-c:a", "libmp3lame", "-q:a", "0"]
+
+        local_out = os.path.join(NORMALIZE_TMP_DIR, f"{uuid.uuid4().hex}_out{ext}")
+        # True 2-pass loudnorm — feeds the measurement just taken back into
+        # the actual render. The previous remote-only version measured
+        # first but then ran a plain single-pass encode that re-measured
+        # from scratch internally anyway, discarding the earlier pass
+        # entirely; this is a real accuracy improvement that costs nothing
+        # extra, since the measurement already happened above regardless.
+        render_filter = (
+            f"{LOUDNORM_FILTER}:measured_I={summary.get('input_i')}:"
+            f"measured_TP={summary.get('input_tp')}:measured_LRA={summary.get('input_lra')}:"
+            f"measured_thresh={summary.get('input_thresh')}:"
+            f"offset={summary.get('target_offset', 0)}:linear=true"
+        )
+        cmd = (["ffmpeg", "-y", "-i", local_in, "-af", render_filter, "-map_metadata", "-1", "-vn"]
+               + codec_args + [local_out])
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=280, preexec_fn=_nice)
+        if r.returncode != 0:
+            return {"action": "failed", "reason": r.stderr[-300:], "rel_path": rel_path}
+
+        if ext == ".flac":
+            new_tags = FLAC(local_out)
+            for k, v in vc.items():
+                new_tags[k] = v
+            for pic in pictures:
+                new_tags.add_picture(pic)
+            new_tags.save()
+        elif orig_id3 is not None:
+            orig_id3.save(local_out)
+
+        remote_tmp = f"{remote_path}.normalizing.tmp"
+        scp_up = ["scp", "-i", "/root/.ssh/id_rsa", "-P", str(ssh_cfg["port"]),
+                  "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                  local_out, f"{ssh_cfg['user']}@{ssh_cfg['host']}:{remote_tmp}"]
+        r = subprocess.run(scp_up, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return {"action": "failed", "reason": f"upload failed: {r.stderr[-200:]}", "rel_path": rel_path}
+
+        swap_script = ("import os; "
+                        f"p={remote_path!r}; t={remote_tmp!r}; "
+                        "os.chmod(t, os.stat(p).st_mode); os.replace(t, p)")
+        swap_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(swap_script)}")
+        r = subprocess.run(swap_cmd, capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            subprocess.run(_ssh_cmd(ssh_cfg, f"rm -f -- {shlex.quote(remote_tmp)}"),
+                            capture_output=True, timeout=10)
+            return {"action": "failed", "reason": f"remote swap failed: {r.stderr[-200:]}", "rel_path": rel_path}
+
+        return {"action": "normalized", "lufs_before": input_i, "rel_path": rel_path}
+    except Exception as e:
+        return {"action": "failed", "reason": str(e)[:200], "rel_path": rel_path}
+    finally:
+        for f in (local_in, local_out):
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
 def volume_normalize_worker(job_id):
     with job_lock:
@@ -2341,6 +2419,10 @@ def volume_normalize_worker(job_id):
             jobs[job_id]["log"].append("✗ SSH not configured")
             jobs[job_id]["status"] = "done"
         return
+
+    # Clears out anything left behind by a previous run that crashed or got
+    # killed mid-file — normal runs always clean up their own temp files.
+    shutil.rmtree(NORMALIZE_TMP_DIR, ignore_errors=True)
 
     with job_lock:
         jobs[job_id]["current_track"] = "Listing library files on the Navidrome host…"
@@ -2363,65 +2445,55 @@ def volume_normalize_worker(job_id):
         jobs[job_id]["log"].append(f"ℹ Found {len(rel_paths)} file(s) on the Navidrome host")
 
     normalized = failed = skipped = 0
-    for i, rel_path in enumerate(rel_paths):
-        remote_path = f"{ssh_cfg['music_path']}/{rel_path}"
-        with job_lock:
-            jobs[job_id]["current"] = i + 1
-            jobs[job_id]["current_track"] = rel_path
-            skip = jobs[job_id].get("skip_current", False)
-            if skip:
-                jobs[job_id]["skip_current"] = False
-        if skip:
-            skipped += 1
-            with job_lock:
-                jobs[job_id]["log"].append(f"⏭ Skipped: {rel_path}")
-            continue
+    completed = 0
+    # All tasks submitted up front — ThreadPoolExecutor's own internal queue
+    # bounds how many actually run at once (NORMALIZE_WORKERS, matching this
+    # container's CPU limit), so there's no need to hand-manage a submission
+    # window. "Skip" cancels whatever's still queued (not-yet-started) rather
+    # than one specific file — the at-most-NORMALIZE_WORKERS already running
+    # just finish naturally; there's no single "current file" to interrupt
+    # once several run concurrently.
+    with ThreadPoolExecutor(max_workers=NORMALIZE_WORKERS) as executor:
+        future_to_path = {executor.submit(_normalize_one_file_local, ssh_cfg, rel_path): rel_path
+                           for rel_path in rel_paths}
+        for future in as_completed(future_to_path):
+            rel_path = future_to_path[future]
+            completed += 1
 
-        cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_LOUDNORM_ONE_FILE_SCRIPT)} "
-                                 f"{shlex.quote(remote_path)}")
-        # run_yt_dlp is a generic "run this subprocess with skip/timeout
-        # supervision" helper despite the name — reused as-is here rather
-        # than renaming it just for this caller.
-        rc, killed, stdout, stderr = run_yt_dlp(cmd, job_id, rel_path, timeout=300)
+            with job_lock:
+                stop = jobs[job_id].get("skip_current", False)
+                if stop:
+                    jobs[job_id]["skip_current"] = False
+            if stop:
+                for f in future_to_path:
+                    f.cancel()
+                with job_lock:
+                    jobs[job_id]["log"].append("⏭ Stopping — letting in-progress files finish, cancelling the rest")
 
-        if killed == "skipped":
-            skipped += 1
-            with job_lock:
-                jobs[job_id]["log"].append(f"⏭ Skipped: {rel_path}")
-            continue
-        if killed == "timeout":
-            failed += 1
-            with job_lock:
-                jobs[job_id]["log"].append(f"✗ Timed out: {rel_path}")
-            continue
+            try:
+                evt = future.result()
+            except Exception as e:
+                evt = {"action": "failed", "reason": str(e)[:200]}
+            action = evt.get("action")
 
-        try:
-            start = stdout.rfind("{")
-            evt = json.loads(stdout[start:]) if start != -1 else {}
-        except Exception:
-            evt = {}
-        action = evt.get("action")
+            if action == "normalized":
+                normalized += 1
+                lb = evt.get("lufs_before")
+                lb_str = f"{lb:.1f} LUFS" if isinstance(lb, (int, float)) else "?"
+                with job_lock:
+                    jobs[job_id]["log"].append(f"🔊 Normalized: {rel_path} ({lb_str} → {_LOUDNORM_TARGET_I:.0f} LUFS)")
+            elif action == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+                with job_lock:
+                    jobs[job_id]["log"].append(f"✗ Failed: {rel_path} — {evt.get('reason', 'unknown error')}")
 
-        if action == "normalized":
-            normalized += 1
-            lb = evt.get("lufs_before")
-            lb_str = f"{lb:.1f} LUFS" if isinstance(lb, (int, float)) else "?"
             with job_lock:
-                jobs[job_id]["log"].append(f"🔊 Normalized: {rel_path} ({lb_str} → {_LOUDNORM_TARGET_I:.0f} LUFS)")
-        elif action == "skipped":
-            skipped += 1
-        elif action == "failed":
-            failed += 1
-            with job_lock:
-                jobs[job_id]["log"].append(f"✗ Failed: {rel_path} — {evt.get('reason', 'unknown error')}")
-        else:
-            failed += 1
-            with job_lock:
-                jobs[job_id]["log"].append(f"✗ Failed: {rel_path} — {_extract_yt_dlp_error(stderr) or 'no result'}")
-
-        with job_lock:
-            jobs[job_id]["downloaded"] = normalized
-            jobs[job_id]["failed"] = failed
+                jobs[job_id]["current"] = completed
+                jobs[job_id]["current_track"] = rel_path
+                jobs[job_id]["downloaded"] = normalized
+                jobs[job_id]["failed"] = failed
 
     with job_lock:
         jobs[job_id]["log"].append(
@@ -2796,6 +2868,324 @@ def library_orphans_prune():
     if result.get("error"):
         return jsonify(result), 500
     return jsonify(result)
+
+
+# ─── Edition consolidation (deluxe/remaster/etc. split across albums) ──────
+# Spotify keeps a track's own "canonical album" pointed at whatever release
+# it was originally on, even once a Deluxe/Remaster/Anniversary edition
+# containing a copy of that same track exists too — so syncing a playlist
+# faithfully tags each track by ITS OWN canonical album, which is accurate
+# per-track but leaves something like a 22-track "Deluxe Version" release
+# looking like a 7-track album in the library (just the tracks that only
+# exist on the deluxe edition), with the other 15 sitting under the
+# original release's name instead — never wrong exactly, just never
+# assembled into the complete thing the way Spotify's own UI shows it.
+# This scans the whole library for exactly that pattern (same artist, same
+# base album name, more than one edition suffix in use) and consolidates
+# each family into whichever edition's real Spotify tracklist is the most
+# complete one.
+
+_EDITION_SUFFIX_RE = re.compile(
+    r"\s*[\(\[](deluxe(\s+version)?|super\s+deluxe|remaster(ed)?(\s*\d{0,4})?|"
+    r"anniversary(\s+edition)?|special\s+edition|expanded(\s+edition)?|"
+    r"bonus\s+track(s)?(\s+version)?)[\)\]]\s*$",
+    re.IGNORECASE)
+
+def _edition_base_name(album):
+    return _EDITION_SUFFIX_RE.sub("", album or "").strip()
+
+def find_edition_families(albums):
+    """albums: [{'artist':..., 'name':...}, ...] (as returned by Navidrome).
+    Returns {(artist, base_name): {raw_album_name, ...}} for every group
+    where the same artist has more than one differently-named album
+    sharing a base name once a trailing edition suffix is stripped —
+    i.e. an actual candidate, not just every album in the library."""
+    groups = {}
+    for a in albums:
+        artist, name = (a.get("artist") or "").strip(), (a.get("name") or "").strip()
+        if not artist or not name:
+            continue
+        base = _edition_base_name(name)
+        if not base:
+            continue
+        key = (artist, base)
+        groups.setdefault(key, set()).add(name)
+    return {k: v for k, v in groups.items() if len(v) > 1}
+
+def _find_complete_spotify_edition(sp, artist, base_name):
+    """Searches Spotify for every album release matching artist+base_name
+    and returns (album_id, full_tracklist) for whichever has the most
+    tracks — the most complete edition to consolidate everything into.
+    None if Spotify has nothing useful (a private/unreleased/mistagged
+    situation this can't safely resolve)."""
+    try:
+        result = sp.search(q=f'artist:"{artist}" album:"{base_name}"', type="album", limit=10)
+        candidates = result.get("albums", {}).get("items", [])
+        if not candidates:
+            result = sp.search(q=f"{artist} {base_name}", type="album", limit=10)
+            candidates = result.get("albums", {}).get("items", [])
+        candidates = [c for c in candidates
+                      if _edition_base_name(c.get("name", "")) and
+                      difflib.SequenceMatcher(None, _edition_base_name(c["name"]).lower(),
+                                               base_name.lower()).ratio() >= 0.85]
+        if not candidates:
+            return None, None
+        best = max(candidates, key=lambda c: c.get("total_tracks", 0))
+        tracks = sp.album_tracks(best["id"])["items"]
+        return best["id"], [{"title": t["name"], "duration_sec": t["duration_ms"] / 1000} for t in tracks]
+    except Exception as e:
+        print(f"[editions] Spotify lookup failed for {artist} / {base_name}: {e}", file=sys.stderr)
+        return None, None
+
+def consolidate_editions_worker(job_id):
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+
+    ssh_cfg = load_ssh_config()
+    nd_cfg = load_nd_config()
+    if not ssh_cfg or not nd_cfg:
+        with job_lock:
+            jobs[job_id]["log"].append("✗ SSH and/or Navidrome not configured")
+            jobs[job_id]["status"] = "done"
+        return
+    sp, auth_url = get_sp()
+    if not sp:
+        with job_lock:
+            jobs[job_id]["log"].append("✗ Spotify not authenticated — can't tell which edition is the complete one")
+            jobs[job_id]["status"] = "done"
+        return
+
+    with job_lock:
+        jobs[job_id]["current_track"] = "Clearing stale album entries first…"
+    try:
+        prune_result = prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg)
+        if prune_result.get("pruned_albums") or prune_result.get("pruned"):
+            with job_lock:
+                jobs[job_id]["log"].append(
+                    f"🧹 Cleared {prune_result.get('pruned_albums', 0)} stale album entries "
+                    f"and {prune_result.get('pruned', 0)} stale track entries first — these would "
+                    f"have muddied the picture below otherwise")
+    except Exception as e:
+        print(f"[editions] Pre-scan prune failed: {e}", file=sys.stderr)
+
+    with job_lock:
+        jobs[job_id]["current_track"] = "Fetching the library from Navidrome…"
+    all_songs, all_albums, offset = [], [], 0
+    while True:
+        data = nd_subsonic("search3", cfg=nd_cfg, query="", songCount=500, songOffset=offset,
+                            albumCount=500, albumOffset=offset, artistCount=0)
+        result = data.get("searchResult3", {})
+        songs, albums = result.get("song", []), result.get("album", [])
+        if not songs and not albums:
+            break
+        all_songs.extend(songs)
+        all_albums.extend(albums)
+        if len(songs) < 500 and len(albums) < 500:
+            break
+        offset += 500
+
+    families = find_edition_families(all_albums)
+    with job_lock:
+        jobs[job_id]["total"] = len(families)
+        jobs[job_id]["log"].append(
+            f"ℹ Found {len(all_albums)} album(s), {len(families)} look like a split edition")
+
+    if not families:
+        with job_lock:
+            jobs[job_id]["log"].append("✅ Nothing looks split across editions — library already consolidated")
+            jobs[job_id]["status"] = "done"
+            save_jobs()
+        return
+
+    songs_by_artist = {}
+    for s in all_songs:
+        songs_by_artist.setdefault((s.get("artist") or "").strip(), []).append(s)
+
+    consolidated_total = missing_total = unresolved = 0
+    touched_any = False
+    for i, ((artist, base), raw_names) in enumerate(sorted(families.items())):
+        with job_lock:
+            jobs[job_id]["current"] = i + 1
+            jobs[job_id]["current_track"] = f"{artist} — {base}"
+            skip = jobs[job_id].get("skip_current", False)
+            if skip:
+                jobs[job_id]["skip_current"] = False
+        if skip:
+            with job_lock:
+                jobs[job_id]["log"].append(f"⏭ Skipped: {artist} — {base}")
+            continue
+
+        album_id, tracklist = _find_complete_spotify_edition(sp, artist, base)
+        if not tracklist:
+            with job_lock:
+                jobs[job_id]["log"].append(f"? {artist} — {base}: no confident Spotify match, leaving as-is "
+                                            f"(editions in library: {', '.join(sorted(raw_names))})")
+            unresolved += 1
+            continue
+        # Recompute the target album name directly from Spotify's own
+        # result rather than guessing which local raw name is "the"
+        # complete one — a library that's never seen the complete
+        # edition's own exact title at all is exactly the case this is
+        # meant to fix.
+        target_album_name = None
+        try:
+            info = sp.album(album_id)
+            target_album_name = info.get("name")
+        except Exception:
+            pass
+        if not target_album_name:
+            with job_lock:
+                jobs[job_id]["log"].append(f"✗ {artist} — {base}: couldn't confirm the target album's real name")
+            unresolved += 1
+            continue
+
+        candidates = songs_by_artist.get(artist, [])
+        moves, missing = [], []
+        for track in tracklist:
+            # Already sitting correctly under the target album? Nothing to do.
+            if any(s.get("album") == target_album_name and _title_ok(s.get("title", ""), track["title"])
+                   for s in candidates):
+                continue
+            # Otherwise, a copy under some other (sibling-edition) album
+            # that should move — duration has to agree too, since two
+            # different tracks can share a title.
+            sibling = next((s for s in candidates
+                             if s.get("album") != target_album_name
+                             and _title_ok(s.get("title", ""), track["title"])
+                             and _duration_close(s.get("duration") or 0, track["duration_sec"])), None)
+            if sibling:
+                moves.append({"song": sibling, "title": track["title"]})
+            else:
+                missing.append(track["title"])
+
+        if not moves and not missing:
+            with job_lock:
+                jobs[job_id]["log"].append(f"✓ {artist} — {target_album_name}: already fully consolidated")
+            continue
+
+        if moves:
+            ids = [m["song"]["id"] for m in moves]
+            id_list = ",".join(f"'{i}'" for i in ids)
+            select_cmd = _ssh_cmd(ssh_cfg,
+                f"sqlite3 /var/lib/navidrome/navidrome.db "
+                f"\"SELECT id || char(1) || path FROM media_file WHERE id IN ({id_list});\"")
+            result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=30)
+            real_paths = {}
+            for line in result.stdout.splitlines():
+                if "\x01" not in line:
+                    continue
+                rid, path = line.split("\x01", 1)
+                real_paths[rid] = path
+
+            new_dir = f"{ssh_cfg['music_path']}/{sanitize(target_album_name)}"
+            batch = []
+            for m in moves:
+                real_path = real_paths.get(m["song"]["id"])
+                if not real_path:
+                    continue
+                old_full = real_path if real_path.startswith("/") else f"{ssh_cfg['music_path']}/{real_path}"
+                batch.append({"old": old_full, "new_dir": new_dir, "new_album": target_album_name})
+
+            if batch:
+                script_cmd = _ssh_cmd(ssh_cfg,
+                    f"python3 -c {shlex.quote(_CONSOLIDATE_REMOTE_SCRIPT)} {shlex.quote(json.dumps(batch))}")
+                result = subprocess.run(script_cmd, capture_output=True, text=True, timeout=120)
+                try:
+                    outcomes = json.loads(result.stdout.strip())
+                except Exception:
+                    outcomes = []
+                ok_count = sum(1 for o in outcomes if o.get("ok"))
+                consolidated_total += ok_count
+                touched_any = touched_any or ok_count > 0
+                with job_lock:
+                    jobs[job_id]["log"].append(
+                        f"🔀 {artist} — {target_album_name}: moved {ok_count}/{len(batch)} track(s) in "
+                        f"from {', '.join(sorted(n for n in raw_names if n != target_album_name))}")
+
+        if missing:
+            missing_total += len(missing)
+            with job_lock:
+                jobs[job_id]["log"].append(
+                    f"⚠ {artist} — {target_album_name}: {len(missing)} track(s) not found anywhere in the "
+                    f"library at all (needs a fresh download, not just a retag): {', '.join(missing[:5])}"
+                    f"{'…' if len(missing) > 5 else ''}")
+
+        with job_lock:
+            jobs[job_id]["downloaded"] = consolidated_total
+            jobs[job_id]["failed"] = missing_total
+
+    if touched_any:
+        with job_lock:
+            jobs[job_id]["current_track"] = "Cleaning up now-orphaned entries and rescanning…"
+        try:
+            prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg)
+        except Exception as e:
+            with job_lock:
+                jobs[job_id]["log"].append(f"⚠ Orphan cleanup failed: {e}")
+
+    with job_lock:
+        jobs[job_id]["log"].append(
+            f"✅ Done: {consolidated_total} track(s) consolidated, {missing_total} missing entirely, "
+            f"{unresolved} famil{'y' if unresolved == 1 else 'ies'} had no confident Spotify match")
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["current_track"] = None
+        save_jobs()
+
+_CONSOLIDATE_REMOTE_SCRIPT = r'''
+import json, os, sys
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TALB, error as ID3Error
+
+moves = json.loads(sys.argv[1])
+results = []
+for m in moves:
+    old = m["old"]
+    try:
+        ext = os.path.splitext(old)[1].lower()
+        os.makedirs(m["new_dir"], exist_ok=True)
+        new_path = os.path.join(m["new_dir"], os.path.basename(old))
+        if ext == ".flac":
+            tags = FLAC(old)
+            tags["album"] = [m["new_album"]]
+            tags.save()
+        elif ext == ".mp3":
+            try:
+                tags = ID3(old)
+            except ID3Error:
+                tags = ID3()
+            tags["TALB"] = TALB(encoding=3, text=m["new_album"])
+            tags.save(old)
+        else:
+            results.append({"old": old, "ok": False, "error": "unsupported format"})
+            continue
+        if os.path.abspath(old) != os.path.abspath(new_path):
+            os.rename(old, new_path)
+        results.append({"old": old, "new": new_path, "ok": True})
+    except Exception as e:
+        results.append({"old": old, "ok": False, "error": str(e)[:200]})
+print(json.dumps(results))
+'''
+
+
+@app.route("/library/consolidate-editions", methods=["POST"])
+def library_consolidate_editions():
+    ssh_cfg = load_ssh_config()
+    if not ssh_cfg:
+        return jsonify({"error": "SSH not configured"}), 400
+    try:
+        sp, url = get_sp()
+    except Exception:
+        sp, url = None, None
+    if not sp:
+        return jsonify({"error": "Spotify not authenticated", "auth_url": url}), 401
+
+    job_id = f"consolidate_editions_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Consolidate Editions] Library", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0,
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+    threading.Thread(target=consolidate_editions_worker, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 
 # ─── Cleanup routes ───────────────────────────────────────────────────────────

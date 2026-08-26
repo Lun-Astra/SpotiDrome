@@ -435,6 +435,10 @@ header{
           <div><div class="settings-label">Fix Broken Entries</div><div class="settings-sub">Removes Navidrome library rows left behind by a file that's gone missing from disk — never deletes a real file, only the stale database row for one already gone</div></div>
           <button class="btn btn-nd" id="btn-prune-orphans" onclick="pruneOrphans()" style="flex-shrink:0">🩹 Scan &amp; Fix</button>
         </div>
+        <div class="settings-row">
+          <div><div class="settings-label">Consolidate Editions</div><div class="settings-sub">Finds albums split across Deluxe/Remastered/Anniversary editions and moves tracks into whichever edition's real tracklist is the most complete one — e.g. a 22-track Deluxe release that only shows 7 tracks because the rest are still filed under the original album</div></div>
+          <button class="btn btn-nd" id="btn-consolidate-editions" onclick="consolidateEditions()" style="flex-shrink:0">🔀 Scan &amp; Fix</button>
+        </div>
       </div>
     </div>
   </div>
@@ -896,6 +900,19 @@ async function normalizeVolume(){
     const r=await fetch(`${API}/library/normalize-volume`,{method:'POST'});
     const d=await r.json();
     if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
+    renderJobs();
+  }catch(e){alert('Failed: '+e.message);}
+  finally{btn.disabled=false;btn.innerHTML=orig;}
+}
+
+async function consolidateEditions(){
+  if(!confirm('Scan the whole library for albums split across editions (Deluxe/Remastered/Anniversary/etc.) and move tracks into the most complete real edition? Only moves files already in the library and retags them — never deletes or re-downloads anything; a track that\'s missing entirely gets reported, not fetched. Progress shows up in Download Jobs.'))return;
+  const btn=document.getElementById('btn-consolidate-editions');
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
+  try{
+    const r=await fetch(`${API}/library/consolidate-editions`,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){alert('Error: '+(d.error||'Could not start')+(d.auth_url?'\n\nReconnect Spotify first.':''));return;}
     renderJobs();
   }catch(e){alert('Failed: '+e.message);}
   finally{btn.disabled=false;btn.innerHTML=orig;}

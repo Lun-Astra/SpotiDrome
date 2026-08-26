@@ -2891,7 +2891,20 @@ def cleanup_scan():
 
 @app.route("/cleanup/delete", methods=["POST"])
 def cleanup_delete():
-    """Delete tracks from Navidrome and optionally from disk."""
+    """Delete tracks from Navidrome and optionally from disk.
+
+    2026-08-26: this used to resolve each file's path via the Subsonic
+    getSong API's own 'path' field — which turned out to sometimes be a
+    virtual/display path (artist/album/title-derived) rather than the
+    literal filesystem path Navidrome actually indexed the file at (the
+    exact same lesson learned the hard way with a permission-denied bug
+    around the same time — see find_orphaned_navidrome_entries). Worse,
+    the delete used `rm -f`, which exits 0 even when the target doesn't
+    exist — so a wrong path meant the real file was silently never
+    touched while the response still reported success. Now reads the
+    real path straight from the media_file table (one batched SQL
+    query, like find_orphaned_navidrome_entries does) instead of
+    trusting the API's convenience field."""
     data = request.json
     track_ids = data.get("track_ids", [])
     delete_files = data.get("delete_files", True)
@@ -2908,91 +2921,49 @@ def cleanup_delete():
     deleted = []
     failed = []
 
-    # Get file paths before deleting from Navidrome
-    paths_to_delete = []
     if delete_files and ssh_cfg:
-        for tid in track_ids:
-            try:
-                data_song = nd_subsonic("getSong", cfg=cfg, id=tid)
-                song = data_song.get("song", {})
-                path = song.get("path", "")
-                print(f"[cleanup] track {tid} path='{path}'", file=sys.stderr)
-                if path:
-                    paths_to_delete.append(path)
-            except Exception as e:
-                print(f"[cleanup] getSong failed for {tid}: {e}", file=sys.stderr)
-    print(f"[cleanup] paths_to_delete={paths_to_delete}", file=sys.stderr)
+        ids_str = ",".join(f"'{tid}'" for tid in track_ids)
+        select_cmd = _ssh_cmd(ssh_cfg,
+            "sqlite3 /var/lib/navidrome/navidrome.db "
+            f"\"SELECT id || char(1) || path FROM media_file WHERE id IN ({ids_str});\"")
+        result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=30)
+        real_paths = {}
+        for line in result.stdout.splitlines():
+            if "\x01" not in line:
+                continue
+            tid, path = line.split("\x01", 1)
+            real_paths[tid] = path
+        print(f"[cleanup] real paths from DB: {real_paths}", file=sys.stderr)
 
-    # Delete from Navidrome by removing from all playlists and marking as deleted
-    # Use subsonic star/unstar doesn't delete - we need to delete the file
-    # Delete files via SSH
-    if delete_files and ssh_cfg and paths_to_delete:
-        for path in paths_to_delete:
-            try:
-                # Path from Navidrome is relative to music folder
-                full_path = path if path.startswith("/") else f"{ssh_cfg['music_path']}/{path}"
-                # Use a safer deletion approach that handles special chars in filenames
-                cmd = ["ssh", "-i", "/root/.ssh/id_rsa",
-                       "-p", str(ssh_cfg["port"]),
-                       "-o", "StrictHostKeyChecking=no",
-                       "-o", "BatchMode=yes",
-                       f"{ssh_cfg['user']}@{ssh_cfg['host']}",
-                       f"rm -f -- {repr(full_path)}"]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                print(f"[cleanup] rm '{full_path}' -> rc={result.returncode} err={result.stderr}", file=sys.stderr)
-                if result.returncode == 0:
-                    deleted.append(path)
-                    # Create empty placeholder so Navidrome detects folder still exists
-                    # This ensures scanner marks the track as missing
-                    folder = os.path.dirname(full_path)
-                    placeholder_cmd = ["ssh", "-i", "/root/.ssh/id_rsa",
-                                      "-p", str(ssh_cfg["port"]),
-                                      "-o", "StrictHostKeyChecking=no",
-                                      "-o", "BatchMode=yes",
-                                      f"{ssh_cfg['user']}@{ssh_cfg['host']}",
-                                      f"mkdir -p {repr(folder)}"]
-                    subprocess.run(placeholder_cmd, capture_output=True, timeout=10)
-                else:
-                    failed.append(f"{path}: {result.stderr}")
-            except Exception as e:
-                failed.append(f"{path}: {e}")
+        for tid in track_ids:
+            path = real_paths.get(tid)
+            if not path:
+                failed.append(f"{tid}: no path found in Navidrome's DB")
+                continue
+            full_path = path if path.startswith("/") else f"{ssh_cfg['music_path']}/{path}"
+            # Confirm the file actually exists before claiming success —
+            # rm -f exits 0 either way, which is exactly what let this
+            # silently no-op before.
+            check_cmd = _ssh_cmd(ssh_cfg, f"test -f {shlex.quote(full_path)} && echo yes || echo no")
+            exists = subprocess.run(check_cmd, capture_output=True, text=True, timeout=10).stdout.strip() == "yes"
+            if not exists:
+                failed.append(f"{path}: file not found at {full_path}")
+                continue
+            rm_cmd = _ssh_cmd(ssh_cfg, f"rm -f -- {shlex.quote(full_path)}")
+            result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
+            print(f"[cleanup] rm '{full_path}' -> rc={result.returncode} err={result.stderr}", file=sys.stderr)
+            if result.returncode == 0:
+                deleted.append(path)
+            else:
+                failed.append(f"{path}: {result.stderr}")
 
     print(f"[cleanup] Deleting {len(track_ids)} tracks, delete_files={delete_files}", file=sys.stderr)
-    # Debug: check what getSong returns
-    if track_ids:
-        try:
-            test = nd_subsonic("getSong", cfg=cfg, id=track_ids[0])
-            print(f"[cleanup] getSong result: {test}", file=sys.stderr)
-        except Exception as e:
-            print(f"[cleanup] getSong error: {e}", file=sys.stderr)
-
-    # Get all song info in one batch via search, collect any remaining paths
-    if track_ids and ssh_cfg:
-        # Fetch all song info at once using the scan data already in memory
-        # Use the songs from the scan result passed via request
-        songs_info = request.json.get("songs_info", {})
-        for tid in track_ids:
-            song = songs_info.get(tid, {})
-            if not song:
-                try:
-                    data_song = nd_subsonic("getSong", cfg=cfg, id=tid)
-                    song = data_song.get("song", {})
-                except Exception:
-                    pass
-            path = song.get("path","")
-            if path:
-                paths_to_delete.append(path)
 
     # Delete directly from Navidrome SQLite DB via SSH
     if track_ids and ssh_cfg:
-        ids_str = ",".join(f"\'{tid}\'" for tid in track_ids)
+        ids_str = ",".join(f"'{tid}'" for tid in track_ids)
         sql = f"DELETE FROM media_file WHERE id IN ({ids_str});"
-        cmd = ["ssh", "-i", "/root/.ssh/id_rsa",
-               "-p", str(ssh_cfg["port"]),
-               "-o", "StrictHostKeyChecking=no",
-               "-o", "BatchMode=yes",
-               f"{ssh_cfg['user']}@{ssh_cfg['host']}",
-               f"sqlite3 /var/lib/navidrome/navidrome.db {repr(sql)}"]
+        cmd = _ssh_cmd(ssh_cfg, f"sqlite3 /var/lib/navidrome/navidrome.db {shlex.quote(sql)}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         print(f"[cleanup] DB delete rc={result.returncode} err={result.stderr.strip()}", file=sys.stderr)
 

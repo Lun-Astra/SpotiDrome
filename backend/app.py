@@ -656,6 +656,18 @@ YTMUSIC_OFFICIAL_VIDEO_TYPES = {"MUSIC_VIDEO_TYPE_ATV", "MUSIC_VIDEO_TYPE_OMV"}
 
 _ytmusic_client = None
 _ytmusic_disabled = False
+# gunicorn runs this as one process with many threads (see Dockerfile:
+# --workers 1 --threads 16), so this client — and whatever HTTP session
+# ytmusicapi keeps internally — is genuinely shared across every concurrent
+# job (a manual sync and the nightly auto-sync, a retry, etc. can all be
+# mid-download at once). Unsynchronized concurrent use of a shared
+# session/native-extension object like this is a known way to segfault the
+# whole process outright rather than raise an ordinary, catchable Python
+# exception — confirmed as the actual cause of repeated crashes in
+# Jamidrome (which shares this exact pattern, but with a background thread
+# hitting it continuously, making the race far more likely to land) — see
+# its _ytmusic_lock. Held around both construction and every actual call.
+_ytmusic_lock = threading.Lock()
 
 def _get_ytmusic():
     """Lazily construct a shared YTMusic client. If construction ever fails
@@ -664,14 +676,15 @@ def _get_ytmusic():
     global _ytmusic_client, _ytmusic_disabled
     if _ytmusic_disabled:
         return None
-    if _ytmusic_client is None:
-        try:
-            _ytmusic_client = YTMusic()
-        except Exception as e:
-            print(f"[ytmusic] init failed, disabling YT Music search: {e}", file=sys.stderr)
-            _ytmusic_disabled = True
-            return None
-    return _ytmusic_client
+    with _ytmusic_lock:
+        if _ytmusic_client is None:
+            try:
+                _ytmusic_client = YTMusic()
+            except Exception as e:
+                print(f"[ytmusic] init failed, disabling YT Music search: {e}", file=sys.stderr)
+                _ytmusic_disabled = True
+                return None
+        return _ytmusic_client
 
 def _normalize_title(s):
     s = (s or "").lower()
@@ -761,8 +774,9 @@ def _search_ytmusic(query, filter_type, expected_title, expected_artist, expecte
         return None
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(ytm.search, query, filter=filter_type, limit=limit)
-        results = future.result(timeout=timeout)
+        with _ytmusic_lock:  # serialize against every other caller of ytm — see _ytmusic_lock above
+            future = executor.submit(ytm.search, query, filter=filter_type, limit=limit)
+            results = future.result(timeout=timeout)
     except Exception:
         return None
     finally:

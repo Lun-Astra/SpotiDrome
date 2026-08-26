@@ -436,7 +436,7 @@ header{
           <button class="btn btn-nd" id="btn-prune-orphans" onclick="pruneOrphans()" style="flex-shrink:0">🩹 Scan &amp; Fix</button>
         </div>
         <div class="settings-row">
-          <div><div class="settings-label">Consolidate Editions</div><div class="settings-sub">Finds albums split across Deluxe/Remastered/Anniversary editions and moves tracks into whichever edition's real tracklist is the most complete one — e.g. a 22-track Deluxe release that only shows 7 tracks because the rest are still filed under the original album</div></div>
+          <div><div class="settings-label">Consolidate Editions</div><div class="settings-sub">Finds albums split across Deluxe/Remastered/Anniversary editions and completes every edition that's actually in the library by copying tracks in from siblings where needed — e.g. a 22-track Deluxe release that only shows 7 tracks because the rest are still filed under the original album. Copies, never moves — the original release stays intact too</div></div>
           <button class="btn btn-nd" id="btn-consolidate-editions" onclick="consolidateEditions()" style="flex-shrink:0">🔀 Scan &amp; Fix</button>
         </div>
       </div>
@@ -906,7 +906,7 @@ async function normalizeVolume(){
 }
 
 async function consolidateEditions(){
-  if(!confirm('Scan the whole library for albums split across editions (Deluxe/Remastered/Anniversary/etc.) and move tracks into the most complete real edition? Only moves files already in the library and retags them — never deletes or re-downloads anything; a track that\'s missing entirely gets reported, not fetched. Progress shows up in Download Jobs.'))return;
+  if(!confirm('Scan the whole library for albums split across editions (Deluxe/Remastered/Anniversary/etc.) and complete every edition found by copying tracks in from siblings where needed? Copies files already in the library and retags the copy — never touches or deletes the original, never re-downloads anything; a track that\'s missing entirely gets reported, not fetched. Progress shows up in Download Jobs.'))return;
   const btn=document.getElementById('btn-consolidate-editions');
   btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
   try{

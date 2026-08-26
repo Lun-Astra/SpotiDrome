@@ -2881,9 +2881,14 @@ def library_orphans_prune():
 # original release's name instead — never wrong exactly, just never
 # assembled into the complete thing the way Spotify's own UI shows it.
 # This scans the whole library for exactly that pattern (same artist, same
-# base album name, more than one edition suffix in use) and consolidates
-# each family into whichever edition's real Spotify tracklist is the most
-# complete one.
+# base album name, more than one edition suffix in use) and completes
+# EVERY edition actually present, copying a track in from a sibling
+# edition wherever needed — never moving or deleting, since a Deluxe
+# edition existing doesn't make the original release stop being a real,
+# separate thing worth having intact too (2026-08-27: an earlier version
+# of this moved tracks into just the single most-complete edition, which
+# silently deleted the original release entirely once nothing was left
+# under its name — fixed after exactly that happened to a real library).
 
 _EDITION_SUFFIX_RE = re.compile(
     r"\s*[\(\[](deluxe(\s+version)?|super\s+deluxe|remaster(ed)?(\s*\d{0,4})?|"
@@ -2912,29 +2917,32 @@ def find_edition_families(albums):
         groups.setdefault(key, set()).add(name)
     return {k: v for k, v in groups.items() if len(v) > 1}
 
-def _find_complete_spotify_edition(sp, artist, base_name):
-    """Searches Spotify for every album release matching artist+base_name
-    and returns (album_id, full_tracklist) for whichever has the most
-    tracks — the most complete edition to consolidate everything into.
-    None if Spotify has nothing useful (a private/unreleased/mistagged
-    situation this can't safely resolve)."""
+def _find_spotify_edition_tracklist(sp, artist, edition_name):
+    """Looks up the real Spotify tracklist for THIS SPECIFIC edition name
+    (not 'whichever edition is biggest' — every edition that's actually
+    present in the library is a real, distinct release in its own right
+    and deserves to be its own complete album, exactly as it exists on
+    Spotify; a 'Deluxe' edition existing doesn't make the original
+    release stop being a real thing worth having intact too). Returns
+    (canonical_name, tracklist) using Spotify's own name for the match
+    (capitalization/punctuation can differ slightly from the library's
+    tag) — None, None if nothing confidently matches."""
     try:
-        result = sp.search(q=f'artist:"{artist}" album:"{base_name}"', type="album", limit=10)
+        result = sp.search(q=f'artist:"{artist}" album:"{edition_name}"', type="album", limit=5)
         candidates = result.get("albums", {}).get("items", [])
         if not candidates:
-            result = sp.search(q=f"{artist} {base_name}", type="album", limit=10)
+            result = sp.search(q=f"{artist} {edition_name}", type="album", limit=5)
             candidates = result.get("albums", {}).get("items", [])
-        candidates = [c for c in candidates
-                      if _edition_base_name(c.get("name", "")) and
-                      difflib.SequenceMatcher(None, _edition_base_name(c["name"]).lower(),
-                                               base_name.lower()).ratio() >= 0.85]
+        def score(c):
+            return difflib.SequenceMatcher(None, c.get("name", "").lower(), edition_name.lower()).ratio()
+        candidates = [c for c in candidates if score(c) >= 0.85]
         if not candidates:
             return None, None
-        best = max(candidates, key=lambda c: c.get("total_tracks", 0))
+        best = max(candidates, key=score)
         tracks = sp.album_tracks(best["id"])["items"]
-        return best["id"], [{"title": t["name"], "duration_sec": t["duration_ms"] / 1000} for t in tracks]
+        return best["name"], [{"title": t["name"], "duration_sec": t["duration_ms"] / 1000} for t in tracks]
     except Exception as e:
-        print(f"[editions] Spotify lookup failed for {artist} / {base_name}: {e}", file=sys.stderr)
+        print(f"[editions] Spotify lookup failed for {artist} / {edition_name}: {e}", file=sys.stderr)
         return None, None
 
 def consolidate_editions_worker(job_id):
@@ -3015,104 +3023,95 @@ def consolidate_editions_worker(job_id):
                 jobs[job_id]["log"].append(f"⏭ Skipped: {artist} — {base}")
             continue
 
-        album_id, tracklist = _find_complete_spotify_edition(sp, artist, base)
-        if not tracklist:
-            with job_lock:
-                jobs[job_id]["log"].append(f"? {artist} — {base}: no confident Spotify match, leaving as-is "
-                                            f"(editions in library: {', '.join(sorted(raw_names))})")
-            unresolved += 1
-            continue
-        # Recompute the target album name directly from Spotify's own
-        # result rather than guessing which local raw name is "the"
-        # complete one — a library that's never seen the complete
-        # edition's own exact title at all is exactly the case this is
-        # meant to fix.
-        target_album_name = None
-        try:
-            info = sp.album(album_id)
-            target_album_name = info.get("name")
-        except Exception:
-            pass
-        if not target_album_name:
-            with job_lock:
-                jobs[job_id]["log"].append(f"✗ {artist} — {base}: couldn't confirm the target album's real name")
-            unresolved += 1
-            continue
-
         candidates = songs_by_artist.get(artist, [])
-        moves, missing = [], []
-        for track in tracklist:
-            # Already sitting correctly under the target album? Nothing to do.
-            if any(s.get("album") == target_album_name and _title_ok(s.get("title", ""), track["title"])
-                   for s in candidates):
+        # Every edition actually present in the library is a real,
+        # separate release worth having complete in its own right — a
+        # Deluxe edition existing doesn't make the original release stop
+        # being a real thing. So this completes EACH edition found here,
+        # copying a track in from a sibling edition when needed rather
+        # than moving it — the original never loses tracks just because
+        # they're also needed somewhere else.
+        for edition_name in sorted(raw_names):
+            canonical_name, tracklist = _find_spotify_edition_tracklist(sp, artist, edition_name)
+            if not tracklist:
+                with job_lock:
+                    jobs[job_id]["log"].append(f"? {artist} — {edition_name}: no confident Spotify match, leaving as-is")
+                unresolved += 1
                 continue
-            # Otherwise, a copy under some other (sibling-edition) album
-            # that should move — duration has to agree too, since two
-            # different tracks can share a title.
-            sibling = next((s for s in candidates
-                             if s.get("album") != target_album_name
-                             and _title_ok(s.get("title", ""), track["title"])
-                             and _duration_close(s.get("duration") or 0, track["duration_sec"])), None)
-            if sibling:
-                moves.append({"song": sibling, "title": track["title"]})
-            else:
-                missing.append(track["title"])
 
-        if not moves and not missing:
-            with job_lock:
-                jobs[job_id]["log"].append(f"✓ {artist} — {target_album_name}: already fully consolidated")
-            continue
-
-        if moves:
-            ids = [m["song"]["id"] for m in moves]
-            id_list = ",".join(f"'{i}'" for i in ids)
-            select_cmd = _ssh_cmd(ssh_cfg,
-                f"sqlite3 /var/lib/navidrome/navidrome.db "
-                f"\"SELECT id || char(1) || path FROM media_file WHERE id IN ({id_list});\"")
-            result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=30)
-            real_paths = {}
-            for line in result.stdout.splitlines():
-                if "\x01" not in line:
+            copies, missing = [], []
+            for track in tracklist:
+                # Already sitting correctly under this edition? Nothing to do.
+                if any(s.get("album") == canonical_name and _title_ok(s.get("title", ""), track["title"])
+                       for s in candidates):
                     continue
-                rid, path = line.split("\x01", 1)
-                real_paths[rid] = path
+                # Otherwise, a copy under some sibling edition that can be
+                # copied in — duration has to agree too, since two
+                # different tracks can share a title.
+                source = next((s for s in candidates
+                               if s.get("album") != canonical_name
+                               and _title_ok(s.get("title", ""), track["title"])
+                               and _duration_close(s.get("duration") or 0, track["duration_sec"])), None)
+                if source:
+                    copies.append({"song": source, "title": track["title"]})
+                else:
+                    missing.append(track["title"])
 
-            new_dir = f"{ssh_cfg['music_path']}/{sanitize(target_album_name)}"
-            batch = []
-            for m in moves:
-                real_path = real_paths.get(m["song"]["id"])
-                if not real_path:
-                    continue
-                old_full = real_path if real_path.startswith("/") else f"{ssh_cfg['music_path']}/{real_path}"
-                batch.append({"old": old_full, "new_dir": new_dir, "new_album": target_album_name})
+            if not copies and not missing:
+                with job_lock:
+                    jobs[job_id]["log"].append(f"✓ {artist} — {canonical_name}: already complete")
+                continue
 
-            if batch:
-                script_cmd = _ssh_cmd(ssh_cfg,
-                    f"python3 -c {shlex.quote(_CONSOLIDATE_REMOTE_SCRIPT)} {shlex.quote(json.dumps(batch))}")
-                result = subprocess.run(script_cmd, capture_output=True, text=True, timeout=120)
-                try:
-                    outcomes = json.loads(result.stdout.strip())
-                except Exception:
-                    outcomes = []
-                ok_count = sum(1 for o in outcomes if o.get("ok"))
-                consolidated_total += ok_count
-                touched_any = touched_any or ok_count > 0
+            if copies:
+                ids = [c["song"]["id"] for c in copies]
+                id_list = ",".join(f"'{i}'" for i in ids)
+                select_cmd = _ssh_cmd(ssh_cfg,
+                    f"sqlite3 /var/lib/navidrome/navidrome.db "
+                    f"\"SELECT id || char(1) || path FROM media_file WHERE id IN ({id_list});\"")
+                result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=30)
+                real_paths = {}
+                for line in result.stdout.splitlines():
+                    if "\x01" not in line:
+                        continue
+                    rid, path = line.split("\x01", 1)
+                    real_paths[rid] = path
+
+                new_dir = f"{ssh_cfg['music_path']}/{sanitize(canonical_name)}"
+                batch = []
+                for c in copies:
+                    real_path = real_paths.get(c["song"]["id"])
+                    if not real_path:
+                        continue
+                    old_full = real_path if real_path.startswith("/") else f"{ssh_cfg['music_path']}/{real_path}"
+                    batch.append({"old": old_full, "new_dir": new_dir, "new_album": canonical_name})
+
+                if batch:
+                    script_cmd = _ssh_cmd(ssh_cfg,
+                        f"python3 -c {shlex.quote(_CONSOLIDATE_REMOTE_SCRIPT)} {shlex.quote(json.dumps(batch))}")
+                    result = subprocess.run(script_cmd, capture_output=True, text=True, timeout=120)
+                    try:
+                        outcomes = json.loads(result.stdout.strip())
+                    except Exception:
+                        outcomes = []
+                    ok_count = sum(1 for o in outcomes if o.get("ok"))
+                    consolidated_total += ok_count
+                    touched_any = touched_any or ok_count > 0
+                    with job_lock:
+                        jobs[job_id]["log"].append(
+                            f"🔀 {artist} — {canonical_name}: copied {ok_count}/{len(batch)} track(s) in "
+                            f"from elsewhere in the library (originals left in place)")
+
+            if missing:
+                missing_total += len(missing)
                 with job_lock:
                     jobs[job_id]["log"].append(
-                        f"🔀 {artist} — {target_album_name}: moved {ok_count}/{len(batch)} track(s) in "
-                        f"from {', '.join(sorted(n for n in raw_names if n != target_album_name))}")
+                        f"⚠ {artist} — {canonical_name}: {len(missing)} track(s) not found anywhere in the "
+                        f"library at all (needs a fresh download, not just a retag): {', '.join(missing[:5])}"
+                        f"{'…' if len(missing) > 5 else ''}")
 
-        if missing:
-            missing_total += len(missing)
             with job_lock:
-                jobs[job_id]["log"].append(
-                    f"⚠ {artist} — {target_album_name}: {len(missing)} track(s) not found anywhere in the "
-                    f"library at all (needs a fresh download, not just a retag): {', '.join(missing[:5])}"
-                    f"{'…' if len(missing) > 5 else ''}")
-
-        with job_lock:
-            jobs[job_id]["downloaded"] = consolidated_total
-            jobs[job_id]["failed"] = missing_total
+                jobs[job_id]["downloaded"] = consolidated_total
+                jobs[job_id]["failed"] = missing_total
 
     if touched_any:
         with job_lock:
@@ -3132,34 +3131,47 @@ def consolidate_editions_worker(job_id):
         save_jobs()
 
 _CONSOLIDATE_REMOTE_SCRIPT = r'''
-import json, os, sys
+import json, os, shutil, sys
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TALB, error as ID3Error
 
-moves = json.loads(sys.argv[1])
+# COPY, never move or retag in place — the source file (and whichever
+# edition it already belongs to) is left completely untouched. A track
+# needed on more than one real edition genuinely exists on both, exactly
+# as it does on Spotify itself; consolidating one edition must never come
+# at the cost of another edition losing a track it's also supposed to have.
+copies = json.loads(sys.argv[1])
 results = []
-for m in moves:
+for m in copies:
     old = m["old"]
     try:
         ext = os.path.splitext(old)[1].lower()
+        if ext not in (".flac", ".mp3"):
+            results.append({"old": old, "ok": False, "error": "unsupported format"})
+            continue
         os.makedirs(m["new_dir"], exist_ok=True)
         new_path = os.path.join(m["new_dir"], os.path.basename(old))
+        if os.path.abspath(old) == os.path.abspath(new_path):
+            results.append({"old": old, "ok": False, "error": "source and destination are the same file"})
+            continue
+        # copy2 preserves permission bits from the source (unlike a fresh
+        # write, which would pick up whatever this process's own umask
+        # defaults to) — the exact same lesson already learned the hard
+        # way with tempfile.mkstemp() defaulting to 0600 elsewhere in this
+        # app; the source here is already correctly-permissioned, so this
+        # carries that forward rather than risking a fresh default.
+        shutil.copy2(old, new_path)
         if ext == ".flac":
-            tags = FLAC(old)
+            tags = FLAC(new_path)
             tags["album"] = [m["new_album"]]
             tags.save()
-        elif ext == ".mp3":
+        else:
             try:
-                tags = ID3(old)
+                tags = ID3(new_path)
             except ID3Error:
                 tags = ID3()
             tags["TALB"] = TALB(encoding=3, text=m["new_album"])
-            tags.save(old)
-        else:
-            results.append({"old": old, "ok": False, "error": "unsupported format"})
-            continue
-        if os.path.abspath(old) != os.path.abspath(new_path):
-            os.rename(old, new_path)
+            tags.save(new_path)
         results.append({"old": old, "new": new_path, "ok": True})
     except Exception as e:
         results.append({"old": old, "ok": False, "error": str(e)[:200]})

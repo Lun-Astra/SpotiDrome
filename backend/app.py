@@ -2308,6 +2308,18 @@ try:
         new_tags.save()
     elif orig_id3 is not None:
         orig_id3.save(tmp_path)
+    # tempfile.mkstemp() deliberately creates its file mode 0600 (owner-only)
+    # — a sane default for an actual temp file, but this one is about to
+    # BECOME the real library file via the os.replace() below, and
+    # os.replace()/rename() does not change permission bits. Left as-is,
+    # every successfully-normalized file ends up owner-read-only — unreadable
+    # by whatever user Navidrome's own service actually runs as (not
+    # necessarily root, and wasn't here), which is exactly what made ~74% of
+    # a real library unplayable after a normalize run. Match the ORIGINAL
+    # file's mode rather than hardcoding one, so this keeps working
+    # correctly regardless of whatever permission convention a given
+    # library/host actually uses.
+    os.chmod(tmp_path, os.stat(path).st_mode)
     os.replace(tmp_path, path)
     done("normalized", lufs_before=input_i)
 except Exception as e:

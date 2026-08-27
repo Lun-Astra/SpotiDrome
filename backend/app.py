@@ -1704,6 +1704,28 @@ dupes = {vid: files for vid, files in groups.items() if len(files) > 1}
 print(json.dumps(dupes))
 '''
 
+def _album_folder_name(path):
+    return os.path.basename(os.path.dirname(path))
+
+def _is_edition_sibling_pair(path_a, path_b):
+    """True when path_a/path_b sit in two different album folders that are
+    the same release under Consolidate Editions' own definition (e.g.
+    "Lover Of A Ghost" vs "Lover Of A Ghost (Deluxe Version)") — i.e. two
+    genuinely different releases that deliberately share a track, not an
+    accidental duplicate. Both dedupe sweeps below delete the smaller/
+    non-kept file of a matched pair; without this exemption they silently
+    undo Consolidate Editions' whole point the very next time they run,
+    which is exactly what happened to a real album (2026-08-27) — this
+    reuses the same base-name-after-stripping-edition-suffix logic
+    Consolidate Editions itself uses to decide what counts as a sibling,
+    defined further down as _edition_base_name (forward reference — fine
+    at call time, both are top-level functions in the same module)."""
+    folder_a, folder_b = _album_folder_name(path_a), _album_folder_name(path_b)
+    if folder_a == folder_b:
+        return False  # same album folder — an ordinary duplicate, not this case
+    base_a, base_b = _edition_base_name(folder_a), _edition_base_name(folder_b)
+    return bool(base_a) and base_a.lower() == base_b.lower()
+
 def scan_and_dedupe_remote(ssh_cfg, nd_cfg):
     """Find files sharing the same source YouTube video ID (from the comment tag)
     and delete all but the largest. File deletion only — never touches the
@@ -1733,7 +1755,10 @@ def scan_and_dedupe_remote(ssh_cfg, nd_cfg):
     removed = []
     for vid, files in groups.items():
         files.sort(key=lambda f: f["size"], reverse=True)
+        keep = files[0]
         for f in files[1:]:
+            if _is_edition_sibling_pair(keep["path"], f["path"]):
+                continue  # deliberately duplicated across sibling editions — leave both
             rm_cmd = ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(ssh_cfg["port"]),
                       "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
                       f"{ssh_cfg['user']}@{ssh_cfg['host']}",
@@ -1944,6 +1969,8 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
             cluster.sort(key=lambda x: x["size"], reverse=True)
             keep, dupes = cluster[0], cluster[1:]
             for d in dupes:
+                if _is_edition_sibling_pair(keep["path"], d["path"]):
+                    continue  # deliberately duplicated across sibling editions — leave both
                 plan.append((keep, d))
 
     if len(plan) > MAX_TITLE_DEDUPE_PER_RUN:

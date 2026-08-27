@@ -1,4 +1,4 @@
-import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib, uuid
+import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib, uuid, base64
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import requests as http
@@ -3045,9 +3045,15 @@ def _find_spotify_edition_tracklist(sp, artist, edition_name):
     and deserves to be its own complete album, exactly as it exists on
     Spotify; a 'Deluxe' edition existing doesn't make the original
     release stop being a real thing worth having intact too). Returns
-    (canonical_name, tracklist) using Spotify's own name for the match
-    (capitalization/punctuation can differ slightly from the library's
-    tag) — None, None if nothing confidently matches."""
+    (canonical_name, tracklist, cover_url) using Spotify's own name for
+    the match (capitalization/punctuation can differ slightly from the
+    library's tag) — None, None, None if nothing confidently matches.
+    cover_url is this specific edition's own official artwork — every
+    downloaded track only ever carries its individual source video's
+    thumbnail as embedded art, never a real album cover, so without this
+    Navidrome just shows whichever track it happens to scan first to
+    represent the whole album (and two sibling editions can easily end
+    up showing the exact same track's thumbnail as a result)."""
     try:
         result = sp.search(q=f'artist:"{artist}" album:"{edition_name}"', type="album", limit=5)
         candidates = result.get("albums", {}).get("items", [])
@@ -3058,13 +3064,82 @@ def _find_spotify_edition_tracklist(sp, artist, edition_name):
             return difflib.SequenceMatcher(None, c.get("name", "").lower(), edition_name.lower()).ratio()
         candidates = [c for c in candidates if score(c) >= 0.85]
         if not candidates:
-            return None, None
+            return None, None, None
         best = max(candidates, key=score)
         tracks = sp.album_tracks(best["id"])["items"]
-        return best["name"], [{"title": t["name"], "duration_sec": t["duration_ms"] / 1000} for t in tracks]
+        images = sorted(best.get("images") or [], key=lambda im: im.get("width") or 0, reverse=True)
+        cover_url = images[0]["url"] if images else None
+        return (best["name"],
+                [{"title": t["name"], "duration_sec": t["duration_ms"] / 1000} for t in tracks],
+                cover_url)
     except Exception as e:
         print(f"[editions] Spotify lookup failed for {artist} / {edition_name}: {e}", file=sys.stderr)
-        return None, None
+        return None, None, None
+
+_APPLY_COVER_ART_REMOTE_SCRIPT = r'''
+import base64, json, os, sys
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3, APIC, error as ID3Error
+
+folder, mime = sys.argv[1], sys.argv[2]
+img_data = base64.b64decode(sys.stdin.read())
+
+updated, failed = 0, []
+for fn in os.listdir(folder):
+    p = os.path.join(folder, fn)
+    ext = os.path.splitext(fn)[1].lower()
+    try:
+        if ext == ".flac":
+            tags = FLAC(p)
+            tags.clear_pictures()
+            pic = Picture()
+            pic.data = img_data
+            pic.type = 3  # front cover
+            pic.mime = mime
+            tags.add_picture(pic)
+            tags.save()
+            updated += 1
+        elif ext == ".mp3":
+            try:
+                tags = ID3(p)
+            except ID3Error:
+                tags = ID3()
+            tags.delall("APIC")
+            tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=img_data))
+            tags.save(p)
+            updated += 1
+    except Exception as e:
+        failed.append({"file": fn, "error": str(e)[:150]})
+print(json.dumps({"updated": updated, "failed": failed}))
+'''
+
+def _apply_cover_art(ssh_cfg, album_folder_name, cover_url):
+    """Downloads cover_url (this container has internet access; the
+    Navidrome host doesn't necessarily) and embeds it as the front-cover
+    picture on every track in album_folder_name, replacing whatever
+    per-track art is already there. Returns (updated_count, [errors])."""
+    if not cover_url:
+        return 0, ["no cover art available from Spotify for this edition"]
+    try:
+        resp = http.get(cover_url, timeout=15)
+        resp.raise_for_status()
+        img_data = resp.content
+        mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip() or "image/jpeg"
+    except Exception as e:
+        return 0, [f"cover art download failed: {e}"]
+
+    folder_path = f"{ssh_cfg['music_path']}/{sanitize(album_folder_name)}"
+    cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_APPLY_COVER_ART_REMOTE_SCRIPT)} "
+                             f"{shlex.quote(folder_path)} {shlex.quote(mime)}")
+    try:
+        result = subprocess.run(cmd, input=base64.b64encode(img_data).decode(),
+                                 capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return 0, [result.stderr[-300:]]
+        outcome = json.loads(result.stdout.strip() or "{}")
+        return outcome.get("updated", 0), outcome.get("failed", [])
+    except Exception as e:
+        return 0, [str(e)]
 
 def consolidate_editions_worker(job_id):
     with job_lock:
@@ -3153,7 +3228,7 @@ def consolidate_editions_worker(job_id):
         # than moving it — the original never loses tracks just because
         # they're also needed somewhere else.
         for edition_name in sorted(raw_names):
-            canonical_name, tracklist = _find_spotify_edition_tracklist(sp, artist, edition_name)
+            canonical_name, tracklist, cover_url = _find_spotify_edition_tracklist(sp, artist, edition_name)
             if not tracklist:
                 with job_lock:
                     jobs[job_id]["log"].append(f"? {artist} — {edition_name}: no confident Spotify match, leaving as-is")
@@ -3181,7 +3256,6 @@ def consolidate_editions_worker(job_id):
             if not copies and not missing:
                 with job_lock:
                     jobs[job_id]["log"].append(f"✓ {artist} — {canonical_name}: already complete")
-                continue
 
             if copies:
                 ids = [c["song"]["id"] for c in copies]
@@ -3229,6 +3303,22 @@ def consolidate_editions_worker(job_id):
                         f"⚠ {artist} — {canonical_name}: {len(missing)} track(s) not found anywhere in the "
                         f"library at all (needs a fresh download, not just a retag): {', '.join(missing[:5])}"
                         f"{'…' if len(missing) > 5 else ''}")
+
+            # Every downloaded track only ever carries its own individual
+            # source video's thumbnail as embedded art, never a real album
+            # cover — so this runs regardless of whether the edition needed
+            # any tracks copied in, fixing wrong/inconsistent art even on
+            # an edition that was already complete.
+            art_updated, art_errors = _apply_cover_art(ssh_cfg, canonical_name, cover_url)
+            if art_updated:
+                touched_any = True
+                with job_lock:
+                    jobs[job_id]["log"].append(
+                        f"🖼 {artist} — {canonical_name}: set the correct cover art on {art_updated} track(s)")
+            elif art_errors:
+                with job_lock:
+                    jobs[job_id]["log"].append(
+                        f"⚠ {artist} — {canonical_name}: couldn't set cover art ({art_errors[0]})")
 
             with job_lock:
                 jobs[job_id]["downloaded"] = consolidated_total

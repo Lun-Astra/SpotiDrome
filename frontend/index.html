@@ -692,7 +692,7 @@ document.getElementById('btn-refresh').addEventListener('click',()=>{if(selected
 
 async function renderJobs(){
   const r=await fetch(`${API}/jobs`),jobs=await r.json();
-  const hash=JSON.stringify(jobs.map(j=>[j.id,j.status,j.current,j.downloaded,j.failed,j.current_track,(j.log||[]).length]));
+  const hash=JSON.stringify(jobs.map(j=>[j.id,j.status,j.current,j.downloaded,j.failed,j.current_track,(j.log||[]).length,j.cancel_requested]));
   if(hash===_lastJobsHash)return;_lastJobsHash=hash;
   document.getElementById('jobs-count').textContent=jobs.length;
   const list=document.getElementById('jobs-list');
@@ -708,8 +708,11 @@ async function renderJobs(){
     const trackLine=job.current_track&&job.status==='running'
       ?`<div class="job-track"><span>${esc(job.current_track)}</span><button class="skip-btn" onclick="skipTrack('${job.id}')">⏭ Skip</button></div>`
       :job.current_track?`<div class="job-track">${sc?'⬡':up?'↑':'▶'} ${esc(job.current_track)}</div>`:'';
+    const cancelBtn=['running','scanning','uploading','pending'].includes(job.status)&&!job.cancel_requested
+      ?`<button class="skip-btn" onclick="cancelJob('${job.id}')" style="margin-left:8px">🛑 Cancel</button>`
+      :job.cancel_requested?`<span style="margin-left:8px;opacity:.6">cancelling…</span>`:'';
     return`<div class="job-card">
-      <div class="job-hd"><div class="job-name">${esc(job.playlist)}</div><div class="job-status ${job.status}">${job.status}</div></div>
+      <div class="job-hd"><div class="job-name">${esc(job.playlist)}</div><div class="job-status ${job.status}">${job.status}</div>${cancelBtn}</div>
       <div class="prog-bar"><div class="prog-fill ${sc?'nd':up?'up':''}" style="width:${sc||up?100:pct}%"></div></div>
       <div class="job-stats">Progress: <b>${job.current}/${job.total}</b> &nbsp; ✓ <b>${job.downloaded}</b> &nbsp; ✗ <b>${job.failed}</b></div>
       ${trackLine}${ndR}
@@ -720,6 +723,7 @@ async function renderJobs(){
 }
 
 async function skipTrack(id){await fetch(`${API}/jobs/${id}/skip`,{method:'POST'});}
+async function cancelJob(id){await fetch(`${API}/jobs/${id}/cancel`,{method:'POST'});_lastJobsHash=null;renderJobs();}
 
 // YT Music
 async function ytFetch(){

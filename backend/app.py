@@ -85,6 +85,27 @@ def load_jobs():
 
 load_jobs()
 
+def _mark_stale_jobs_interrupted():
+    """A job left in a non-terminal status ('running' / 'scanning' /
+    'uploading') on disk always means its worker thread died with the
+    previous process (container restart, crash) — nothing resumes it, so
+    without this it looks like a live job forever in the UI (and the /jobs
+    list endpoint re-saving it on every poll just keeps that stale
+    'running' state alive on disk too). Close it out honestly on startup
+    instead of leaving a ghost job that never finishes."""
+    changed = False
+    for job in jobs.values():
+        if job.get("status") in ("running", "scanning", "uploading"):
+            job["status"] = "done"
+            job["current_track"] = None
+            job.setdefault("log", []).append(
+                "⚠ Interrupted by a server restart — re-run this if it didn't finish")
+            changed = True
+    if changed:
+        save_jobs()
+
+_mark_stale_jobs_interrupted()
+
 # ─── Tracked playlists ────────────────────────────────────────────────────────
 
 def load_tracked():
@@ -516,6 +537,28 @@ YT_GENRE_KEYWORDS = {
     "latin", "soundtrack",
 }
 
+# yt-dlp's --add-metadata embeds a bunch of the source video's own fields
+# automatically, and one it happily writes straight into the GENRE tag is
+# YouTube's own video *category* — "Music", "People & Blogs", "Gaming",
+# etc. That's a completely different, much coarser classification than a
+# music genre (every music video on the platform is generically "Music"),
+# and it isn't produced by lookup_genre()/YT_GENRE_KEYWORDS above at all —
+# it's already sitting in the file the moment yt-dlp finishes downloading
+# it, before any of this app's own genre logic ever runs. Both fix_tags()
+# and the genre-relabel job explicitly clear it out on sight (rather than
+# just never fixing it further, which is all they used to do whenever a
+# real genre couldn't be found to replace it with), since it's never a
+# genre a track should keep no matter how confident the source is.
+YT_VIDEO_CATEGORIES = {
+    "film & animation", "autos & vehicles", "music", "pets & animals",
+    "sports", "short movies", "travel & events", "gaming", "videoblogging",
+    "people & blogs", "comedy", "entertainment", "news & politics",
+    "howto & style", "education", "science & technology",
+    "nonprofits & activism", "movies", "anime/animation", "action/adventure",
+    "classics", "documentary", "drama", "family", "foreign", "horror",
+    "sci-fi/fantasy", "thriller", "shorts", "shows", "trailers",
+}
+
 def lookup_genre_from_youtube(artist):
     """Best-effort fallback genre source when Spotify has nothing for this
     artist: search YouTube Music for them and check whether any of the top
@@ -611,6 +654,12 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
                 tags["comment"] = [source_url]
             if genre:
                 tags["genre"] = [genre]
+            elif (tags.get("genre") or [""])[0].strip().lower() in YT_VIDEO_CATEGORIES:
+                # No real genre to set, but whatever's already there is a
+                # raw YouTube video category (yt-dlp's own auto-embedded
+                # metadata, not a music genre at all) — clear it rather
+                # than silently keep it just because nothing better was found.
+                del tags["genre"]
             tags.save()
         else:
             try:
@@ -625,6 +674,8 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
                 tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=source_url)
             if genre:
                 tags["TCON"] = TCON(encoding=3, text=genre)
+            elif str(tags.get("TCON", "")).strip().lower() in YT_VIDEO_CATEGORIES:
+                del tags["TCON"]
             tags.save(filepath)
     except Exception as e:
         print(f"Tag fix failed for {filepath}: {e}")
@@ -1986,14 +2037,20 @@ for item in updates:
     try:
         if p.endswith(".flac"):
             tags = FLAC(p)
-            tags["genre"] = [genre]
+            if genre:
+                tags["genre"] = [genre]
+            elif "genre" in tags:
+                del tags["genre"]
             tags.save()
         elif p.endswith(".mp3"):
             try:
                 tags = ID3(p)
             except ID3Error:
                 tags = ID3()
-            tags["TCON"] = TCON(encoding=3, text=genre)
+            if genre:
+                tags["TCON"] = TCON(encoding=3, text=genre)
+            elif "TCON" in tags:
+                del tags["TCON"]
             tags.save(p)
         else:
             continue
@@ -2179,8 +2236,15 @@ def genre_relabel_worker(job_id):
     for f in files:
         by_artist.setdefault(f["artist"], []).append(f)
 
-    updates, processed, already_correct, no_genre_found = [], 0, 0, 0
+    updates, processed, already_correct, no_genre_found, cleared_junk = [], 0, 0, 0, 0
     for artist, group in by_artist.items():
+        with job_lock:
+            if jobs[job_id].get("cancel_requested"):
+                jobs[job_id]["log"].append(f"🛑 Cancelled ({processed}/{len(files)} scanned)")
+                jobs[job_id]["status"] = "done"
+                jobs[job_id]["current_track"] = None
+                save_jobs()
+                return
         processed += len(group)
         with job_lock:
             jobs[job_id]["current"] = processed
@@ -2195,7 +2259,18 @@ def genre_relabel_worker(job_id):
 
         new_genre = lookup_genre(artist)
         if not new_genre:
-            no_genre_found += len(group)
+            # No real genre to set, but still worth a pass: yt-dlp's own
+            # auto-embedded metadata writes YouTube's raw video *category*
+            # ("Music", "People & Blogs", "Gaming"...) straight into the
+            # genre tag at download time, and that's never actually a
+            # music genre — clear it on sight even with nothing to
+            # replace it with, rather than leaving it looking like a real
+            # (wrong) answer forever just because nothing better turned up.
+            for f in group:
+                if (f.get("genre") or "").strip().lower() in YT_VIDEO_CATEGORIES:
+                    updates.append({"path": f["path"], "genre": ""})
+                    cleared_junk += 1
+            no_genre_found += len(group) - sum(1 for f in group if (f.get("genre") or "").strip().lower() in YT_VIDEO_CATEGORIES)
             continue
         for f in group:
             if (f.get("genre") or "").strip().lower() == new_genre.lower():
@@ -2205,8 +2280,9 @@ def genre_relabel_worker(job_id):
 
     with job_lock:
         jobs[job_id]["log"].append(
-            f"ℹ {len(updates)} file(s) need a genre update, {already_correct} already correct, "
-            f"{no_genre_found} had no genre match on Spotify")
+            f"ℹ {len(updates)} file(s) need a genre update ({cleared_junk} just clearing a YouTube "
+            f"category that was never a real genre), {already_correct} already correct, "
+            f"{no_genre_found} had no genre match on Spotify or YouTube")
 
     applied, failed = 0, 0
     if updates:
@@ -2214,6 +2290,13 @@ def genre_relabel_worker(job_id):
             jobs[job_id]["current_track"] = f"Writing {len(updates)} genre tag(s) on the Navidrome host…"
         BATCH = 200
         for i in range(0, len(updates), BATCH):
+            with job_lock:
+                if jobs[job_id].get("cancel_requested"):
+                    jobs[job_id]["log"].append(f"🛑 Cancelled ({applied}/{len(updates)} tag(s) written)")
+                    jobs[job_id]["status"] = "done"
+                    jobs[job_id]["current_track"] = None
+                    save_jobs()
+                    return
             batch = updates[i:i + BATCH]
             apply_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_GENRE_APPLY_REMOTE_SCRIPT)}")
             try:
@@ -2684,6 +2767,17 @@ def skip_track(job_id):
         return jsonify({"error": "Not found"}), 404
     with job_lock:
         jobs[job_id]["skip_current"] = True
+    return jsonify({"status": "ok"})
+
+@app.route("/jobs/<job_id>/cancel", methods=["POST"])
+def cancel_job(job_id):
+    with job_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Not found"}), 404
+        if job.get("status") == "done":
+            return jsonify({"status": "already done"})
+        job["cancel_requested"] = True
     return jsonify({"status": "ok"})
 
 @app.route("/schedule", methods=["GET"])

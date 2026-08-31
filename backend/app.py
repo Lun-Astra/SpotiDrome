@@ -3136,6 +3136,139 @@ def find_edition_families(albums):
         groups.setdefault(key, set()).add(name)
     return {k: v for k, v in groups.items() if len(v) > 1}
 
+# A split caused by an *inconsistent album-artist tag* looks identical to a
+# genuine multi-edition split in Navidrome's UI, but has nothing to do with
+# edition suffixes — it's the same physical release, same folder, same
+# "album" tag, just one or a few tracks carrying a different (or missing)
+# ALBUMARTIST than the rest. Confirmed root cause of "Nullscape Vol. 2/3
+# tracks aren't joining the rest of the album" (2026-08-31): a track's
+# ALBUMARTIST tag was either never set (legacy download, predates fix_tags'
+# `album_artist or artist` fallback) or, ironically, set *by a manual
+# /failed/retry fix* that didn't pass through the album's real album_artist
+# and fell back to that one track's own (collab) artist string instead.
+#
+# Empirically (checked directly against the live Navidrome library, not
+# just inferred): an empty/missing ALBUMARTIST is harmless — Navidrome
+# quietly folds it into whatever real value the rest of the folder has, no
+# split. Two or more *different non-empty* values is what actually splits
+# it. So detection only cares about distinct non-blank values, and the fix
+# is conservative — realign the minority to the majority only when there's
+# a real majority (>=3 tracks, >=60%) to anchor it on; a near-even split
+# (often a genuine Various-Artists-style compilation, or two tracks with no
+# way to tell which is "right") is left alone rather than guessed at.
+_ALBUMARTIST_SCAN_REMOTE_SCRIPT = r'''
+import json, os, sys
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3
+
+root = sys.argv[1]
+out = {}
+for entry in os.scandir(root):
+    if not entry.is_dir():
+        continue
+    files_by_artist = {}
+    for fn in os.listdir(entry.path):
+        low = fn.lower()
+        if not (low.endswith(".flac") or low.endswith(".mp3")):
+            continue
+        path = os.path.join(entry.path, fn)
+        try:
+            if low.endswith(".flac"):
+                aa = (FLAC(path).get("albumartist") or [""])[0].strip()
+            else:
+                aa = str(ID3(path).get("TPE2", "")).strip()
+        except Exception:
+            continue
+        if aa:
+            files_by_artist.setdefault(aa, []).append(path)
+    if len(files_by_artist) > 1:
+        out[entry.name] = files_by_artist
+print(json.dumps(out))
+'''
+
+_REALIGN_ALBUMARTIST_REMOTE_SCRIPT = r'''
+import json, sys
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TPE2, error as ID3Error
+
+fixes = json.loads(sys.argv[1])
+results = []
+for m in fixes:
+    path = m["path"]
+    try:
+        if path.lower().endswith(".flac"):
+            tags = FLAC(path)
+            tags["albumartist"] = [m["album_artist"]]
+            tags.save()
+        elif path.lower().endswith(".mp3"):
+            try:
+                tags = ID3(path)
+            except ID3Error:
+                tags = ID3()
+            tags["TPE2"] = TPE2(encoding=3, text=m["album_artist"])
+            tags.save(path)
+        else:
+            results.append({"path": path, "ok": False, "error": "unsupported format"})
+            continue
+        results.append({"path": path, "ok": True})
+    except Exception as e:
+        results.append({"path": path, "ok": False, "error": str(e)[:200]})
+print(json.dumps(results))
+'''
+
+ALBUMARTIST_SPLIT_MIN_TRACKS = 3
+ALBUMARTIST_SPLIT_MIN_RATIO = 0.6
+
+def scan_albumartist_splits(ssh_cfg):
+    """Runs _ALBUMARTIST_SCAN_REMOTE_SCRIPT over the whole library in one
+    SSH round-trip. Returns {folder_name: {artist: [paths]}} for every
+    folder with 2+ distinct non-blank ALBUMARTIST values."""
+    cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_ALBUMARTIST_SCAN_REMOTE_SCRIPT)} "
+                             f"{shlex.quote(ssh_cfg['music_path'])}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except Exception:
+        return {}
+
+def find_albumartist_split_fixes(scan_result):
+    """scan_result: output of scan_albumartist_splits. Returns
+    {folder: {"winner": str, "paths": [path, ...]}} — only for folders with
+    a confident majority worth realigning the minority to (see thresholds
+    above); a near-even split is intentionally left out, not guessed at."""
+    fixes = {}
+    for folder, files_by_artist in scan_result.items():
+        total = sum(len(paths) for paths in files_by_artist.values())
+        winner, winner_paths = max(files_by_artist.items(), key=lambda kv: len(kv[1]))
+        winner_n = len(winner_paths)
+        if winner_n < ALBUMARTIST_SPLIT_MIN_TRACKS or winner_n / total < ALBUMARTIST_SPLIT_MIN_RATIO:
+            continue
+        outlier_paths = [p for artist, paths in files_by_artist.items()
+                          if artist != winner for p in paths]
+        if outlier_paths:
+            fixes[folder] = {"winner": winner, "paths": outlier_paths}
+    return fixes
+
+def apply_albumartist_split_fixes(ssh_cfg, fixes):
+    """fixes: output of find_albumartist_split_fixes. Retags every outlier
+    file's ALBUMARTIST to its folder's winning value. Returns (ok_count,
+    error_count)."""
+    batch = [{"path": p, "album_artist": info["winner"]}
+              for info in fixes.values() for p in info["paths"]]
+    if not batch:
+        return 0, 0
+    cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_REALIGN_ALBUMARTIST_REMOTE_SCRIPT)} "
+                             f"{shlex.quote(json.dumps(batch))}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    try:
+        outcomes = json.loads(result.stdout.strip())
+    except Exception:
+        return 0, len(batch)
+    ok = sum(1 for o in outcomes if o.get("ok"))
+    return ok, len(outcomes) - ok
+
 def _find_spotify_edition_tracklist(sp, artist, edition_name):
     """Looks up the real Spotify tracklist for THIS SPECIFIC edition name
     (not 'whichever edition is biggest' — every edition that's actually
@@ -3800,25 +3933,17 @@ def dismiss_failed_track():
         save_failed_tracks(data)
     return jsonify({"status": "ok"})
 
-@app.route("/failed/retry", methods=["POST"])
-def retry_failed_track():
-    body = request.json or {}
-    key = body.get("key", "")
-    url = (body.get("url") or "").strip()
-    if not key or not url:
-        return jsonify({"error": "key and url required"}), 400
-
-    entry = load_failed_tracks().get(key)
-    if not entry:
-        return jsonify({"error": "Unknown failed track (it may already be resolved)"}), 404
-
-    artist, title = entry.get("artist", ""), entry.get("name", "")
-    album = entry.get("album") or "Unknown Album"
-    album_artist = entry.get("album_artist")
-    playlist_name = entry.get("playlist_name") or "Manual Downloads"
-    ssh_cfg = load_ssh_config()
-    nd_cfg = load_nd_config()
-
+def _download_and_replace_track(artist, title, album, album_artist, duration_ms,
+                                 playlist_name, url, ssh_cfg, nd_cfg,
+                                 delete_existing_remote=False):
+    """Download `url`, validate it actually looks like the expected track,
+    tag it, and sync it to Navidrome. Shared by /failed/retry (retrying a
+    recorded failure) and /track/flag-wrong (replacing a track that's
+    already in the library — the download looked successful at the time,
+    it just turned out to be the wrong audio, e.g. a title collision with a
+    different song). Returns a plain dict, ready to jsonify."""
+    album = album or "Unknown Album"
+    playlist_name = playlist_name or "Manual Downloads"
     local_dir = os.path.join(DOWNLOAD_DIR, sanitize(playlist_name))
     album_dir = os.path.join(local_dir, sanitize(album))
     os.makedirs(album_dir, exist_ok=True)
@@ -3831,6 +3956,19 @@ def retry_failed_track():
                             "status": "running", "total": 1, "current": 1,
                             "downloaded": 0, "failed": 0, "nd_synced": None, "nd_missing": None,
                             "current_track": f"{artist} - {title}", "log": []}
+
+    # Unlike a failed download (nothing to overwrite), a flagged-wrong track
+    # already has a file sitting in Navidrome under this exact name — delete
+    # it up front so a rejected replacement doesn't leave the known-wrong
+    # file in place, and so a stale Navidrome DB row doesn't survive
+    # alongside the new one if the filename ever ends up differing.
+    if delete_existing_remote and ssh_cfg:
+        remote_path = f"{ssh_cfg['music_path']}/{sanitize(album)}/{filename}.flac"
+        rm_cmd = _ssh_cmd(ssh_cfg, f"rm -f -- {shlex.quote(remote_path)}")
+        result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
+        with job_lock:
+            jobs[tmp_job_id]["log"].append(f"🗑 Removed existing file at {remote_path}")
+        print(f"[flag-wrong] rm '{remote_path}' -> rc={result.returncode} err={result.stderr}", file=sys.stderr)
 
     is_youtube_url = "youtube.com" in url or "youtu.be" in url
     use_cookies = is_youtube_url and os.path.exists(COOKIES_FILE)
@@ -3855,18 +3993,18 @@ def retry_failed_track():
         jobs[tmp_job_id]["status"] = "done"
 
     if killed == "timeout":
-        return jsonify({"success": False, "message": "Download timed out after 30s"})
+        return {"success": False, "message": "Download timed out after 30s"}
     if killed == "skipped":
-        return jsonify({"success": False, "message": "Download was skipped"})
+        return {"success": False, "message": "Download was skipped"}
     if rc != 0:
         reason = _extract_yt_dlp_error(stderr) or f"yt-dlp exited with code {rc}"
-        return jsonify({"success": False, "message": reason})
+        return {"success": False, "message": reason}
 
     flac_path = out_template.replace(".%(ext)s", ".flac")
     if not os.path.exists(flac_path):
-        return jsonify({"success": False, "message": "File missing after download"})
+        return {"success": False, "message": "File missing after download"}
 
-    wrong_reason = _downloaded_file_looks_wrong(flac_path, title, entry.get("duration_ms", 0), expected_artist=artist)
+    wrong_reason = _downloaded_file_looks_wrong(flac_path, title, duration_ms, expected_artist=artist)
     if wrong_reason:
         try:
             os.remove(flac_path)
@@ -3874,8 +4012,7 @@ def retry_failed_track():
             pass
         with job_lock:
             jobs[tmp_job_id]["log"].append(f"✗ Rejected pasted link ({wrong_reason}): {artist} - {title}")
-        return jsonify({"success": False,
-                         "message": f"Rejected — {wrong_reason}. Try a different link."})
+        return {"success": False, "message": f"Rejected — {wrong_reason}. Try a different link."}
 
     source_url = extract_resolved_url(stdout) or url
     genre = lookup_genre(artist)
@@ -3886,8 +4023,8 @@ def retry_failed_track():
 
     synced_to_navidrome = False
     if ssh_cfg:
-        retried_track = {"id": key, "name": title, "artist": artist, "album": new_album,
-                          "album_artist": album_artist, "duration_ms": entry.get("duration_ms", 0),
+        retried_track = {"id": None, "name": title, "artist": artist, "album": new_album,
+                          "album_artist": album_artist, "duration_ms": duration_ms,
                           "image": None, "source_url": source_url}
         batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, [retried_track], tmp_job_id)
         synced_to_navidrome = True
@@ -3900,7 +4037,50 @@ def retry_failed_track():
     message += " and synced to Navidrome" if synced_to_navidrome else " — no SSH configured, file left in local storage"
     if used_android_fallback:
         message += " — ⚠ lower quality (android fallback after repeated YouTube 403s)"
-    return jsonify({"success": True, "message": message})
+    return {"success": True, "message": message}
+
+@app.route("/failed/retry", methods=["POST"])
+def retry_failed_track():
+    body = request.json or {}
+    key = body.get("key", "")
+    url = (body.get("url") or "").strip()
+    if not key or not url:
+        return jsonify({"error": "key and url required"}), 400
+
+    entry = load_failed_tracks().get(key)
+    if not entry:
+        return jsonify({"error": "Unknown failed track (it may already be resolved)"}), 404
+
+    result = _download_and_replace_track(
+        entry.get("artist", ""), entry.get("name", ""), entry.get("album"),
+        entry.get("album_artist"), entry.get("duration_ms", 0),
+        entry.get("playlist_name"), url,
+        load_ssh_config(), load_nd_config(), delete_existing_remote=False)
+    return jsonify(result)
+
+@app.route("/track/flag-wrong", methods=["POST"])
+def flag_wrong_track():
+    """Replace a track that's already in the library but turned out to be
+    the wrong audio under a correct-looking name — most often a title
+    collision with a different artist's or soundtrack's same-titled song
+    (see the Nullscape Vol. 1-3 fixes: Baby Face, Dimension, Self Destruct,
+    Find your Flame). Unlike /failed/retry, this track was never a recorded
+    failure — the original download looked successful — so the caller
+    supplies the track's own expected metadata directly instead of a
+    failed_tracks key, and the existing file gets deleted up front rather
+    than merely overwritten."""
+    body = request.json or {}
+    artist = (body.get("artist") or "").strip()
+    title = (body.get("name") or "").strip()
+    url = (body.get("url") or "").strip()
+    if not artist or not title or not url:
+        return jsonify({"error": "artist, name and url required"}), 400
+
+    result = _download_and_replace_track(
+        artist, title, body.get("album"), body.get("album_artist"),
+        body.get("duration_ms", 0), body.get("playlist_name"), url,
+        load_ssh_config(), load_nd_config(), delete_existing_remote=True)
+    return jsonify(result)
 
 # ─── Sync health routes ────────────────────────────────────────────────────────
 

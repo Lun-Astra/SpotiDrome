@@ -787,6 +787,46 @@ def _duration_close(candidate_sec, expected_sec, pct=0.15, floor=15):
         return False  # we DO have an expected duration; an unknown one is not "close enough"
     return abs(candidate_sec - expected_sec) <= max(floor, expected_sec * pct)
 
+# Manual retries and pasted-URL imports bypass the scored multi-provider
+# matcher entirely (the whole point is the user hands us an exact URL), so
+# nothing there ever ran _looks_like_non_music or a duration check against
+# it. In practice that let things like a full "let's play" episode get saved
+# and tagged as a 2-minute game OST track (confirmed: several Super Mario
+# Galaxy tracks turned out to be 20-30min commentary videos this way). This
+# is the safety net for both of those paths, applied *after* download so it
+# can inspect the file yt-dlp actually produced instead of trusting the URL.
+DURATION_MISMATCH_RATIO = 2.5
+DURATION_MISMATCH_FLOOR_SEC = 45
+
+def _downloaded_file_looks_wrong(flac_path, expected_title, expected_duration_ms=0):
+    """Sanity-check a just-downloaded FLAC against what it was supposed to
+    be. Returns a human-readable reason string if it looks wrong, else None.
+    Must be called BEFORE fix_tags() overwrites the file's own tags — this
+    reads yt-dlp's originally-embedded title/description to see what the
+    source video actually was."""
+    try:
+        tags = FLAC(flac_path)
+    except Exception:
+        return None  # can't inspect it; don't block on our own failure to read it
+
+    actual_sec = tags.info.length if tags.info else 0
+    if expected_duration_ms:
+        expected_sec = expected_duration_ms / 1000
+        if (actual_sec > expected_sec * DURATION_MISMATCH_RATIO
+                and actual_sec - expected_sec > DURATION_MISMATCH_FLOOR_SEC):
+            return (f"downloaded audio is {actual_sec/60:.1f} min long but "
+                    f"'{expected_title}' should be about {expected_sec/60:.1f} min — "
+                    f"this is very likely the wrong video (e.g. a full soundtrack, "
+                    f"let's play/walkthrough, or extended mix), not the actual track")
+
+    raw_title = (tags.get("title") or [""])[0]
+    raw_desc = (tags.get("synopsis") or tags.get("description") or [""])[0]
+    if _looks_like_non_music(f"{raw_title} {raw_desc}", expected_title):
+        return (f"the source video's own title/description looks like non-music "
+                f"content (podcast, let's play, walkthrough episode, etc.), not "
+                f"'{expected_title}'")
+    return None
+
 def _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec):
     title = entry.get("title") or ""
     artists = [a.get("name", "") for a in (entry.get("artists") or [])]
@@ -1325,6 +1365,17 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 jobs[job_id]["log"].append(f"🚫 Permanently ignored: {artist} - {title}")
             continue
 
+        # A pasted single track URL is an explicit, deliberate choice — nothing
+        # to second-guess it against. A pasted *playlist/album* URL is swept in
+        # wholesale with no per-entry review, though, and playlists like game-OST
+        # "full soundtrack" rips are commonly interleaved with unrelated content
+        # (let's plays, trailers, etc.) by whoever uploaded them — so filter
+        # those the same way the Spotify path's matcher does.
+        if is_playlist and any(kw in title.lower() for kw in NOT_MUSIC_KEYWORDS):
+            with job_lock:
+                jobs[job_id]["log"].append(f"🚫 Skipped (looks like non-music content): {artist} - {title}")
+            continue
+
         filename = sanitize(f"{artist} - {title}")
         album_dir = os.path.join(local_dir, sanitize(album or "Unknown Album"))
         os.makedirs(album_dir, exist_ok=True)
@@ -1417,6 +1468,19 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                     jobs[job_id]["log"].append(f"✗ Failed (file missing after download): {artist} - {title}")
                     jobs[job_id]["failed"] += 1
                 continue
+            if is_playlist:
+                wrong_reason = _downloaded_file_looks_wrong(flac_path, title)
+                if wrong_reason:
+                    try:
+                        os.remove(flac_path)
+                    except Exception:
+                        pass
+                    record_failed_track(failed_track_stub, failed_playlist_id, playlist_name,
+                                         f"looks like non-music content ({wrong_reason})")
+                    with job_lock:
+                        jobs[job_id]["log"].append(f"✗ Rejected ({wrong_reason}): {artist} - {title}")
+                        jobs[job_id]["failed"] += 1
+                    continue
             genre = lookup_genre(artist)
             fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
             new_album, flac_path = maybe_correct_album(
@@ -3767,6 +3831,17 @@ def retry_failed_track():
     flac_path = out_template.replace(".%(ext)s", ".flac")
     if not os.path.exists(flac_path):
         return jsonify({"success": False, "message": "File missing after download"})
+
+    wrong_reason = _downloaded_file_looks_wrong(flac_path, title, entry.get("duration_ms", 0))
+    if wrong_reason:
+        try:
+            os.remove(flac_path)
+        except Exception:
+            pass
+        with job_lock:
+            jobs[tmp_job_id]["log"].append(f"✗ Rejected pasted link ({wrong_reason}): {artist} - {title}")
+        return jsonify({"success": False,
+                         "message": f"Rejected — {wrong_reason}. Try a different link."})
 
     source_url = extract_resolved_url(stdout) or url
     genre = lookup_genre(artist)

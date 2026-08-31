@@ -795,15 +795,25 @@ def _duration_close(candidate_sec, expected_sec, pct=0.15, floor=15):
 # Galaxy tracks turned out to be 20-30min commentary videos this way). This
 # is the safety net for both of those paths, applied *after* download so it
 # can inspect the file yt-dlp actually produced instead of trusting the URL.
+#
+# It also runs (with an expected_artist) after every candidate download in
+# the normal scored-matcher path (download_worker) — belt and suspenders on
+# top of _artist_ok's pre-download channel-name check, since that only sees
+# the channel/uploader name, not the richer "artist" field yt-dlp's own
+# --add-metadata pulls from the video itself. Confirmed necessary: several
+# "Nullscape" tracks (artist DIGITAL DESCENDANT) turned out to be a
+# completely different artist's same-titled song — e.g. the track named
+# "Baby Face" was actually "Babyface & Kehlani - Seamless", embedded with
+# TAG:artist=Babyface, a title collision _title_ok alone can't catch.
 DURATION_MISMATCH_RATIO = 2.5
 DURATION_MISMATCH_FLOOR_SEC = 45
 
-def _downloaded_file_looks_wrong(flac_path, expected_title, expected_duration_ms=0):
+def _downloaded_file_looks_wrong(flac_path, expected_title, expected_duration_ms=0, expected_artist=None):
     """Sanity-check a just-downloaded FLAC against what it was supposed to
     be. Returns a human-readable reason string if it looks wrong, else None.
     Must be called BEFORE fix_tags() overwrites the file's own tags — this
-    reads yt-dlp's originally-embedded title/description to see what the
-    source video actually was."""
+    reads yt-dlp's originally-embedded title/description/artist to see what
+    the source video actually was."""
     try:
         tags = FLAC(flac_path)
     except Exception:
@@ -825,6 +835,19 @@ def _downloaded_file_looks_wrong(flac_path, expected_title, expected_duration_ms
         return (f"the source video's own title/description looks like non-music "
                 f"content (podcast, let's play, walkthrough episode, etc.), not "
                 f"'{expected_title}'")
+
+    # yt-dlp's --add-metadata embeds the video's own "artist" field (distinct
+    # from uploader/channel) whenever the source actually has one — reliably
+    # true for official music uploads. When it's present and it flatly
+    # doesn't match who this was supposed to be by, a title collision with a
+    # different artist's same-named song is the near-certain explanation.
+    # Absent/empty is not evidence of anything (plenty of legitimate uploads
+    # carry no artist tag at all) — only a confident mismatch rejects.
+    raw_artist = (tags.get("artist") or [""])[0].strip()
+    if raw_artist and expected_artist and not _artist_ok([raw_artist], expected_artist):
+        return (f"the source video's own artist tag is '{raw_artist}', not "
+                f"'{expected_artist}' — almost certainly a different artist's "
+                f"same-titled song, not '{expected_title}'")
     return None
 
 def _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec):
@@ -1191,6 +1214,17 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 flac_path = out_template.replace('.%(ext)s', '.flac')
                 if not os.path.exists(flac_path):
                     last_reason = f"file missing after download, via {provider}"
+                    continue
+                wrong_reason = _downloaded_file_looks_wrong(
+                    flac_path, track['name'], track.get('duration_ms', 0), expected_artist=track['artist'])
+                if wrong_reason:
+                    try:
+                        os.remove(flac_path)
+                    except Exception:
+                        pass
+                    with job_lock:
+                        jobs[job_id]["log"].append(f"✗ Rejected via {provider} ({wrong_reason}): {label}")
+                    last_reason = f"rejected via {provider} ({wrong_reason})"
                     continue
                 source_url = extract_resolved_url(stdout)
                 track["source_url"] = source_url
@@ -3832,7 +3866,7 @@ def retry_failed_track():
     if not os.path.exists(flac_path):
         return jsonify({"success": False, "message": "File missing after download"})
 
-    wrong_reason = _downloaded_file_looks_wrong(flac_path, title, entry.get("duration_ms", 0))
+    wrong_reason = _downloaded_file_looks_wrong(flac_path, title, entry.get("duration_ms", 0), expected_artist=artist)
     if wrong_reason:
         try:
             os.remove(flac_path)

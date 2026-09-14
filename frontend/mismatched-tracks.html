@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpotiDrome — Mismatched Tracks</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d0d12;
+  --bg2: #13131a;
+  --bg3: #1a1a24;
+  --bg4: #22222e;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --sp: #1ed760;
+  --nd: #8b5cf6;
+  --yt: #ff3333;
+  --amber: #f59e0b;
+  --red: #f87171;
+  --text: #f0f0f8;
+  --text2: #9090b0;
+  --text3: #5a5a7a;
+  --r: 10px;
+  --r2: 14px;
+  --font: 'Inter', sans-serif;
+  --font2: 'Space Grotesk', sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;
+  background-image:radial-gradient(circle at 20% 20%, rgba(139,92,246,0.06) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, rgba(30,215,96,0.04) 0%, transparent 50%),
+    linear-gradient(var(--border) 1px,transparent 1px),
+    linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:100% 100%,100% 100%,32px 32px,32px 32px;
+  pointer-events:none;z-index:0}
+.app{position:relative;z-index:1;max-width:900px;margin:0 auto;padding:0 20px 80px}
+header{display:flex;align-items:center;justify-content:space-between;padding:20px 0 24px;border-bottom:1px solid var(--border);margin-bottom:24px;flex-wrap:wrap;gap:12px}
+.logo{font-family:var(--font2);font-size:24px;font-weight:700;letter-spacing:-0.5px;display:flex;align-items:center;gap:2px}
+.logo .sp{color:var(--sp)}
+.logo .arr{color:var(--text3);margin:0 4px;font-weight:400}
+.logo .nd{color:var(--nd)}
+.back-link{display:inline-flex;align-items:center;gap:6px;color:var(--text2);text-decoration:none;font-size:13px;font-weight:500;padding:6px 12px;border-radius:40px;background:var(--bg3);border:1px solid var(--border);transition:all .15s}
+.back-link:hover{border-color:var(--border2);color:var(--text)}
+.page-title{font-family:var(--font2);font-size:22px;font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:10px}
+.page-sub{color:var(--text2);font-size:13px;margin-bottom:20px}
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--text3);font-weight:500}
+.badge.count{background:rgba(248,113,113,.12);color:var(--red);border-color:rgba(248,113,113,.2)}
+
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden;margin-bottom:20px}
+.panel-hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border);gap:10px;flex-wrap:wrap}
+.panel-title{font-family:var(--font2);font-size:12px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text2)}
+.panel-body{padding:14px 16px}
+.scan-sub{font-size:12px;color:var(--text2);line-height:1.5}
+
+.btn{display:inline-flex;align-items:center;gap:6px;font-family:var(--font);font-size:12px;font-weight:500;padding:8px 14px;border-radius:var(--r);border:none;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-primary{background:var(--sp);color:#000}
+.btn-primary:hover{box-shadow:0 4px 12px rgba(30,215,96,.3);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--border2);color:var(--text)}
+.btn-danger{background:rgba(248,113,113,.12);color:var(--red);border:1px solid rgba(248,113,113,.25)}
+.btn-danger:hover{background:rgba(248,113,113,.2)}
+.btn-danger:disabled{opacity:.4;cursor:not-allowed}
+
+.prog-bar{height:4px;background:var(--bg4);border-radius:2px;overflow:hidden;margin-top:10px}
+.prog-fill{height:100%;background:var(--nd);transition:width .3s}
+.job-log{margin-top:10px;max-height:140px;overflow-y:auto;font-size:11px;font-family:monospace;background:var(--bg3);border-radius:8px;padding:8px 10px;line-height:1.6}
+.ll{opacity:.85}
+.ll.err{color:var(--amber)}
+.ll.nd{color:#4ade80}
+
+.mm-item{padding:14px 16px;border-bottom:1px solid var(--border)}
+.mm-item:last-child{border-bottom:none}
+.mm-name{font-size:14px;font-weight:600}
+.mm-artist{font-size:12px;color:var(--text2);margin-top:2px}
+.mm-meta{font-size:11px;color:var(--text3);margin-top:6px;line-height:1.6}
+.mm-reason{color:var(--amber);opacity:.9}
+.mm-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.mm-flag-row{display:none;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}
+.mm-flag-url{flex:1;min-width:220px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-family:var(--font);font-size:12px;padding:8px 12px;outline:none;transition:border-color .15s}
+.mm-flag-url:focus{border-color:rgba(139,92,246,.5)}
+.mm-flag-url::placeholder{color:var(--text3)}
+.mm-result{font-size:11px;margin-top:8px;display:none;padding:7px 10px;border-radius:6px}
+.mm-result.ok{display:block;background:rgba(30,215,96,.1);border:1px solid rgba(30,215,96,.2);color:#4ade80}
+.mm-result.err{display:block;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:var(--red)}
+
+.spin{width:13px;height:13px;border:2px solid rgba(255,255,255,.15);border-top-color:currentColor;border-radius:50%;animation:rot .6s linear infinite;display:inline-block;flex-shrink:0}
+@keyframes rot{to{transform:rotate(360deg)}}
+.empty{padding:40px 16px;text-align:center;color:var(--text3);font-size:13px}
+.empty-icon{font-size:28px;margin-bottom:10px}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header>
+    <div class="logo"><span class="sp">Spoti</span><span class="arr">→</span><span class="nd">Drome</span></div>
+    <a class="back-link" href="/">← Back to library</a>
+  </header>
+
+  <div class="page-title">🔍 Mismatched Tracks <span class="badge count" id="mm-count">—</span></div>
+  <div class="page-sub">Re-checks every track's recorded source (YouTube/YouTube Music/SoundCloud link) against its own library tags — catches a title collision with a different artist's song, or a Let's Play/compilation that slipped in under a correct-looking name, even for tracks downloaded before those checks existed.</div>
+
+  <div class="panel">
+    <div class="panel-hd">
+      <span class="panel-title">Scan</span>
+      <button class="btn btn-primary" id="scan-btn" onclick="startScan()">🔍 Scan library</button>
+    </div>
+    <div class="panel-body">
+      <div class="scan-sub" id="scan-sub">Each check is a real network look-up, so a full library takes a while and runs in the background — this page checks in on it periodically. Click again any time to continue checking whatever's left.</div>
+      <div id="scan-progress" style="display:none">
+        <div class="prog-bar"><div class="prog-fill" id="scan-prog-fill" style="width:0%"></div></div>
+        <div class="scan-sub" id="scan-status" style="margin-top:8px"></div>
+        <div class="job-log" id="scan-log" style="display:none"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-hd">
+      <span class="panel-title">Flagged</span>
+      <button class="btn btn-ghost" onclick="loadMismatches()">↺ Refresh</button>
+    </div>
+    <div id="mm-list"><div class="empty"><div class="spin"></div></div></div>
+  </div>
+</div>
+
+<script>
+const API='/api';
+let scanPoll=null;
+
+async function loadMismatches(){
+  try{
+    const r=await fetch(`${API}/library/mismatched-tracks`),d=await r.json();
+    const items=d.mismatches||[];
+    document.getElementById('mm-count').textContent=items.length;
+    const sub=[];
+    if(d.last_run)sub.push(`last scan: ${new Date(d.last_run+'Z').toLocaleString()}`);
+    if(d.total_tracks)sub.push(`${d.total_tracks} tracks on disk`);
+    if(d.still_unverified)sub.push(`${d.still_unverified} not yet checked`);
+    document.getElementById('scan-sub').textContent=sub.length
+      ?sub.join(' · ')
+      :"Each check is a real network look-up, so a full library takes a while and runs in the background — this page checks in on it periodically. Click again any time to continue checking whatever's left.";
+
+    const list=document.getElementById('mm-list');
+    if(!items.length){
+      list.innerHTML='<div class="empty"><div class="empty-icon">🎉</div>No mismatches found (yet) — run a scan if you haven\'t, or it just hasn\'t hit anything.</div>';
+      return;
+    }
+    list.innerHTML=items.map((it,i)=>`<div class="mm-item" data-idx="${i}">
+      <div class="mm-name">${esc(it.title||'Unknown title')}</div>
+      <div class="mm-artist">${esc(it.artist||'Unknown artist')}</div>
+      <div class="mm-meta">
+        ${it.album?`Album: ${esc(it.album)} · `:''}<br><span class="mm-reason">${esc(it.reason||'')}</span>
+      </div>
+      <div class="mm-actions">
+        <button class="btn btn-primary" onclick="toggleFlagRow(${i})">🚩 Paste corrected link</button>
+        <button class="btn btn-ghost" onclick="whitelistTrack(${i},this)">✓ Whitelist (false positive)</button>
+        <button class="btn btn-danger" onclick="removeTrack(${i},this)">🗑 Remove &amp; blocklist</button>
+      </div>
+      <div class="mm-flag-row" id="mm-flag-row-${i}">
+        <input class="mm-flag-url" type="url" placeholder="Paste the correct YouTube / YouTube Music / SoundCloud link…">
+        <button class="btn btn-primary" style="padding:6px 10px;font-size:11px" onclick="submitFlagWrong(${i},this)">↓ Replace</button>
+        <button class="btn btn-ghost" style="padding:6px 10px;font-size:11px" onclick="toggleFlagRow(${i})">Cancel</button>
+      </div>
+      <div class="mm-result"></div>
+    </div>`).join('');
+    window._mmItems=items;
+  }catch(e){
+    document.getElementById('mm-list').innerHTML=`<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+  }
+}
+
+function toggleFlagRow(i){
+  const row=document.getElementById(`mm-flag-row-${i}`);
+  if(!row)return;
+  const showing=row.style.display==='flex';
+  document.querySelectorAll('.mm-flag-row').forEach(r=>r.style.display='none');
+  if(!showing){
+    row.style.display='flex';
+    const input=row.querySelector('.mm-flag-url');
+    input.value='';input.focus();
+  }
+}
+
+async function submitFlagWrong(i,btn){
+  const it=window._mmItems[i];
+  const item=btn.closest('.mm-item');
+  const row=btn.closest('.mm-flag-row');
+  const url=row.querySelector('.mm-flag-url').value.trim();
+  const resultEl=item.querySelector('.mm-result');
+  if(!url){resultEl.className='mm-result err';resultEl.textContent='Paste a link first.';return;}
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span>';
+  resultEl.className='mm-result';resultEl.textContent='';
+  try{
+    const r=await fetch(`${API}/track/flag-wrong`,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({artist:it.artist,name:it.title,album:it.album,album_artist:it.album_artist,
+        duration_ms:it.duration_ms,url})});
+    const d=await r.json();
+    if(d.success){
+      resultEl.className='mm-result ok';resultEl.textContent='✓ '+d.message;
+      setTimeout(()=>{item.style.transition='opacity .3s';item.style.opacity='0';setTimeout(()=>{item.remove();updateCountAfterRemoval();},300);},900);
+    }else{
+      resultEl.className='mm-result err';resultEl.textContent='✗ '+(d.message||d.error||'Replace failed');
+      btn.disabled=false;btn.innerHTML=orig;
+    }
+  }catch(e){
+    resultEl.className='mm-result err';resultEl.textContent='✗ '+e.message;
+    btn.disabled=false;btn.innerHTML=orig;
+  }
+}
+
+async function whitelistTrack(i,btn){
+  const it=window._mmItems[i];
+  const item=btn.closest('.mm-item');
+  const resultEl=item.querySelector('.mm-result');
+  item.querySelectorAll('.mm-actions button').forEach(b=>b.disabled=true);
+  try{
+    const r=await fetch(`${API}/library/mismatched-tracks/whitelist`,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({artist:it.artist,title:it.title})});
+    const d=await r.json();
+    if(d.status==='ok'){
+      resultEl.className='mm-result ok';resultEl.textContent='✓ Whitelisted — won\'t show here again.';
+      setTimeout(()=>{item.style.transition='opacity .3s';item.style.opacity='0';setTimeout(()=>{item.remove();updateCountAfterRemoval();},300);},700);
+    }else{
+      resultEl.className='mm-result err';resultEl.textContent='✗ '+(d.error||'Failed to whitelist');
+      item.querySelectorAll('.mm-actions button').forEach(b=>b.disabled=false);
+    }
+  }catch(e){
+    resultEl.className='mm-result err';resultEl.textContent='✗ '+e.message;
+    item.querySelectorAll('.mm-actions button').forEach(b=>b.disabled=false);
+  }
+}
+
+async function removeTrack(i,btn){
+  // Inline arm/confirm instead of a native confirm() popup — see
+  // long-tracks.html for why (Firefox suppresses repeated native dialogs).
+  if(btn.dataset.armed!=='1'){
+    if(!btn.dataset.origLabel)btn.dataset.origLabel=btn.innerHTML;
+    btn.dataset.armed='1';
+    btn.innerHTML='Click again to confirm';
+    clearTimeout(btn._armTimer);
+    btn._armTimer=setTimeout(()=>{btn.dataset.armed='0';btn.innerHTML=btn.dataset.origLabel;},4000);
+    return;
+  }
+  clearTimeout(btn._armTimer);
+  btn.dataset.armed='0';
+  const origLabel=btn.dataset.origLabel;
+
+  const it=window._mmItems[i];
+  const item=btn.closest('.mm-item');
+  const resultEl=item.querySelector('.mm-result');
+  item.querySelectorAll('.mm-actions button').forEach(b=>b.disabled=true);
+  btn.innerHTML='<span class="spin"></span> Removing…';
+  resultEl.className='mm-result';resultEl.textContent='';
+  try{
+    const r=await fetch(`${API}/library/mismatched-tracks/remove`,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:it.path,artist:it.artist,title:it.title})});
+    const d=await r.json();
+    if(d.status==='ok'){
+      resultEl.className='mm-result ok';resultEl.textContent='✓ Removed and blocklisted.';
+      setTimeout(()=>{item.style.transition='opacity .3s';item.style.opacity='0';setTimeout(()=>{item.remove();updateCountAfterRemoval();},300);},700);
+    }else{
+      resultEl.className='mm-result err';resultEl.textContent='✗ '+(d.error||'Failed to remove');
+      item.querySelectorAll('.mm-actions button').forEach(b=>b.disabled=false);
+      btn.innerHTML=origLabel;
+    }
+  }catch(e){
+    resultEl.className='mm-result err';resultEl.textContent='✗ '+e.message;
+    item.querySelectorAll('.mm-actions button').forEach(b=>b.disabled=false);
+    btn.innerHTML=origLabel;
+  }
+}
+
+function updateCountAfterRemoval(){
+  const remaining=document.querySelectorAll('.mm-item').length;
+  document.getElementById('mm-count').textContent=remaining;
+  if(!remaining)document.getElementById('mm-list').innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing flagged.</div>';
+}
+
+async function startScan(){
+  const btn=document.getElementById('scan-btn');
+  btn.disabled=true;
+  try{
+    const r=await fetch(`${API}/library/verify-tracks`,{method:'POST'});
+    const d=await r.json();
+    if(d.error){alert(d.error);btn.disabled=false;return;}
+    document.getElementById('scan-progress').style.display='block';
+    pollScan(d.job_id);
+  }catch(e){
+    alert('Failed to start scan: '+e.message);
+    btn.disabled=false;
+  }
+}
+
+function pollScan(jobId){
+  clearInterval(scanPoll);
+  scanPoll=setInterval(async()=>{
+    try{
+      const r=await fetch(`${API}/jobs/${jobId}`),job=await r.json();
+      if(job.error){clearInterval(scanPoll);return;}
+      const pct=job.total>0?Math.round(job.current/job.total*100):0;
+      document.getElementById('scan-prog-fill').style.width=pct+'%';
+      document.getElementById('scan-status').textContent=
+        `${job.status} — ${job.current}/${job.total}${job.current_track?' · '+job.current_track:''} · ${job.downloaded} mismatch(es) so far`;
+      const logEl=document.getElementById('scan-log');
+      if((job.log||[]).length){
+        logEl.style.display='block';
+        logEl.innerHTML=job.log.slice(-30).map(l=>{
+          const c=l.startsWith('⚠')?'err':(l.startsWith('✅')||l.startsWith('📚'))?'nd':'';
+          return `<div class="ll ${c}">${esc(l)}</div>`;
+        }).join('');
+        logEl.scrollTop=logEl.scrollHeight;
+      }
+      if(job.status==='done'){
+        clearInterval(scanPoll);
+        document.getElementById('scan-btn').disabled=false;
+        loadMismatches();
+      }
+    }catch(e){}
+  },2000);
+}
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+loadMismatches();
+</script>
+</body>
+</html>

@@ -3965,6 +3965,362 @@ def library_long_tracks_remove():
     })
 
 
+# ─── Track match verification ──────────────────────────────────────────────
+# fix_tags() overwrites a downloaded file's own title/artist tags with the
+# *expected* metadata right after download — so once a wrong match slips
+# through (see spotidrome-wrong-track-bugs), the library file itself no
+# longer carries any trace of what it actually is. The one surviving clue
+# is the "comment" tag, which fix_tags() sets to the actual source URL. This
+# re-resolves that URL via yt-dlp and diffs the *real* video's title/artist
+# against the library tag — the same checks _downloaded_file_looks_wrong()
+# already runs at download time, just run again after the fact so it also
+# catches tracks that were downloaded before that safety net existed.
+
+TRACK_VERIFY_STATE_FILE       = "/root/.ssh/track_verify_state.json"
+TRACK_MISMATCH_REPORT_FILE    = "/root/.ssh/track_mismatch_report.json"
+TRACK_MISMATCH_WHITELIST_FILE = "/root/.ssh/track_mismatch_whitelist.json"
+# Each check is a real yt-dlp network round-trip (a few seconds each) —
+# capped per run for the same reason scan_and_dedupe_by_title caps itself
+# (MAX_TITLE_DEDUPE_PER_RUN): keep one run's wall-clock predictable rather
+# than one job blocking on the entire library. Re-run to keep going —
+# already-verified tracks are cached and skipped on the next run.
+MAX_VERIFY_CHECKS_PER_RUN = 300
+# Bump this whenever _verify_track_against_source's rules change. The cache
+# below is keyed on (path, comment) alone, which only tells you the *file*
+# hasn't changed — not that it was checked with today's logic. Without this,
+# a rule fix (like the channel/uploader false-positive fix below) would
+# silently keep serving verdicts computed under the old, wrong rules for
+# every track already cached, since its file and comment URL didn't change.
+TRACK_VERIFY_LOGIC_VERSION = 2
+
+def load_track_verify_state():
+    try:
+        with open(TRACK_VERIFY_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_track_verify_state(data):
+    with open(TRACK_VERIFY_STATE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_track_mismatch_report():
+    try:
+        with open(TRACK_MISMATCH_REPORT_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"last_run": None, "total_tracks": 0, "checked_this_run": 0,
+                 "still_unverified": 0, "mismatches": []}
+
+def save_track_mismatch_report(data):
+    with open(TRACK_MISMATCH_REPORT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_track_mismatch_whitelist():
+    try:
+        with open(TRACK_MISMATCH_WHITELIST_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_track_mismatch_whitelist(data):
+    with open(TRACK_MISMATCH_WHITELIST_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# One SSH round-trip reads every track's tags at once — same idiom as
+# _GENRE_SCAN_REMOTE_SCRIPT / _TITLE_DEDUPE_SCAN_SCRIPT, just pulling
+# "comment" (the source URL) and album_artist as well.
+_VERIFY_SCAN_SCRIPT = r'''
+import json, os, sys
+import mutagen
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, error as ID3Error
+
+MUSIC = sys.argv[1]
+out = []
+for root, dirs, files in os.walk(MUSIC):
+    for f in files:
+        p = os.path.join(root, f)
+        try:
+            if f.endswith(".flac"):
+                tags = FLAC(p)
+                title = (tags.get("title") or [""])[0]
+                artist = (tags.get("artist") or [""])[0]
+                album_artist = (tags.get("albumartist") or [""])[0]
+                comment = (tags.get("comment") or [""])[0]
+                duration = tags.info.length if tags.info else 0
+            elif f.endswith(".mp3"):
+                tags = ID3(p)
+                title = str(tags.get("TIT2", ""))
+                artist = str(tags.get("TPE1", ""))
+                album_artist = str(tags.get("TPE2", ""))
+                comm = tags.getall("COMM")
+                comment = str(comm[0]) if comm else ""
+                duration = mutagen.File(p).info.length
+            else:
+                continue
+        except Exception:
+            continue
+        if title and artist:
+            out.append({"path": p, "title": title, "artist": artist,
+                        "album_artist": album_artist, "comment": comment,
+                        "duration": duration or 0,
+                        "album": os.path.basename(os.path.dirname(p))})
+print(json.dumps(out))
+'''
+
+def _lookup_source_identity(url, timeout=20):
+    """Ask yt-dlp what a source URL actually is (title/artist/description),
+    without downloading it — mirrors lookup_real_album()'s pattern."""
+    if not url:
+        return None
+    try:
+        cmd = ["yt-dlp", "--dump-json", "--no-playlist", "--skip-download",
+               "--socket-timeout", "10", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return json.loads(result.stdout.strip().split("\n")[0])
+    except Exception:
+        return None
+
+def _verify_track_against_source(title, artist, comment_url):
+    """Returns a human-readable reason string if the track looks wrong,
+    else None. Deliberately mirrors _downloaded_file_looks_wrong()'s exact
+    signals — not looser ones — just fed freshly-refetched source metadata
+    instead of the originally-embedded tags fix_tags() already overwrote on
+    disk. In particular: only yt-dlp's own dedicated 'artist' field counts
+    as ground truth for the artist check, same as that function only trusts
+    the file's --add-metadata-embedded artist tag — NOT a channel/uploader
+    name, which is an upload *account*, not a performer credit, and falling
+    back to it produced real false positives in testing (a legitimate,
+    correctly-tagged song re-uploaded by some unrelated compilation/fan
+    channel still isn't 'by' that channel). Absent is not evidence of
+    anything either way — only a confident mismatch rejects."""
+    if not comment_url:
+        return None  # nothing to verify against (e.g. the Subspace Sequence case) — not evidence of anything
+    info = _lookup_source_identity(comment_url)
+    if not info:
+        return None  # dead link / unresolvable — not evidence of a mismatch, just unverifiable right now
+
+    real_title = info.get("track") or info.get("title") or ""
+    real_artist = (info.get("artist") or "").strip()
+    real_desc = info.get("description") or ""
+
+    if _looks_like_non_music(f"{real_title} {real_desc}", title):
+        return (f"the source video's own title/description looks like non-music content "
+                f"(podcast, let's play, walkthrough, full compilation, etc.), not '{title}'")
+    if real_artist and not _artist_ok([real_artist], artist):
+        return (f"the source video's own artist tag is '{real_artist}', not '{artist}' — "
+                f"almost certainly a different artist's same-titled song")
+    return None
+
+def verify_tracks_worker(job_id):
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+
+    ssh_cfg = load_ssh_config()
+    if not ssh_cfg:
+        with job_lock:
+            jobs[job_id]["log"].append("✗ SSH not configured")
+            jobs[job_id]["status"] = "done"
+        return
+
+    with job_lock:
+        jobs[job_id]["current_track"] = "Reading tags for every track on the Navidrome host…"
+    scan_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_VERIFY_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+    try:
+        result = subprocess.run(scan_cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            raise ValueError(result.stderr[-500:])
+        files = json.loads(result.stdout.strip() or "[]")
+    except Exception as e:
+        with job_lock:
+            jobs[job_id]["log"].append(f"✗ Failed to scan library: {e}")
+            jobs[job_id]["status"] = "done"
+        return
+
+    whitelist = load_track_mismatch_whitelist()
+    state = load_track_verify_state()
+
+    with job_lock:
+        jobs[job_id]["total"] = len(files)
+        jobs[job_id]["log"].append(f"📚 {len(files)} track(s) on disk — verifying each against its recorded source…")
+
+    mismatches = []
+    checked_this_run = 0
+    still_unverified = 0
+
+    for i, f in enumerate(files):
+        with job_lock:
+            if jobs[job_id].get("cancel_requested"):
+                jobs[job_id]["log"].append(f"🛑 Cancelled ({i}/{len(files)} scanned)")
+                jobs[job_id]["status"] = "done"
+                jobs[job_id]["current_track"] = None
+                save_jobs()
+                return
+            jobs[job_id]["current"] = i + 1
+            jobs[job_id]["current_track"] = f"{f['artist']} - {f['title']}"
+
+        if track_ignore_key(f["artist"], f["title"]) in whitelist:
+            continue
+
+        cached = state.get(f["path"])
+        if (cached and cached.get("comment") == f.get("comment")
+                and cached.get("logic_version") == TRACK_VERIFY_LOGIC_VERSION):
+            # Already checked this exact file against this exact source
+            # under today's rules — nothing has changed since, so don't
+            # spend another yt-dlp round-trip re-confirming the same answer.
+            if cached.get("verdict") == "mismatch" and cached.get("entry"):
+                mismatches.append(cached["entry"])
+            continue
+
+        if checked_this_run >= MAX_VERIFY_CHECKS_PER_RUN:
+            still_unverified += 1
+            continue
+
+        reason = _verify_track_against_source(f["title"], f["artist"], f.get("comment"))
+        checked_this_run += 1
+
+        if reason:
+            entry = {
+                "path": f["path"], "title": f["title"], "artist": f["artist"],
+                "album": f["album"], "album_artist": f.get("album_artist") or f["artist"],
+                "duration_ms": int((f.get("duration") or 0) * 1000),
+                "comment": f.get("comment"), "reason": reason,
+            }
+            state[f["path"]] = {"comment": f.get("comment"), "verdict": "mismatch", "entry": entry,
+                                 "logic_version": TRACK_VERIFY_LOGIC_VERSION,
+                                 "checked_at": datetime.utcnow().isoformat()}
+            mismatches.append(entry)
+            with job_lock:
+                jobs[job_id]["log"].append(f"⚠ {f['artist']} - {f['title']}: {reason}")
+        else:
+            state[f["path"]] = {"comment": f.get("comment"), "verdict": "ok",
+                                 "logic_version": TRACK_VERIFY_LOGIC_VERSION,
+                                 "checked_at": datetime.utcnow().isoformat()}
+
+        if checked_this_run % 20 == 0:
+            save_track_verify_state(state)  # checkpoint periodically so a crash mid-run doesn't lose progress
+
+    save_track_verify_state(state)
+    save_track_mismatch_report({
+        "last_run": datetime.utcnow().isoformat(),
+        "total_tracks": len(files),
+        "checked_this_run": checked_this_run,
+        "still_unverified": still_unverified,
+        "mismatches": mismatches,
+    })
+
+    with job_lock:
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["current_track"] = None
+        jobs[job_id]["downloaded"] = len(mismatches)
+        msg = f"✅ Verified {checked_this_run} track(s) this run — {len(mismatches)} mismatch(es) on record."
+        if still_unverified:
+            msg += f" {still_unverified} track(s) still unchecked — run again to continue."
+        jobs[job_id]["log"].append(msg)
+
+def _sql_quote(s):
+    """Escape a value for embedding as a SQLite string literal (doubling
+    embedded single quotes) — unlike the Navidrome-generated ids used
+    elsewhere in this file, a raw filesystem path can legitimately contain
+    a quote (e.g. \"King Bowser's Might\"), so it can't be interpolated
+    unescaped into SQL text."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+def _delete_track_by_path(path, ssh_cfg, cfg):
+    """Delete one track from Navidrome by its literal on-disk path — used
+    where a raw filesystem/tag scan already found the exact file (so there's
+    no Subsonic song id to key off, unlike _delete_tracks_from_navidrome).
+    Same file-then-DB-row delete plus full rescan."""
+    if not ssh_cfg:
+        return False, "SSH not configured"
+    check_cmd = _ssh_cmd(ssh_cfg, f"test -f {shlex.quote(path)} && echo yes || echo no")
+    exists = subprocess.run(check_cmd, capture_output=True, text=True, timeout=10).stdout.strip() == "yes"
+    if exists:
+        rm_cmd = _ssh_cmd(ssh_cfg, f"rm -f -- {shlex.quote(path)}")
+        result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            return False, f"rm failed: {result.stderr.strip()}"
+    sql = f"DELETE FROM media_file WHERE path = {_sql_quote(path)};"
+    cmd = _ssh_cmd(ssh_cfg, f"sqlite3 /var/lib/navidrome/navidrome.db {shlex.quote(sql)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    if result.returncode != 0:
+        return False, f"DB delete failed: {result.stderr.strip()}"
+    if cfg:
+        ok, _ = nd_trigger_scan(cfg, full=True)
+        if ok:
+            nd_wait_for_scan(cfg, timeout=300)
+    return True, None
+
+@app.route("/library/verify-tracks", methods=["POST"])
+def library_verify_tracks():
+    """Kick off a background scan that re-checks every track's tags against
+    its own recorded source (see the section comment above)."""
+    ssh_cfg = load_ssh_config()
+    if not ssh_cfg:
+        return jsonify({"error": "SSH not configured"}), 400
+    job_id = f"verify_tracks_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Verify] Library", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0,
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+    threading.Thread(target=verify_tracks_worker, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/library/mismatched-tracks", methods=["GET"])
+def library_mismatched_tracks():
+    """Return the most recent verify scan's results — doesn't re-scan
+    (that's what /library/verify-tracks is for), just serves the saved
+    report, filtered against whatever's been whitelisted since."""
+    report = load_track_mismatch_report()
+    whitelist = load_track_mismatch_whitelist()
+    mismatches = [m for m in report.get("mismatches", [])
+                  if track_ignore_key(m.get("artist"), m.get("title")) not in whitelist]
+    return jsonify({**report, "mismatches": mismatches})
+
+@app.route("/library/mismatched-tracks/whitelist", methods=["POST"])
+def library_mismatched_tracks_whitelist():
+    """Mark a flagged track as a false positive — hides it from future
+    reports without touching the file or blocking anything."""
+    data = request.json or {}
+    artist, title = data.get("artist", ""), data.get("title", "")
+    if not artist or not title:
+        return jsonify({"error": "artist and title required"}), 400
+    key = track_ignore_key(artist, title)
+    whitelist = load_track_mismatch_whitelist()
+    whitelist[key] = {"artist": artist, "title": title, "added_at": datetime.utcnow().isoformat()}
+    save_track_mismatch_whitelist(whitelist)
+    return jsonify({"status": "ok"})
+
+@app.route("/library/mismatched-tracks/remove", methods=["POST"])
+def library_mismatched_tracks_remove():
+    """Delete a flagged track outright (file + its media_file row, no
+    orphaned entry) and blocklist it — for cases with no legitimate
+    single-song replacement to flag-wrong to instead (same call as
+    /track/flag-wrong otherwise handles)."""
+    data = request.json or {}
+    path = data.get("path", "")
+    artist, title = data.get("artist", ""), data.get("title", "")
+    if not path or not artist or not title:
+        return jsonify({"error": "path, artist and title required"}), 400
+
+    cfg = load_nd_config()
+    ssh_cfg = load_ssh_config()
+    ok, err = _delete_track_by_path(path, ssh_cfg, cfg)
+
+    key = track_ignore_key(artist, title)
+    ignored = load_ignored_tracks()
+    ignored[key] = {
+        "artist": artist, "title": title,
+        "added_at": datetime.utcnow().isoformat(),
+        "reason": "Removed as a mismatched track via /library/mismatched-tracks",
+    }
+    save_ignored_tracks(ignored)
+
+    return jsonify({"status": "ok" if ok else "partial", "error": err})
+
 
 # ─── yt-dlp management ───────────────────────────────────────────────────────
 

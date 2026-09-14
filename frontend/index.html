@@ -434,6 +434,10 @@ header{
       <div class="settings-sec" style="margin-top:12px">
         <div class="settings-sec-title">Library Maintenance</div>
         <div class="settings-row">
+          <div><div class="settings-label">Failed Downloads</div><div class="settings-sub">Tracks that couldn't be found or downloaded automatically <span class="dot" id="failed-dot" style="display:inline-block;margin-left:2px;vertical-align:middle"></span> <span id="failed-pill-label">…</span></div></div>
+          <a class="btn btn-nd" href="/failed.html" style="flex-shrink:0;text-decoration:none">⚠ Review</a>
+        </div>
+        <div class="settings-row">
           <div><div class="settings-label">Relabel Genres</div><div class="settings-sub">Rewrite every track's genre from Spotify (falls back to YouTube) — tags only, nothing re-downloaded</div></div>
           <button class="btn btn-nd" id="btn-relabel-genres" onclick="relabelGenres()" style="flex-shrink:0">🏷 Relabel</button>
         </div>
@@ -464,10 +468,6 @@ header{
       <span class="sp">Spoti</span><span class="arr">→</span><span class="nd">Drome</span>
     </div>
     <div class="header-right">
-      <a class="pill" href="/failed.html" id="failed-pill" style="text-decoration:none">
-        <div class="dot" id="failed-dot"></div>
-        <span id="failed-pill-label">Failed Downloads</span>
-      </a>
       <div class="pill settings-pill" onclick="openSettingsModal()">⚙ Settings</div>
       <div class="pill" onclick="openScheduleModal()" id="schedule-pill">
         <div class="dot" id="schedule-dot"></div>
@@ -611,8 +611,8 @@ async function init(){
 async function checkFailed(){
   try{const r=await fetch(`${API}/failed`),items=await r.json();
     const dot=document.getElementById('failed-dot'),lbl=document.getElementById('failed-pill-label');
-    if(items.length){dot.classList.add('err');lbl.textContent=`Failed Downloads (${items.length})`;}
-    else{dot.classList.remove('err');lbl.textContent='Failed Downloads';}
+    if(items.length){dot.classList.add('err');lbl.textContent=`${items.length} pending`;}
+    else{dot.classList.remove('err');lbl.textContent='none';}
   }catch(e){}
 }
 

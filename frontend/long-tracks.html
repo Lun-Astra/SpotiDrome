@@ -173,13 +173,30 @@ async function whitelistTrack(id,btn){
 }
 
 async function removeTrack(id,btn){
+  // No native confirm() dialog here on purpose — Firefox (and other
+  // browsers) offers to suppress "further dialogs from this page" after
+  // a couple of them, which then silently breaks confirmation for every
+  // later remove on the page. Use an inline arm/confirm on the button
+  // itself instead: first click arms it, second click (within 4s)
+  // actually removes.
+  if(btn.dataset.armed!=='1'){
+    if(!btn.dataset.origLabel)btn.dataset.origLabel=btn.innerHTML;
+    btn.dataset.armed='1';
+    btn.innerHTML='Click again to confirm';
+    clearTimeout(btn._armTimer);
+    btn._armTimer=setTimeout(()=>{btn.dataset.armed='0';btn.innerHTML=btn.dataset.origLabel;},4000);
+    return;
+  }
+  clearTimeout(btn._armTimer);
+  btn.dataset.armed='0';
+  const origLabel=btn.dataset.origLabel;
+
   const item=btn.closest('.lt-item');
   const artist=item.querySelector('.lt-artist').textContent;
   const title=item.querySelector('.lt-name').textContent;
-  if(!confirm(`Delete "${title}" by ${artist} from Navidrome and stop it from ever downloading again?`))return;
   const resultEl=item.querySelector('.lt-result');
   item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=true);
-  const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Removing…';
+  btn.innerHTML='<span class="spin"></span> Removing…';
   resultEl.className='lt-result';resultEl.textContent='';
   try{
     const r=await fetch(`${API}/library/long-tracks/remove`,{method:'POST',headers:{'Content-Type':'application/json'},
@@ -191,12 +208,12 @@ async function removeTrack(id,btn){
     }else{
       resultEl.className='lt-result err';resultEl.textContent='✗ '+(d.error||'Failed to remove');
       item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=false);
-      btn.innerHTML=orig;
+      btn.innerHTML=origLabel;
     }
   }catch(e){
     resultEl.className='lt-result err';resultEl.textContent='✗ '+e.message;
     item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=false);
-    btn.innerHTML=orig;
+    btn.innerHTML=origLabel;
   }
 }
 

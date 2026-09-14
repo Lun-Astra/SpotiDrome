@@ -870,6 +870,30 @@ def _downloaded_file_looks_wrong(flac_path, expected_title, expected_duration_ms
                 f"same-titled song, not '{expected_title}'")
     return None
 
+def _embedded_artist_tag(flac_path):
+    """Read a just-downloaded FLAC's own --add-metadata-embedded artist tag
+    — same field _downloaded_file_looks_wrong() reads, before fix_tags()
+    overwrites it. Used by the raw YouTube playlist/album/video import path
+    (ytmusic_download_worker), where the only 'artist' available at
+    --flat-playlist listing time is the channel/uploader name (with an
+    " - Topic" suffix stripped) — a guess that's flatly wrong whenever the
+    uploading Topic channel isn't named after the actual performer (found
+    in production: 8 tracks across unrelated albums/genres all tagged
+    artist "Release", because YouTube's Content ID system had grouped them
+    under a Topic channel literally named "Release" rather than the real
+    performer — confirmed via a full yt-dlp resolve, e.g. the Metal Gear
+    Rising Revengeance track came back with the real artist tag "Free
+    Dominguez, Logan Mader/Jamie Christopherson"). yt-dlp's full resolution
+    at actual download time routinely surfaces that real artist credit even
+    when the flat listing never had it — strictly better ground truth than
+    a channel name once it's available, so prefer it when non-empty."""
+    try:
+        tags = FLAC(flac_path)
+    except Exception:
+        return None
+    raw = (tags.get("artist") or [""])[0].strip()
+    return raw or None
+
 def _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec):
     title = entry.get("title") or ""
     artists = [a.get("name", "") for a in (entry.get("artists") or [])]
@@ -1535,6 +1559,22 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                         jobs[job_id]["log"].append(f"✗ Rejected ({wrong_reason}): {artist} - {title}")
                         jobs[job_id]["failed"] += 1
                     continue
+            # The "artist" computed above is only ever the channel/uploader
+            # name at --flat-playlist listing time (see the top of this
+            # loop) — a guess that's flatly wrong whenever that channel
+            # isn't named after the real performer. The actual download
+            # just did a full yt-dlp resolve, which often surfaces a real
+            # artist credit the flat listing never had — prefer it now,
+            # before fix_tags() overwrites the file's own tag with whatever
+            # we pass it. See _embedded_artist_tag()'s docstring for the
+            # "Release" mistagging this was found from.
+            better_artist = _embedded_artist_tag(flac_path)
+            if better_artist and better_artist != artist:
+                with job_lock:
+                    jobs[job_id]["log"].append(
+                        f"🏷 Corrected artist: '{artist}' → '{better_artist}' (from the source's own metadata)")
+                artist = better_artist
+                t["artist"] = artist
             genre = lookup_genre(artist)
             fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
             new_album, flac_path = maybe_correct_album(

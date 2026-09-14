@@ -4031,7 +4031,7 @@ MAX_VERIFY_CHECKS_PER_RUN = 300
 # a rule fix (like the channel/uploader false-positive fix below) would
 # silently keep serving verdicts computed under the old, wrong rules for
 # every track already cached, since its file and comment URL didn't change.
-TRACK_VERIFY_LOGIC_VERSION = 2
+TRACK_VERIFY_LOGIC_VERSION = 3  # v3: an unresolvable lookup used to get silently cached as "ok" forever — now it isn't cached at all, see verify_tracks_worker
 
 def load_track_verify_state():
     try:
@@ -4125,35 +4125,41 @@ def _lookup_source_identity(url, timeout=20):
         return None
 
 def _verify_track_against_source(title, artist, comment_url):
-    """Returns a human-readable reason string if the track looks wrong,
-    else None. Deliberately mirrors _downloaded_file_looks_wrong()'s exact
-    signals — not looser ones — just fed freshly-refetched source metadata
-    instead of the originally-embedded tags fix_tags() already overwrote on
-    disk. In particular: only yt-dlp's own dedicated 'artist' field counts
-    as ground truth for the artist check, same as that function only trusts
-    the file's --add-metadata-embedded artist tag — NOT a channel/uploader
+    """Returns (status, reason). status is 'ok' (verified, no mismatch),
+    'mismatch' (verified, and it's wrong — reason set), or 'unresolvable'
+    (has a source URL but couldn't resolve it right now — dead link,
+    network hiccup, rate limit, etc.). Callers must NOT cache
+    'unresolvable' as a permanent verdict, unlike the other two — a
+    transient failure today says nothing about whether it'd resolve fine
+    on a later run, and caching it as settled would silently stop this
+    track from ever being re-checked.
+
+    Deliberately mirrors _downloaded_file_looks_wrong()'s exact signals —
+    not looser ones — just fed freshly-refetched source metadata instead of
+    the originally-embedded tags fix_tags() already overwrote on disk. In
+    particular: only yt-dlp's own dedicated 'artist' field counts as ground
+    truth for the artist check, same as that function only trusts the
+    file's --add-metadata-embedded artist tag — NOT a channel/uploader
     name, which is an upload *account*, not a performer credit, and falling
     back to it produced real false positives in testing (a legitimate,
     correctly-tagged song re-uploaded by some unrelated compilation/fan
     channel still isn't 'by' that channel). Absent is not evidence of
     anything either way — only a confident mismatch rejects."""
-    if not comment_url:
-        return None  # nothing to verify against (e.g. the Subspace Sequence case) — not evidence of anything
     info = _lookup_source_identity(comment_url)
     if not info:
-        return None  # dead link / unresolvable — not evidence of a mismatch, just unverifiable right now
+        return "unresolvable", None
 
     real_title = info.get("track") or info.get("title") or ""
     real_artist = (info.get("artist") or "").strip()
     real_desc = info.get("description") or ""
 
     if _looks_like_non_music(f"{real_title} {real_desc}", title):
-        return (f"the source video's own title/description looks like non-music content "
-                f"(podcast, let's play, walkthrough, full compilation, etc.), not '{title}'")
+        return "mismatch", (f"the source video's own title/description looks like non-music content "
+                             f"(podcast, let's play, walkthrough, full compilation, etc.), not '{title}'")
     if real_artist and not _artist_ok([real_artist], artist):
-        return (f"the source video's own artist tag is '{real_artist}', not '{artist}' — "
-                f"almost certainly a different artist's same-titled song")
-    return None
+        return "mismatch", (f"the source video's own artist tag is '{real_artist}', not '{artist}' — "
+                             f"almost certainly a different artist's same-titled song")
+    return "ok", None
 
 def verify_tracks_worker(job_id):
     with job_lock:
@@ -4215,14 +4221,29 @@ def verify_tracks_worker(job_id):
                 mismatches.append(cached["entry"])
             continue
 
+        if not f.get("comment"):
+            # No source URL recorded at all (e.g. the Subspace Sequence
+            # case) — nothing to check, and that's a stable fact about the
+            # file, not a network call, so it's free: cache it and move on
+            # without touching this run's yt-dlp-call budget.
+            state[f["path"]] = {"comment": None, "verdict": "ok",
+                                 "logic_version": TRACK_VERIFY_LOGIC_VERSION,
+                                 "checked_at": datetime.utcnow().isoformat()}
+            continue
+
         if checked_this_run >= MAX_VERIFY_CHECKS_PER_RUN:
             still_unverified += 1
             continue
 
-        reason = _verify_track_against_source(f["title"], f["artist"], f.get("comment"))
+        status, reason = _verify_track_against_source(f["title"], f["artist"], f["comment"])
         checked_this_run += 1
 
-        if reason:
+        if status == "unresolvable":
+            # Don't cache — a dead/rate-limited/flaky lookup today doesn't
+            # mean anything about tomorrow, and caching it as settled would
+            # silently stop this track from ever being re-checked.
+            continue
+        elif status == "mismatch":
             entry = {
                 "path": f["path"], "title": f["title"], "artist": f["artist"],
                 "album": f["album"], "album_artist": f.get("album_artist") or f["artist"],
@@ -4235,7 +4256,7 @@ def verify_tracks_worker(job_id):
             mismatches.append(entry)
             with job_lock:
                 jobs[job_id]["log"].append(f"⚠ {f['artist']} - {f['title']}: {reason}")
-        else:
+        else:  # ok
             state[f["path"]] = {"comment": f.get("comment"), "verdict": "ok",
                                  "logic_version": TRACK_VERIFY_LOGIC_VERSION,
                                  "checked_at": datetime.utcnow().isoformat()}

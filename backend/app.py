@@ -44,6 +44,8 @@ TITLE_DUPLICATE_REPORT_FILE = "/root/.ssh/title_duplicate_report.json"
 MAX_TITLE_DEDUPE_PER_RUN = 150  # safety cap — see scan_and_dedupe_by_title
 SYNC_HEALTH_FILE      = "/root/.ssh/sync_health.json"
 FAILED_TRACKS_FILE    = "/root/.ssh/failed_tracks.json"
+LONG_TRACK_WHITELIST_FILE = "/root/.ssh/long_track_whitelist.json"
+LONG_TRACK_THRESHOLD_SEC  = 15 * 60  # 15 minutes
 
 jobs = {}
 job_lock = threading.Lock()
@@ -140,6 +142,24 @@ def save_ignored_tracks(data):
 
 def is_track_ignored(artist, title):
     return track_ignore_key(artist, title) in load_ignored_tracks()
+
+# ─── Long-track whitelist ───────────────────────────────────────────────────
+# Separate from the permanent-ignore list above: whitelisting a track just
+# hides it from the /library/long-tracks report (it's a legitimately long
+# track, e.g. a DJ mix or a live medley) — it does NOT stop it from being
+# (re)downloaded. Removing a long track is the opposite: it deletes the file
+# and *also* adds it to the permanent-ignore list so it's never fetched again.
+
+def load_long_track_whitelist():
+    try:
+        with open(LONG_TRACK_WHITELIST_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_long_track_whitelist(data):
+    with open(LONG_TRACK_WHITELIST_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ─── Failed downloads (manual-retry queue) ──────────────────────────────────
 
@@ -3733,9 +3753,13 @@ def cleanup_scan():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/cleanup/delete", methods=["POST"])
-def cleanup_delete():
-    """Delete tracks from Navidrome and optionally from disk.
+def _delete_tracks_from_navidrome(track_ids, ssh_cfg, cfg, delete_files=True):
+    """Delete tracks from Navidrome's DB and (optionally) the underlying
+    files on the remote host — the real DELETE FROM media_file, not just a
+    file removal that Navidrome would otherwise re-flag as merely
+    'missing' on its next scan (see find_orphaned_navidrome_entries),
+    which is what leaves a blank/ghost entry behind instead of removing
+    the track outright.
 
     2026-08-26: this used to resolve each file's path via the Subsonic
     getSong API's own 'path' field — which turned out to sometimes be a
@@ -3748,20 +3772,10 @@ def cleanup_delete():
     touched while the response still reported success. Now reads the
     real path straight from the media_file table (one batched SQL
     query, like find_orphaned_navidrome_entries does) instead of
-    trusting the API's convenience field."""
-    data = request.json
-    track_ids = data.get("track_ids", [])
-    delete_files = data.get("delete_files", True)
+    trusting the API's convenience field.
 
-    if not track_ids:
-        return jsonify({"error": "No track IDs provided"}), 400
-
-    cfg = load_nd_config()
-    ssh_cfg = load_ssh_config()
-
-    if not cfg:
-        return jsonify({"error": "Navidrome not configured"}), 400
-
+    Shared by /cleanup/delete and /library/long-tracks/remove — returns
+    (deleted_paths, failed_reasons)."""
     deleted = []
     failed = []
 
@@ -3816,10 +3830,138 @@ def cleanup_delete():
     if ok:
         nd_wait_for_scan(cfg, timeout=300)
 
+    return deleted, failed
+
+
+@app.route("/cleanup/delete", methods=["POST"])
+def cleanup_delete():
+    """Delete tracks from Navidrome and optionally from disk."""
+    data = request.json
+    track_ids = data.get("track_ids", [])
+    delete_files = data.get("delete_files", True)
+
+    if not track_ids:
+        return jsonify({"error": "No track IDs provided"}), 400
+
+    cfg = load_nd_config()
+    ssh_cfg = load_ssh_config()
+
+    if not cfg:
+        return jsonify({"error": "Navidrome not configured"}), 400
+
+    deleted, failed = _delete_tracks_from_navidrome(track_ids, ssh_cfg, cfg, delete_files)
+
     return jsonify({
         "deleted_files": len(deleted),
         "failed": len(failed),
         "failed_list": failed[:10],
+    })
+
+
+@app.route("/library/long-tracks", methods=["GET"])
+def library_long_tracks():
+    """Scan the whole Navidrome library for tracks longer than
+    LONG_TRACK_THRESHOLD_SEC (15 min) — these are usually a Let's Play
+    episode, a full album/OST rip, or a DJ mix that slipped past the
+    download-time sanity checks (see spotidrome-wrong-track-bugs). Skips
+    anything already whitelisted as a legitimately long track."""
+    cfg = load_nd_config()
+    if not cfg:
+        return jsonify({"error": "Navidrome not configured"}), 400
+
+    whitelist = load_long_track_whitelist()
+
+    try:
+        all_songs = []
+        offset = 0
+        while True:
+            data = nd_subsonic("search3", cfg=cfg,
+                               query="", songCount=500, songOffset=offset,
+                               albumCount=0, artistCount=0)
+            songs = data.get("searchResult3", {}).get("song", [])
+            if not songs:
+                break
+            all_songs.extend(songs)
+            if len(songs) < 500:
+                break
+            offset += 500
+
+        long_tracks = []
+        for s in all_songs:
+            duration = s.get("duration", 0) or 0
+            if duration <= LONG_TRACK_THRESHOLD_SEC:
+                continue
+            if track_ignore_key(s.get("artist"), s.get("title")) in whitelist:
+                continue
+            long_tracks.append({
+                "id": s["id"],
+                "title": s.get("title", ""),
+                "artist": s.get("artist", ""),
+                "album": s.get("album", ""),
+                "album_artist": s.get("albumArtist") or s.get("artist", ""),
+                "duration": duration,
+                "bitRate": s.get("bitRate", 0),
+                "path": s.get("path", ""),
+            })
+        long_tracks.sort(key=lambda t: t["duration"], reverse=True)
+
+        return jsonify({
+            "total_scanned": len(all_songs),
+            "threshold_sec": LONG_TRACK_THRESHOLD_SEC,
+            "long_tracks": long_tracks,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/library/long-tracks/whitelist", methods=["POST"])
+def library_long_tracks_whitelist():
+    """Mark a track as a legitimately long one — it stops showing up in
+    /library/long-tracks but is otherwise left completely alone (still
+    playable, still re-downloadable, nothing deleted or blocked)."""
+    data = request.json or {}
+    artist, title = data.get("artist", ""), data.get("title", "")
+    if not artist or not title:
+        return jsonify({"error": "artist and title required"}), 400
+    key = track_ignore_key(artist, title)
+    whitelist = load_long_track_whitelist()
+    whitelist[key] = {"artist": artist, "title": title, "added_at": datetime.utcnow().isoformat()}
+    save_long_track_whitelist(whitelist)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/library/long-tracks/remove", methods=["POST"])
+def library_long_tracks_remove():
+    """Delete a long track from Navidrome entirely — file on disk plus its
+    media_file row, so no blank/ghost entry is left behind (same delete
+    path as /cleanup/delete) — and add it to the permanent-ignore list so
+    it's never re-downloaded by a future sync or manual retry."""
+    data = request.json or {}
+    track_id = data.get("id", "")
+    artist, title = data.get("artist", ""), data.get("title", "")
+    if not track_id or not artist or not title:
+        return jsonify({"error": "id, artist and title required"}), 400
+
+    cfg = load_nd_config()
+    ssh_cfg = load_ssh_config()
+    if not cfg:
+        return jsonify({"error": "Navidrome not configured"}), 400
+
+    deleted, failed = _delete_tracks_from_navidrome([track_id], ssh_cfg, cfg, delete_files=True)
+
+    key = track_ignore_key(artist, title)
+    ignored = load_ignored_tracks()
+    ignored[key] = {
+        "artist": artist, "title": title,
+        "added_at": datetime.utcnow().isoformat(),
+        "reason": "Removed as a long track (> 15 min) via /library/long-tracks",
+    }
+    save_ignored_tracks(ignored)
+
+    return jsonify({
+        "status": "ok",
+        "deleted_files": len(deleted),
+        "failed": failed,
     })
 
 

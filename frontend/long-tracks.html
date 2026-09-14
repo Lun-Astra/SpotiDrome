@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpotiDrome — Long Tracks</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d0d12;
+  --bg2: #13131a;
+  --bg3: #1a1a24;
+  --bg4: #22222e;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --sp: #1ed760;
+  --nd: #8b5cf6;
+  --yt: #ff3333;
+  --amber: #f59e0b;
+  --red: #f87171;
+  --text: #f0f0f8;
+  --text2: #9090b0;
+  --text3: #5a5a7a;
+  --r: 10px;
+  --r2: 14px;
+  --font: 'Inter', sans-serif;
+  --font2: 'Space Grotesk', sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;
+  background-image:radial-gradient(circle at 20% 20%, rgba(139,92,246,0.06) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, rgba(30,215,96,0.04) 0%, transparent 50%),
+    linear-gradient(var(--border) 1px,transparent 1px),
+    linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:100% 100%,100% 100%,32px 32px,32px 32px;
+  pointer-events:none;z-index:0}
+.app{position:relative;z-index:1;max-width:900px;margin:0 auto;padding:0 20px 80px}
+header{display:flex;align-items:center;justify-content:space-between;padding:20px 0 24px;border-bottom:1px solid var(--border);margin-bottom:24px;flex-wrap:wrap;gap:12px}
+.logo{font-family:var(--font2);font-size:24px;font-weight:700;letter-spacing:-0.5px;display:flex;align-items:center;gap:2px}
+.logo .sp{color:var(--sp)}
+.logo .arr{color:var(--text3);margin:0 4px;font-weight:400}
+.logo .nd{color:var(--nd)}
+.back-link{display:inline-flex;align-items:center;gap:6px;color:var(--text2);text-decoration:none;font-size:13px;font-weight:500;padding:6px 12px;border-radius:40px;background:var(--bg3);border:1px solid var(--border);transition:all .15s}
+.back-link:hover{border-color:var(--border2);color:var(--text)}
+.page-title{font-family:var(--font2);font-size:22px;font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:10px}
+.page-sub{color:var(--text2);font-size:13px;margin-bottom:20px}
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--text3);font-weight:500}
+.badge.count{background:rgba(245,158,11,.12);color:var(--amber);border-color:rgba(245,158,11,.2)}
+
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden}
+.panel-hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+.panel-title{font-family:var(--font2);font-size:12px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text2)}
+
+.btn{display:inline-flex;align-items:center;gap:6px;font-family:var(--font);font-size:12px;font-weight:500;padding:8px 14px;border-radius:var(--r);border:none;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-primary{background:var(--sp);color:#000}
+.btn-primary:hover{box-shadow:0 4px 12px rgba(30,215,96,.3);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--border2);color:var(--text)}
+.btn-danger{background:rgba(248,113,113,.12);color:var(--red);border:1px solid rgba(248,113,113,.25)}
+.btn-danger:hover{background:rgba(248,113,113,.2)}
+.btn-danger:disabled{opacity:.4;cursor:not-allowed}
+
+.lt-item{padding:14px 16px;border-bottom:1px solid var(--border)}
+.lt-item:last-child{border-bottom:none}
+.lt-hd{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.lt-name{font-size:14px;font-weight:600}
+.lt-artist{font-size:12px;color:var(--text2);margin-top:2px}
+.lt-meta{font-size:11px;color:var(--text3);margin-top:6px;line-height:1.6}
+.lt-dur{color:var(--amber);opacity:.9;font-weight:600}
+.lt-actions{display:flex;gap:8px;margin-top:10px;flex-shrink:0}
+.lt-result{font-size:11px;margin-top:8px;display:none;padding:7px 10px;border-radius:6px}
+.lt-result.ok{display:block;background:rgba(30,215,96,.1);border:1px solid rgba(30,215,96,.2);color:#4ade80}
+.lt-result.err{display:block;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:var(--red)}
+
+.spin{width:13px;height:13px;border:2px solid rgba(255,255,255,.15);border-top-color:currentColor;border-radius:50%;animation:rot .6s linear infinite;display:inline-block;flex-shrink:0}
+@keyframes rot{to{transform:rotate(360deg)}}
+.empty{padding:40px 16px;text-align:center;color:var(--text3);font-size:13px}
+.empty-icon{font-size:28px;margin-bottom:10px}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header>
+    <div class="logo"><span class="sp">Spoti</span><span class="arr">→</span><span class="nd">Drome</span></div>
+    <a class="back-link" href="/">← Back to library</a>
+  </header>
+
+  <div class="page-title">⏱ Long Tracks <span class="badge count" id="lt-count">—</span></div>
+  <div class="page-sub">Tracks longer than 15 minutes — usually a Let's Play episode, a full album rip, or a DJ mix that slipped past the download-time checks. Whitelist a track to keep it and stop it showing up here again, or remove it to delete it from Navidrome entirely and stop it from ever being downloaded again.</div>
+
+  <div class="panel">
+    <div class="panel-hd">
+      <span class="panel-title">Over 15 minutes</span>
+      <button class="btn btn-ghost" onclick="loadLongTracks()" id="refresh-btn">↺ Scan library</button>
+    </div>
+    <div id="lt-list"><div class="empty"><div class="spin"></div></div></div>
+  </div>
+</div>
+
+<script>
+const API='/api';
+
+function fmtDuration(sec){
+  sec=Math.round(sec||0);
+  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;
+  if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+
+async function loadLongTracks(){
+  const btn=document.getElementById('refresh-btn');
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Scanning…';
+  try{
+    const r=await fetch(`${API}/library/long-tracks`),d=await r.json();
+    if(d.error){
+      document.getElementById('lt-list').innerHTML=`<div class="empty">Failed to load: ${esc(d.error)}</div>`;
+      return;
+    }
+    const items=d.long_tracks||[];
+    document.getElementById('lt-count').textContent=items.length;
+    const list=document.getElementById('lt-list');
+    if(!items.length){
+      list.innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing over 15 minutes.</div>';
+      return;
+    }
+    list.innerHTML=items.map(it=>`<div class="lt-item" data-id="${escA(it.id)}">
+      <div class="lt-hd">
+        <div>
+          <div class="lt-name">${esc(it.title||'Unknown title')}</div>
+          <div class="lt-artist">${esc(it.artist||'Unknown artist')}</div>
+          <div class="lt-meta">
+            ${it.album?`Album: ${esc(it.album)} · `:''}<span class="lt-dur">${fmtDuration(it.duration)}</span>
+          </div>
+        </div>
+      </div>
+      <div class="lt-actions">
+        <button class="btn btn-ghost" onclick="whitelistTrack('${escA(it.id)}',this)">✓ Whitelist (keep, don't ask again)</button>
+        <button class="btn btn-danger" onclick="removeTrack('${escA(it.id)}',this)">🗑 Remove &amp; blocklist</button>
+      </div>
+      <div class="lt-result"></div>
+    </div>`).join('');
+  }catch(e){
+    document.getElementById('lt-list').innerHTML=`<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+  }finally{
+    btn.disabled=false;btn.innerHTML=orig;
+  }
+}
+
+async function whitelistTrack(id,btn){
+  const item=btn.closest('.lt-item');
+  const artist=item.querySelector('.lt-artist').textContent;
+  const title=item.querySelector('.lt-name').textContent;
+  const resultEl=item.querySelector('.lt-result');
+  item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=true);
+  try{
+    const r=await fetch(`${API}/library/long-tracks/whitelist`,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({artist,title})});
+    const d=await r.json();
+    if(d.status==='ok'){
+      resultEl.className='lt-result ok';resultEl.textContent='✓ Whitelisted — won\'t show here again.';
+      setTimeout(()=>{item.style.transition='opacity .3s';item.style.opacity='0';setTimeout(()=>{item.remove();updateCountAfterRemoval();},300);},700);
+    }else{
+      resultEl.className='lt-result err';resultEl.textContent='✗ '+(d.error||'Failed to whitelist');
+      item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=false);
+    }
+  }catch(e){
+    resultEl.className='lt-result err';resultEl.textContent='✗ '+e.message;
+    item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=false);
+  }
+}
+
+async function removeTrack(id,btn){
+  const item=btn.closest('.lt-item');
+  const artist=item.querySelector('.lt-artist').textContent;
+  const title=item.querySelector('.lt-name').textContent;
+  if(!confirm(`Delete "${title}" by ${artist} from Navidrome and stop it from ever downloading again?`))return;
+  const resultEl=item.querySelector('.lt-result');
+  item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=true);
+  const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Removing…';
+  resultEl.className='lt-result';resultEl.textContent='';
+  try{
+    const r=await fetch(`${API}/library/long-tracks/remove`,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id,artist,title})});
+    const d=await r.json();
+    if(d.status==='ok'){
+      resultEl.className='lt-result ok';resultEl.textContent='✓ Removed and blocklisted.';
+      setTimeout(()=>{item.style.transition='opacity .3s';item.style.opacity='0';setTimeout(()=>{item.remove();updateCountAfterRemoval();},300);},700);
+    }else{
+      resultEl.className='lt-result err';resultEl.textContent='✗ '+(d.error||'Failed to remove');
+      item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=false);
+      btn.innerHTML=orig;
+    }
+  }catch(e){
+    resultEl.className='lt-result err';resultEl.textContent='✗ '+e.message;
+    item.querySelectorAll('.lt-actions button').forEach(b=>b.disabled=false);
+    btn.innerHTML=orig;
+  }
+}
+
+function updateCountAfterRemoval(){
+  const remaining=document.querySelectorAll('.lt-item').length;
+  document.getElementById('lt-count').textContent=remaining;
+  if(!remaining)document.getElementById('lt-list').innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing over 15 minutes.</div>';
+}
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function escA(s){return String(s).replace(/'/g,"\\'");}
+
+loadLongTracks();
+</script>
+</body>
+</html>

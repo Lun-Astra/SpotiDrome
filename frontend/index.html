@@ -102,14 +102,10 @@ header{
 .source-hd{cursor:pointer;user-select:none}
 .source-chevron{display:inline-block;width:10px}
 .source-body.collapsed{display:none}
-.source-nd-search-row{padding:10px 16px;border-bottom:1px solid var(--border)}
-.source-nd-search-row input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:12px;padding:8px 10px;outline:none;transition:border-color .15s;box-sizing:border-box}
-.source-nd-search-row input:focus{border-color:rgba(139,92,246,.5)}
-.source-nd-search-row input::placeholder{color:var(--text3)}
-#source-nd-albums-list{overflow-y:auto;max-height:calc(100vh - 340px)}
+#source-nd-albums-list{overflow-y:auto;max-height:380px}
 
 /* ── Playlist items ─────────────────────────────────────────────────── */
-#playlists-list{overflow-y:auto;max-height:calc(100vh - 280px)}
+#playlists-list{overflow-y:auto;max-height:380px}
 .pl-item{
   display:flex;align-items:center;gap:12px;padding:11px 16px;cursor:pointer;
   border-bottom:1px solid var(--border);transition:background .1s;position:relative;
@@ -576,9 +572,6 @@ header{
             <span class="badge" id="source-nd-count">—</span>
           </div>
           <div id="source-nd-body" class="source-body">
-            <div class="source-nd-search-row">
-              <input id="source-nd-search" type="text" placeholder="Search albums…" oninput="debouncedSourceNdSearch()">
-            </div>
             <div id="source-nd-albums-list"><div class="empty" style="padding:16px">Not connected — click 🔗 Source Navidrome above</div></div>
           </div>
         </div>
@@ -696,18 +689,12 @@ async function checkSourceNd(){
   }catch(e){}
 }
 
-let sourceNdSearchTimer=null;
-function debouncedSourceNdSearch(){
-  clearTimeout(sourceNdSearchTimer);
-  sourceNdSearchTimer=setTimeout(()=>loadSourceNdAlbums(document.getElementById('source-nd-search').value.trim()),400);
-}
-
-async function loadSourceNdAlbums(query){
+async function loadSourceNdAlbums(){
   if(!sourceNdConnected)return;
   const list=document.getElementById('source-nd-albums-list');
   list.innerHTML='<div class="empty"><div class="spin"></div></div>';
   try{
-    const r=await fetch(`${API}/source-navidrome/albums${query?`?query=${encodeURIComponent(query)}`:''}`);
+    const r=await fetch(`${API}/source-navidrome/albums`);
     const albums=await r.json();
     if(albums.error){
       list.innerHTML=`<div class="empty">⚠ ${esc(albums.error)}</div>`;

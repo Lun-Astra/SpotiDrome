@@ -2921,18 +2921,24 @@ def source_nd_cover(cover_id):
 
 @app.route("/source-navidrome/albums", methods=["GET"])
 def source_nd_albums():
+    """Every album on the source server, alphabetical — paginates through
+    the whole thing server-side (same idiom as cleanup_scan's song
+    pagination) so the frontend gets one complete list in a single call."""
     cfg = load_source_nd_config()
     if not cfg:
         return jsonify({"error": "Not connected to a source Navidrome"}), 400
-    query = request.args.get("query", "").strip()
     try:
-        if query:
-            data = nd_subsonic("search3", cfg=cfg, query=query, albumCount=60, songCount=0, artistCount=0)
-            albums = data.get("searchResult3", {}).get("album", [])
-        else:
-            offset = int(request.args.get("offset", 0))
-            data = nd_subsonic("getAlbumList2", cfg=cfg, type="alphabeticalByName", size=100, offset=offset)
-            albums = data.get("albumList2", {}).get("album", [])
+        albums = []
+        offset = 0
+        while True:
+            data = nd_subsonic("getAlbumList2", cfg=cfg, type="alphabeticalByName", size=500, offset=offset)
+            page = data.get("albumList2", {}).get("album", [])
+            if not page:
+                break
+            albums.extend(page)
+            if len(page) < 500:
+                break
+            offset += 500
     except Exception as e:
         return jsonify({"error": str(e)}), 400
     return jsonify([{

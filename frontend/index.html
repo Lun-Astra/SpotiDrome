@@ -241,13 +241,13 @@ header{
 /* ── Modals ─────────────────────────────────────────────────────────── */
 .modal-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)}
 .modal-ov.show{display:flex}
-.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);width:100%;max-width:460px;overflow:hidden}
-.modal-hd{padding:18px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);width:100%;max-width:460px;max-height:85vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-hd{padding:18px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
 .modal-title{font-family:var(--font2);font-size:16px;font-weight:600}
 .modal-close{background:none;border:none;color:var(--text3);cursor:pointer;font-size:18px;padding:2px;transition:color .15s}
 .modal-close:hover{color:var(--text)}
-.modal-body{padding:20px;display:flex;flex-direction:column;gap:14px}
-.modal-foot{padding:14px 20px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
+.modal-body{padding:20px;display:flex;flex-direction:column;gap:14px;overflow-y:auto;min-height:0}
+.modal-foot{padding:14px 20px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end;flex-shrink:0}
 
 .field{display:flex;flex-direction:column;gap:5px}
 .field label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;font-weight:500}

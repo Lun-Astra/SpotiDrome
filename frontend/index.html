@@ -98,6 +98,16 @@ header{
 .panel-title{font-family:var(--font2);font-size:12px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text2)}
 .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--text3);font-weight:500}
 
+/* ── Collapsible source sections (Spotify / Navidrome) ─────────────────── */
+.source-hd{cursor:pointer;user-select:none}
+.source-chevron{display:inline-block;width:10px}
+.source-body.collapsed{display:none}
+.source-nd-search-row{padding:10px 16px;border-bottom:1px solid var(--border)}
+.source-nd-search-row input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:inherit;font-size:12px;padding:8px 10px;outline:none;transition:border-color .15s;box-sizing:border-box}
+.source-nd-search-row input:focus{border-color:rgba(139,92,246,.5)}
+.source-nd-search-row input::placeholder{color:var(--text3)}
+#source-nd-albums-list{overflow-y:auto;max-height:calc(100vh - 340px)}
+
 /* ── Playlist items ─────────────────────────────────────────────────── */
 #playlists-list{overflow-y:auto;max-height:calc(100vh - 280px)}
 .pl-item{
@@ -339,6 +349,28 @@ header{
   </div>
 </div>
 
+<!-- Source Navidrome modal (someone else's server, browsed as a download source) -->
+<div class="modal-ov" id="source-nd-modal">
+  <div class="modal">
+    <div class="modal-hd">
+      <div class="modal-title" style="color:var(--nd)">Source Navidrome</div>
+      <button class="modal-close" onclick="closeSourceNdModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-hint">Connect to <b>someone else's</b> Navidrome server to browse and pull albums/tracks from their library into yours — the original files are copied as-is, untouched, then synced in exactly like a normal download. This is separate from your own Navidrome connection above, which stays your sync destination either way.</div>
+      <div class="field"><label>Server URL</label><input id="source-nd-url" type="url" placeholder="http://theirserver:4533"></div>
+      <div class="field"><label>Username</label><input id="source-nd-user" type="text" placeholder="username"></div>
+      <div class="field"><label>Password</label><input id="source-nd-pass" type="password" placeholder="••••••••"></div>
+      <div id="source-nd-conn-st"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="disconnectSourceNd()">Disconnect</button>
+      <button class="btn btn-ghost" onclick="testSourceNd()">Test Connection</button>
+      <button class="btn btn-nd" onclick="saveSourceNd()">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Schedule modal -->
 <div class="modal-ov" id="schedule-modal">
   <div class="modal">
@@ -481,6 +513,10 @@ header{
         <div class="dot" id="nd-dot"></div>
         <span id="nd-pill-label">Navidrome</span>
       </div>
+      <div class="pill nd-pill" onclick="openSourceNdModal()" id="source-nd-pill">
+        <div class="dot" id="source-nd-dot"></div>
+        <span id="source-nd-pill-label">🔗 Source Navidrome</span>
+      </div>
       <div id="user-area"></div>
     </div>
   </header>
@@ -526,12 +562,25 @@ header{
     <div class="main">
       <!-- Left column -->
       <div>
-        <div class="panel">
-          <div class="panel-hd">
-            <span class="panel-title">Playlists</span>
+        <div class="panel source-panel">
+          <div class="panel-hd source-hd" onclick="toggleSource('spotify')">
+            <span class="panel-title"><span class="source-chevron" id="spotify-chevron">▾</span> Spotify</span>
             <span class="badge" id="playlist-count">—</span>
           </div>
-          <div id="playlists-list"><div class="empty"><div class="spin"></div></div></div>
+          <div id="playlists-list" class="source-body"><div class="empty"><div class="spin"></div></div></div>
+        </div>
+
+        <div class="panel source-panel" style="margin-top:12px">
+          <div class="panel-hd source-hd" onclick="toggleSource('navidrome')">
+            <span class="panel-title"><span class="source-chevron" id="navidrome-chevron">▾</span> Navidrome</span>
+            <span class="badge" id="source-nd-count">—</span>
+          </div>
+          <div id="source-nd-body" class="source-body">
+            <div class="source-nd-search-row">
+              <input id="source-nd-search" type="text" placeholder="Search albums…" oninput="debouncedSourceNdSearch()">
+            </div>
+            <div id="source-nd-albums-list"><div class="empty" style="padding:16px">Not connected — click 🔗 Source Navidrome above</div></div>
+          </div>
         </div>
 
         <!-- YT tracked -->
@@ -596,7 +645,7 @@ header{
 
 <script>
 const API='/api';
-let selectedPlaylist=null,allTracks=[],ytInfo=null;
+let selectedPlaylist=null,selectedSourceAlbum=null,currentSource='spotify',allTracks=[],ytInfo=null;
 let _lastJobsHash='';
 
 const urlP=new URLSearchParams(window.location.search),code=urlP.get('code');
@@ -606,10 +655,17 @@ if(code){
 }else{init();}
 
 async function init(){
-  await Promise.all([checkNd(),checkSchedule(),checkFailed()]);
+  await Promise.all([checkNd(),checkSchedule(),checkFailed(),checkSourceNd()]);
   const res=await fetch(`${API}/auth/status`),d=await res.json();
   if(d.authenticated){showMain(d);loadPlaylists();loadYtTracked();loadHealth();setInterval(renderJobs,2500);setInterval(loadYtTracked,10000);setInterval(loadHealth,30000);setInterval(checkFailed,30000);renderJobs();}
   else{document.getElementById('auth-link').href=d.auth_url;document.getElementById('auth-screen').style.display='flex';}
+}
+
+function toggleSource(name){
+  const body=document.getElementById(name==='spotify'?'playlists-list':'source-nd-body');
+  const chevron=document.getElementById(`${name}-chevron`);
+  const collapsed=body.classList.toggle('collapsed');
+  chevron.textContent=collapsed?'▸':'▾';
 }
 
 async function checkFailed(){
@@ -626,6 +682,86 @@ async function checkNd(){
     if(c.configured){dot.classList.add('on');lbl.textContent=c.url.replace(/^https?:\/\//,'').split('/')[0];}
     else{dot.classList.remove('on');lbl.textContent='Navidrome';}
   }catch(e){}
+}
+
+let sourceNdConnected=false;
+async function checkSourceNd(){
+  try{const r=await fetch(`${API}/source-navidrome/config`),c=await r.json();
+    sourceNdConnected=!!c.configured;
+    const dot=document.getElementById('source-nd-dot'),lbl=document.getElementById('source-nd-pill-label');
+    if(c.configured){dot.classList.add('on');lbl.textContent=c.url.replace(/^https?:\/\//,'').split('/')[0];loadSourceNdAlbums();}
+    else{dot.classList.remove('on');lbl.textContent='🔗 Source Navidrome';
+      document.getElementById('source-nd-albums-list').innerHTML='<div class="empty" style="padding:16px">Not connected — click 🔗 Source Navidrome above</div>';
+      document.getElementById('source-nd-count').textContent='—';}
+  }catch(e){}
+}
+
+let sourceNdSearchTimer=null;
+function debouncedSourceNdSearch(){
+  clearTimeout(sourceNdSearchTimer);
+  sourceNdSearchTimer=setTimeout(()=>loadSourceNdAlbums(document.getElementById('source-nd-search').value.trim()),400);
+}
+
+async function loadSourceNdAlbums(query){
+  if(!sourceNdConnected)return;
+  const list=document.getElementById('source-nd-albums-list');
+  list.innerHTML='<div class="empty"><div class="spin"></div></div>';
+  try{
+    const r=await fetch(`${API}/source-navidrome/albums${query?`?query=${encodeURIComponent(query)}`:''}`);
+    const albums=await r.json();
+    if(albums.error){
+      list.innerHTML=`<div class="empty">⚠ ${esc(albums.error)}</div>`;
+      document.getElementById('source-nd-count').textContent='!';
+      return;
+    }
+    document.getElementById('source-nd-count').textContent=albums.length;
+    if(!albums.length){list.innerHTML='<div class="empty">No albums found</div>';return;}
+    list.innerHTML=albums.map(a=>`<div class="pl-item" data-src-id="${a.id}" onclick="selectSourceAlbum('${a.id}','${escA(a.name)}')">
+      <div class="pl-thumb">${a.image?`<img src="${API}${a.image}" loading="lazy">`:'♪'}</div>
+      <div class="pl-info"><div class="pl-name">${esc(a.name)}</div><div class="pl-meta">${esc(a.artist||'')}${a.songCount?` · ${a.songCount} tracks`:''}</div></div>
+    </div>`).join('');
+  }catch(e){
+    list.innerHTML=`<div class="empty">⚠ ${esc(e.message)}</div>`;
+  }
+}
+
+async function selectSourceAlbum(id,name){
+  currentSource='navidrome';selectedPlaylist=null;selectedSourceAlbum={id,name};allTracks=[];
+  document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
+  document.querySelector(`[data-src-id="${id}"]`)?.classList.add('active');
+  const panel=document.getElementById('tracks-panel');
+  panel.classList.add('visible');
+  document.getElementById('selected-name').textContent=name;
+  document.getElementById('selected-meta').textContent='Loading…';
+  document.getElementById('tracks-list').innerHTML='<div class="empty"><div class="spin"></div></div>';
+  document.getElementById('btn-download').disabled=true;
+  const r=await fetch(`${API}/source-navidrome/albums/${id}/tracks`);
+  allTracks=await r.json();
+  document.getElementById('selected-meta').textContent=`${allTracks.length} tracks · from source Navidrome`;
+  document.getElementById('btn-download').disabled=false;
+  renderTracks();
+}
+
+// Source Navidrome modal
+function openSourceNdModal(){
+  fetch(`${API}/source-navidrome/config`).then(r=>r.json()).then(c=>{if(c.configured){document.getElementById('source-nd-url').value=c.url;document.getElementById('source-nd-user').value=c.user;}});
+  document.getElementById('source-nd-modal').classList.add('show');
+}
+function closeSourceNdModal(){document.getElementById('source-nd-modal').classList.remove('show');}
+async function testSourceNd(){
+  const url=document.getElementById('source-nd-url').value.trim(),user=document.getElementById('source-nd-user').value.trim(),pass=document.getElementById('source-nd-pass').value.trim(),el=document.getElementById('source-nd-conn-st');
+  el.innerHTML='<div style="font-size:12px;color:var(--text2)">Testing…</div>';
+  try{const r=await fetch(`${API}/source-navidrome/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,user,password:pass})}),d=await r.json();
+    if(d.status==='ok'){el.innerHTML='<div class="conn-ok">✓ Connected successfully</div>';checkSourceNd();}
+    else{el.innerHTML=`<div class="conn-err">✗ ${esc(d.error)}</div>`;}
+  }catch(e){el.innerHTML=`<div class="conn-err">✗ ${esc(e.message)}</div>`;}
+}
+async function saveSourceNd(){await testSourceNd();if(document.getElementById('source-nd-conn-st').querySelector('.conn-ok'))setTimeout(closeSourceNdModal,600);}
+async function disconnectSourceNd(){
+  await fetch(`${API}/source-navidrome/config`,{method:'DELETE'});
+  document.getElementById('source-nd-url').value='';document.getElementById('source-nd-user').value='';document.getElementById('source-nd-pass').value='';
+  document.getElementById('source-nd-conn-st').innerHTML='';
+  checkSourceNd();
 }
 
 async function checkSchedule(){
@@ -671,6 +807,7 @@ async function loadPlaylists(){
 }
 
 async function selectPlaylist(id,name){
+  currentSource='spotify';selectedSourceAlbum=null;
   selectedPlaylist={id,name};allTracks=[];
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
   document.querySelector(`[data-id="${id}"]`)?.classList.add('active');
@@ -689,19 +826,24 @@ async function selectPlaylist(id,name){
 function renderTracks(){
   const list=document.getElementById('tracks-list');
   if(!allTracks.length){list.innerHTML='<div class="empty">No tracks</div>';return;}
+  // "Flag as wrong" only makes sense for tracks that are (or will be) in
+  // *your* library via the Spotify/YouTube pipeline — a source-Navidrome
+  // album is just a preview of someone else's library pre-pull, nothing
+  // to replace yet.
+  const showFlag=currentSource==='spotify';
   list.innerHTML=allTracks.map((t,i)=>`<div class="track-item">
     <div class="track-num">${i+1}</div>
-    <div class="track-art">${t.image?`<img src="${t.image}" loading="lazy">`:''}</div>
+    <div class="track-art">${t.image?`<img src="${t.image.startsWith('/')?API+t.image:t.image}" loading="lazy">`:''}</div>
     <div class="track-info"><div class="track-name">${esc(t.name)}</div><div class="track-artist">${esc(t.artist)}</div></div>
     <div class="track-dur">${fmt(t.duration_ms)}</div>
-    <button class="track-flag-btn" title="Flag as wrong audio — paste a corrected link to replace it" onclick="toggleFlagWrong(${i})">🚩</button>
+    ${showFlag?`<button class="track-flag-btn" title="Flag as wrong audio — paste a corrected link to replace it" onclick="toggleFlagWrong(${i})">🚩</button>`:''}
   </div>
-  <div class="track-flag-row" id="flag-row-${i}">
+  ${showFlag?`<div class="track-flag-row" id="flag-row-${i}">
     <input class="track-flag-url" type="url" placeholder="Paste the correct YouTube / YouTube Music / SoundCloud link…">
     <button class="btn btn-primary" style="padding:6px 10px;font-size:11px" onclick="submitFlagWrong(${i},this)">↓ Replace</button>
     <button class="btn btn-ghost" style="padding:6px 10px;font-size:11px" onclick="toggleFlagWrong(${i})">Cancel</button>
     <div class="track-flag-result"></div>
-  </div>`).join('');
+  </div>`:''}`).join('');
 }
 
 function toggleFlagWrong(i){
@@ -744,15 +886,26 @@ async function submitFlagWrong(i,btn){
 }
 
 document.getElementById('btn-download').addEventListener('click',async()=>{
-  if(!selectedPlaylist||!allTracks.length)return;
   const sync=document.getElementById('toggle-sync').checked,btn=document.getElementById('btn-download');
+  if(currentSource==='navidrome'){
+    if(!selectedSourceAlbum||!allTracks.length)return;
+    btn.disabled=true;btn.innerHTML='<span class="spin"></span> Starting…';
+    await fetch(`${API}/source-navidrome/download`,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({album_name:selectedSourceAlbum.name,tracks:allTracks,sync_navidrome:sync})});
+    btn.disabled=false;btn.innerHTML='↓ Download All';renderJobs();
+    return;
+  }
+  if(!selectedPlaylist||!allTracks.length)return;
   btn.disabled=true;btn.innerHTML='<span class="spin"></span> Starting…';
   await fetch(`${API}/download`,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({playlist_name:selectedPlaylist.name,playlist_id:selectedPlaylist.id,tracks:allTracks,sync_navidrome:sync})});
   btn.disabled=false;btn.innerHTML='↓ Download All';renderJobs();
 });
 
-document.getElementById('btn-refresh').addEventListener('click',()=>{if(selectedPlaylist)selectPlaylist(selectedPlaylist.id,selectedPlaylist.name);});
+document.getElementById('btn-refresh').addEventListener('click',()=>{
+  if(currentSource==='navidrome'&&selectedSourceAlbum)selectSourceAlbum(selectedSourceAlbum.id,selectedSourceAlbum.name);
+  else if(selectedPlaylist)selectPlaylist(selectedPlaylist.id,selectedPlaylist.name);
+});
 
 async function renderJobs(){
   const r=await fetch(`${API}/jobs`),jobs=await r.json();

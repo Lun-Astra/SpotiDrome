@@ -2,7 +2,7 @@ import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, di
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import requests as http
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -33,6 +33,7 @@ SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8080/callback")
 NAVIDROME_CONFIG_FILE = "/root/.ssh/navidrome_config.json"
+SOURCE_NAVIDROME_CONFIG_FILE = "/root/.ssh/source_navidrome_config.json"  # a *different* person's Navidrome, browsed as a download source
 SSH_CONFIG_FILE       = "/root/.ssh/ssh_config.json"
 TRACKED_FILE          = "/root/.ssh/tracked_playlists.json"
 SCHEDULE_CONFIG_FILE  = "/root/.ssh/schedule_config.json"
@@ -328,6 +329,25 @@ def load_nd_config():
 
 def save_nd_config(url, user, password):
     with open(NAVIDROME_CONFIG_FILE, "w") as f:
+        json.dump({"url": url.rstrip("/"), "user": user, "password": password}, f)
+
+# ─── Source Navidrome (someone else's server, browsed/pulled from) ─────────
+# Distinct from NAVIDROME_CONFIG_FILE above, which is always *this* app's
+# own sync destination. This is a second, independent Subsonic connection —
+# typically a friend's or another self-hosted Navidrome — used only to
+# browse its library and pull tracks from it into the destination above.
+# Same {url, user, password} shape, reuses nd_subsonic() by passing this
+# config in explicitly.
+
+def load_source_nd_config():
+    try:
+        with open(SOURCE_NAVIDROME_CONFIG_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def save_source_nd_config(url, user, password):
+    with open(SOURCE_NAVIDROME_CONFIG_FILE, "w") as f:
         json.dump({"url": url.rstrip("/"), "user": user, "password": password}, f)
 
 def nd_subsonic(action, cfg=None, **params):
@@ -2850,6 +2870,209 @@ def nd_set_config():
         return jsonify({"error": f"Connection failed: {e}"}), 400
     save_nd_config(url, user, password)
     return jsonify({"status": "ok"})
+
+# ─── Source Navidrome routes (browse + pull from someone else's server) ────
+
+@app.route("/source-navidrome/config", methods=["GET"])
+def source_nd_get_config():
+    cfg = load_source_nd_config()
+    if cfg:
+        return jsonify({"configured": True, "url": cfg["url"], "user": cfg["user"]})
+    return jsonify({"configured": False})
+
+@app.route("/source-navidrome/config", methods=["POST"])
+def source_nd_set_config():
+    data = request.json or {}
+    url, user, password = data.get("url","").strip(), data.get("user","").strip(), data.get("password","").strip()
+    if not url or not user or not password:
+        return jsonify({"error": "url, user and password required"}), 400
+    try:
+        nd_subsonic("ping", cfg={"url": url.rstrip("/"), "user": user, "password": password})
+    except Exception as e:
+        return jsonify({"error": f"Connection failed: {e}"}), 400
+    save_source_nd_config(url, user, password)
+    return jsonify({"status": "ok"})
+
+@app.route("/source-navidrome/config", methods=["DELETE"])
+def source_nd_delete_config():
+    try:
+        os.remove(SOURCE_NAVIDROME_CONFIG_FILE)
+    except FileNotFoundError:
+        pass
+    return jsonify({"status": "ok"})
+
+@app.route("/source-navidrome/cover/<cover_id>")
+def source_nd_cover(cover_id):
+    """Proxies cover art through our own backend rather than handing the
+    frontend a direct <img src> URL with the source server's credentials
+    embedded in it — those would otherwise go out over the wire (and into
+    browser history/referrers) on every page load."""
+    cfg = load_source_nd_config()
+    if not cfg:
+        return "", 404
+    try:
+        resp = http.get(f"{cfg['url']}/rest/getCoverArt", params={
+            "id": cover_id, "u": cfg["user"], "p": cfg["password"], "v": "1.16.1", "c": "spotidrome"
+        }, timeout=15)
+        resp.raise_for_status()
+        return Response(resp.content, mimetype=resp.headers.get("Content-Type", "image/jpeg"))
+    except Exception:
+        return "", 404
+
+@app.route("/source-navidrome/albums", methods=["GET"])
+def source_nd_albums():
+    cfg = load_source_nd_config()
+    if not cfg:
+        return jsonify({"error": "Not connected to a source Navidrome"}), 400
+    query = request.args.get("query", "").strip()
+    try:
+        if query:
+            data = nd_subsonic("search3", cfg=cfg, query=query, albumCount=60, songCount=0, artistCount=0)
+            albums = data.get("searchResult3", {}).get("album", [])
+        else:
+            offset = int(request.args.get("offset", 0))
+            data = nd_subsonic("getAlbumList2", cfg=cfg, type="alphabeticalByName", size=100, offset=offset)
+            albums = data.get("albumList2", {}).get("album", [])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify([{
+        "id": a.get("id"), "name": a.get("name") or a.get("title", ""),
+        "artist": a.get("artist", ""), "year": a.get("year"),
+        "songCount": a.get("songCount", 0),
+        "image": f"/source-navidrome/cover/{a['coverArt']}" if a.get("coverArt") else None,
+    } for a in albums])
+
+@app.route("/source-navidrome/albums/<album_id>/tracks", methods=["GET"])
+def source_nd_album_tracks(album_id):
+    cfg = load_source_nd_config()
+    if not cfg:
+        return jsonify({"error": "Not connected to a source Navidrome"}), 400
+    try:
+        data = nd_subsonic("getAlbum", cfg=cfg, id=album_id)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    album = data.get("album", {})
+    songs = album.get("song", [])
+    return jsonify([{
+        "id": s.get("id"), "name": s.get("title", ""), "artist": s.get("artist", ""),
+        "album": s.get("album") or album.get("name", ""),
+        "album_artist": album.get("artist") or s.get("artist", ""),
+        "duration_ms": int((s.get("duration") or 0) * 1000),
+        "track_number": s.get("track"), "suffix": s.get("suffix") or "flac",
+        "image": f"/source-navidrome/cover/{s['coverArt']}" if s.get("coverArt") else None,
+    } for s in songs])
+
+def source_nd_download_worker(job_id, album_name, tracks, sync_navidrome):
+    """Pulls each track's actual audio file straight from the source
+    Navidrome (Subsonic 'download' — the original file, not a transcode)
+    and rsyncs it into our own Navidrome exactly like a normal download
+    batch. Deliberately does NOT touch any tags — unlike the YouTube path,
+    these came from someone's real, presumably-already-correct library, so
+    there's no fix_tags()/genre lookup step here, just a straight copy."""
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+
+    src_cfg = load_source_nd_config()
+    ssh_cfg = load_ssh_config()
+    nd_cfg = load_nd_config()
+    if not src_cfg:
+        with job_lock:
+            jobs[job_id]["log"].append("✗ Not connected to a source Navidrome")
+            jobs[job_id]["status"] = "done"
+        return
+
+    local_dir = os.path.join(DOWNLOAD_DIR, sanitize(album_name))
+    os.makedirs(local_dir, exist_ok=True)
+    downloaded_tracks = []
+
+    for i, t in enumerate(tracks):
+        with job_lock:
+            if jobs[job_id].get("cancel_requested"):
+                jobs[job_id]["log"].append(f"🛑 Cancelled ({i}/{len(tracks)})")
+                jobs[job_id]["status"] = "done"
+                jobs[job_id]["current_track"] = None
+                save_jobs()
+                return
+            jobs[job_id]["current"] = i + 1
+            jobs[job_id]["current_track"] = f"{t.get('artist','')} - {t.get('name','')}"
+
+        song_id = t.get("id")
+        label = f"{t.get('artist','')} - {t.get('name','')}"
+        if not song_id:
+            with job_lock:
+                jobs[job_id]["log"].append(f"✗ Skipped (no source id): {label}")
+                jobs[job_id]["failed"] += 1
+            continue
+
+        ext = (t.get("suffix") or "flac").lower()
+        album = t.get("album") or album_name
+        album_dir = os.path.join(local_dir, sanitize(album))
+        os.makedirs(album_dir, exist_ok=True)
+        out_path = os.path.join(album_dir, f"{sanitize(label)}.{ext}")
+
+        try:
+            resp = http.get(f"{src_cfg['url']}/rest/download", params={
+                "id": song_id, "u": src_cfg["user"], "p": src_cfg["password"],
+                "v": "1.16.1", "c": "spotidrome"}, timeout=60, stream=True)
+            resp.raise_for_status()
+            with open(out_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=256 * 1024):
+                    fh.write(chunk)
+        except Exception as e:
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+            with job_lock:
+                jobs[job_id]["log"].append(f"✗ Failed to pull {label}: {e}")
+                jobs[job_id]["failed"] += 1
+            continue
+
+        downloaded_tracks.append(t)
+        with job_lock:
+            jobs[job_id]["log"].append(f"✓ Pulled: {label}")
+            jobs[job_id]["downloaded"] += 1
+
+    if downloaded_tracks and ssh_cfg:
+        rsync_ok = rsync_to_remote(local_dir, ssh_cfg, job_id)
+        if rsync_ok:
+            shutil.rmtree(local_dir, ignore_errors=True)
+            if nd_cfg:
+                ok, msg = nd_trigger_scan(nd_cfg)
+                with job_lock:
+                    jobs[job_id]["log"].append(f"🔄 {msg}")
+                if ok:
+                    nd_wait_for_scan(nd_cfg, timeout=300)
+                if sync_navidrome:
+                    synced, missing = nd_sync_playlist(album_name, downloaded_tracks, nd_cfg, job_id)
+                    with job_lock:
+                        jobs[job_id]["nd_synced"] = synced
+                        jobs[job_id]["nd_missing"] = missing
+
+    with job_lock:
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["current_track"] = None
+        save_jobs()
+
+@app.route("/source-navidrome/download", methods=["POST"])
+def source_nd_download():
+    data = request.json or {}
+    album_name = (data.get("album_name") or "Unknown Album").strip()
+    tracks = data.get("tracks", [])
+    sync_navidrome = data.get("sync_navidrome", True)
+    if not tracks:
+        return jsonify({"error": "No tracks provided"}), 400
+    if not load_source_nd_config():
+        return jsonify({"error": "Not connected to a source Navidrome"}), 400
+
+    job_id = f"src_nd_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": f"[Navidrome] {album_name}", "status": "pending",
+                        "total": len(tracks), "current": 0, "downloaded": 0, "failed": 0,
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+    threading.Thread(target=source_nd_download_worker,
+                     args=(job_id, album_name, tracks, sync_navidrome), daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 @app.route("/ssh/config", methods=["GET"])
 def ssh_get_config():

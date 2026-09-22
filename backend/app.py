@@ -278,7 +278,20 @@ def get_remote_files(remote_dir, cfg):
         return set()
 
 def get_all_remote_files(cfg):
-    """Get ALL filenames (basenames only) across entire music library in one SSH call."""
+    """Get ALL filenames (basenames only) across entire music library in one
+    SSH call — this is the source of truth every download worker's dedup
+    check (_remote_duplicate_exists) runs against, so a failure here is
+    silently catastrophic: an empty return makes EVERY track in the run
+    look like it's missing, triggering a full redundant redownload of the
+    whole library. 30s used to be the timeout; _VERIFY_SCAN_SCRIPT's
+    comparable whole-library walk elsewhere in this file already needed
+    180s of headroom on this same (1 CPU/1GB, known to swap heavily)
+    Navidrome host, so 30s was thin margin even though a `find` over ~3300
+    files measured well under a second when the host was idle — under any
+    real contention (a concurrent rsync batch, Navidrome's own scan) 30s
+    isn't a safe bet. Widened to match, and logs loudly on failure instead
+    of quietly returning an empty set with no trace anywhere but a
+    swallowed exception."""
     try:
         cmd = ["ssh", "-i", "/root/.ssh/id_rsa",
                "-p", str(cfg["port"]),
@@ -287,12 +300,32 @@ def get_all_remote_files(cfg):
                "-o", "ConnectTimeout=5",
                f"{cfg['user']}@{cfg['host']}",
                f"find '{cfg['music_path']}' -name '*.flac' -printf '%f\n' 2>/dev/null"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         return set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
-    except Exception:
+    except Exception as e:
+        print(f"[dedup] get_all_remote_files failed — every track this run will look "
+              f"'missing' and may be redownloaded: {e}", file=sys.stderr)
         return set()
 
 def rsync_to_remote(local_dir, cfg, job_id=None, to_root=True):
+    """Returns True/False — deliberately never raises. This used to let a
+    subprocess.TimeoutExpired (or any other subprocess failure) propagate
+    straight out of subprocess.run() uncaught. Nothing up the call chain
+    catches that: batch_upload_and_cleanup -> download_worker/
+    ytmusic_download_worker -> auto_sync_worker's per-playlist loop has no
+    try/except either, so an exception here used to silently kill the
+    entire nightly auto-sync thread mid-run — the playlist being rsynced
+    stayed stuck at status 'uploading' forever (nothing ever set it to
+    'done'), and every tracked playlist after it in that run never got
+    its turn at all, with no error surfaced anywhere except a Python
+    traceback in the container's stderr nobody was looking at. On the
+    underpowered Navidrome host (1 CPU/1GB RAM, known to swap heavily —
+    see muziekapp-open-issues) a big batch rsync taking longer than the
+    600s timeout below is a completely realistic way to trigger this, and
+    is exactly what happened in practice (GitHub issue: 'Auto Sync
+    staying stuck on RSyncing' — the stuck job's own next-restart cleanup
+    mislabeled it as interrupted by a server restart, when the real cause
+    was this uncaught timeout hours earlier)."""
     def log(msg):
         if job_id:
             with job_lock:
@@ -305,7 +338,14 @@ def rsync_to_remote(local_dir, cfg, job_id=None, to_root=True):
            local_dir + "/",
            target]
     log(f"📤 Rsyncing {folder_name} to {cfg['host']}…")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        log("✗ Rsync timed out after 10 min — the Navidrome host may be overloaded, try again later")
+        return False
+    except Exception as e:
+        log(f"✗ Rsync failed to run: {e}")
+        return False
     if result.returncode == 0:
         log("✓ Rsync complete")
         return True
@@ -815,6 +855,48 @@ def _artist_ok(candidate_names, expected_artist):
                 return True
     return False
 
+# ─── "Is this already in the library?" dedup check ─────────────────────────
+# Every filename in this library is written as sanitize(f"{artist} - {name}")
+# (see download_worker/ytmusic_download_worker below, and the manual-retry/
+# flag-wrong paths). The dedup check used to just be a plain case-sensitive
+# `any(f.startswith(filename) for f in remote_files_flat)` against that exact
+# string — brittle to any artist-credit formatting difference between
+# sources: Spotify's playlist_tracks() joins EVERY credited artist with ", "
+# (e.g. "Missy Elliott, Timbaland"), while a raw YouTube playlist import only
+# ever has the uploader/channel name (typically just the primary artist,
+# e.g. "Missy Elliott"), and manual URL-paste retries can differ again. A
+# track saved via one path and later encountered via another silently failed
+# the exact match and got redownloaded from scratch — confirmed real cause
+# of a 1458-track "Liked Songs" sync redownloading things already in the
+# library (GitHub issue: "Spotidrome saying its downloading a song thats
+# already present"). Fixed by reusing the same _title_ok/_artist_ok fuzzy
+# matchers already trusted elsewhere in this file, indexed by normalized
+# title first so a per-track check stays cheap (O(1) bucket lookup) instead
+# of rescanning the whole remote file list per track — important given the
+# whole point here is to stop syncs from taking forever, not add more work.
+
+def _index_remote_files_by_title(remote_filenames):
+    """{normalized_title: [(artist_guess, title_guess, raw_filename), ...]}
+    — parses each 'Artist - Title.ext' filename by splitting on the FIRST
+    ' - ' (the exact inverse of how it was joined), so an artist or title
+    that itself legitimately contains ' - ' still splits correctly."""
+    index = {}
+    for f in remote_filenames:
+        stem = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", f)  # strip the extension
+        if " - " not in stem:
+            continue
+        artist_guess, title_guess = stem.split(" - ", 1)
+        index.setdefault(_normalize_title(title_guess), []).append((artist_guess, title_guess, f))
+    return index
+
+def _remote_duplicate_exists(track, remote_title_index):
+    """track: a dict with 'name' and 'artist' keys (same shape used
+    throughout download_worker/ytmusic_download_worker)."""
+    for artist_guess, title_guess, _f in remote_title_index.get(_normalize_title(track["name"]), []):
+        if _title_ok(title_guess, track["name"]) and _artist_ok([artist_guess], track["artist"]):
+            return True
+    return False
+
 def _looks_like_non_music(candidate_title, expected_title):
     cand_l = (candidate_title or "").lower()
     exp_l = (expected_title or "").lower()
@@ -1186,6 +1268,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
     remote_dir = f"{ssh_cfg['music_path']}/{sanitize(playlist_name)}" if ssh_cfg else ""
     remote_files = get_remote_files(remote_dir, ssh_cfg) if ssh_cfg else set()
     remote_files_flat = get_all_remote_files(ssh_cfg) if ssh_cfg else set()
+    remote_title_index = _index_remote_files_by_title(remote_files_flat)
 
     for i, track in enumerate(tracks):
         with job_lock:
@@ -1202,8 +1285,10 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
         os.makedirs(album_dir, exist_ok=True)
         out_template = os.path.join(album_dir, f"{filename}.%(ext)s")
 
-        # Check remote globally (any folder)
-        if any(f.startswith(filename) for f in remote_files_flat):
+        # Check remote globally (any folder) — fuzzy match, see
+        # _remote_duplicate_exists' docstring for why this isn't a plain
+        # exact filename check.
+        if _remote_duplicate_exists(track, remote_title_index):
             with job_lock:
                 jobs[job_id]["log"].append(f"⏭ Already on Navidrome: {track['artist']} - {track['name']}")
             all_synced_tracks.append(track)
@@ -1445,6 +1530,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
     remote_dir = f"{ssh_cfg['music_path']}/{sanitize(playlist_name)}" if ssh_cfg else ""
     remote_files = get_remote_files(remote_dir, ssh_cfg) if ssh_cfg else set()
     remote_files_flat = get_all_remote_files(ssh_cfg) if ssh_cfg else set()
+    remote_title_index = _index_remote_files_by_title(remote_files_flat)
 
     for i, entry in enumerate(entries):
         track_id = entry.get("id") or entry.get("url", "")
@@ -1480,8 +1566,10 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
         out_template = os.path.join(album_dir, f"{filename}.%(ext)s")
         t = {"id": track_id, "name": title, "artist": artist, "album": album, "duration_ms": 0, "image": None, "source_url": track_url}
 
-        # Check remote globally (any folder)
-        if any(f.startswith(filename) for f in remote_files_flat):
+        # Check remote globally (any folder) — fuzzy match, see
+        # _remote_duplicate_exists' docstring for why this isn't a plain
+        # exact filename check.
+        if _remote_duplicate_exists(t, remote_title_index):
             with job_lock:
                 jobs[job_id]["log"].append(f"⏭ Already on Navidrome: {artist} - {title}")
             downloaded_tracks.append(t)
@@ -1705,35 +1793,58 @@ def auto_sync_worker():
             print(f"[auto-sync] Syncing: {playlist_name}")
             job_id = f"auto_{int(time.time()*1000)}"
 
-            # YouTube playlist (id starts with yt_)
-            if playlist_id.startswith("yt_"):
-                # Reconstruct original URL from stored tracks
-                url = info.get("url")
-                if not url:
-                    print(f"[auto-sync] No URL stored for {playlist_name}, skipping.")
-                    continue
+            # Each playlist's whole download+sync is wrapped here on purpose.
+            # This loop used to have no try/except at all — an uncaught
+            # exception anywhere down the call chain (confirmed cause: a
+            # slow rsync exceeding rsync_to_remote's 600s timeout, entirely
+            # plausible on the underpowered 1 CPU/1GB Navidrome host under
+            # load) would kill this whole background thread right then and
+            # there. That left the in-progress job stuck in a non-terminal
+            # status forever (nothing downstream ever set it to "done"),
+            # and — worse — silently skipped every tracked playlist that
+            # hadn't had its turn yet that night, with no record of it
+            # anywhere but a traceback in the container's stderr (GitHub
+            # issue: "Auto Sync staying stuck on RSyncing"). One playlist's
+            # failure must never take the rest of the night down with it.
+            try:
+                # YouTube playlist (id starts with yt_)
+                if playlist_id.startswith("yt_"):
+                    # Reconstruct original URL from stored tracks
+                    url = info.get("url")
+                    if not url:
+                        print(f"[auto-sync] No URL stored for {playlist_name}, skipping.")
+                        continue
+                    with job_lock:
+                        jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
+                                        "status": "pending", "total": 0, "current": 0,
+                                        "downloaded": 0, "failed": 0, "nd_synced": None,
+                                        "nd_missing": None, "current_track": None, "log": []}
+                    ytmusic_download_worker(job_id, url, playlist_name, is_playlist=True)
+                else:
+                    # Spotify playlist
+                    if not sp:
+                        print("[auto-sync] Spotify not authenticated, skipping Spotify playlists.")
+                        continue
+                    try:
+                        tracks = fetch_playlist_tracks(sp, playlist_id)
+                    except Exception as e:
+                        print(f"[auto-sync] Failed to fetch tracks for {playlist_name}: {e}")
+                        continue
+                    with job_lock:
+                        jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
+                                        "status": "pending", "total": len(tracks), "current": 0,
+                                        "downloaded": 0, "failed": 0, "nd_synced": None,
+                                        "nd_missing": None, "current_track": None, "log": []}
+                    download_worker(job_id, tracks, playlist_name, playlist_id=playlist_id, sync_navidrome=True)
+            except Exception as e:
+                print(f"[auto-sync] {playlist_name} failed unexpectedly, moving on to the rest of tonight's playlists: {e}",
+                      file=sys.stderr)
                 with job_lock:
-                    jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
-                                    "status": "pending", "total": 0, "current": 0,
-                                    "downloaded": 0, "failed": 0, "nd_synced": None,
-                                    "nd_missing": None, "current_track": None, "log": []}
-                ytmusic_download_worker(job_id, url, playlist_name, is_playlist=True)
-            else:
-                # Spotify playlist
-                if not sp:
-                    print("[auto-sync] Spotify not authenticated, skipping Spotify playlists.")
-                    continue
-                try:
-                    tracks = fetch_playlist_tracks(sp, playlist_id)
-                except Exception as e:
-                    print(f"[auto-sync] Failed to fetch tracks for {playlist_name}: {e}")
-                    continue
-                with job_lock:
-                    jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
-                                    "status": "pending", "total": len(tracks), "current": 0,
-                                    "downloaded": 0, "failed": 0, "nd_synced": None,
-                                    "nd_missing": None, "current_track": None, "log": []}
-                download_worker(job_id, tracks, playlist_name, playlist_id=playlist_id, sync_navidrome=True)
+                    if job_id in jobs and jobs[job_id].get("status") not in ("done",):
+                        jobs[job_id]["log"].append(f"✗ Sync failed unexpectedly: {e}")
+                        jobs[job_id]["status"] = "done"
+                        jobs[job_id]["current_track"] = None
+                    save_jobs()
 
             time.sleep(5)
 
@@ -2095,7 +2206,7 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
            f"{ssh_cfg['user']}@{ssh_cfg['host']}",
            f"python3 -c {shlex.quote(_TITLE_DEDUPE_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = _run_remote_scan(cmd, timeout=300)
         if result.returncode != 0:
             report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": result.stderr[-300:], "history": history}
             save_title_duplicate_report(report)
@@ -2270,6 +2381,30 @@ def _ssh_cmd(ssh_cfg, remote_command):
             "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
             f"{ssh_cfg['user']}@{ssh_cfg['host']}", remote_command]
 
+def _run_remote_scan(cmd, timeout=180, retries=1, retry_delay=5, **run_kwargs):
+    """subprocess.run() wrapper for the remote "python3 -c <scan script>"
+    SSH calls (genre scan, title-dedupe scan, orphan scan, verify scan) —
+    retries once on failure before giving up. Added after a one-off, never
+    reproduced 'ModuleNotFoundError: No module named mutagen' failure on
+    the Navidrome host (GitHub issue: 'Mutagen probleem met library scans')
+    — nothing on that host's package/apt/dpkg logs showed any actual
+    change around the failure time, so the working theory is a transient
+    hiccup (the host is a 1 CPU/1GB box that's known to swap heavily under
+    load — see muziekapp-open-issues) rather than a real, lasting
+    environment break. A single retry costs nothing when the scan already
+    succeeds, and turns a one-off blip into a non-event instead of a
+    failed job Luna has to notice and manually re-run."""
+    last_result = None
+    for attempt in range(retries + 1):
+        last_result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **run_kwargs)
+        if last_result.returncode == 0:
+            return last_result
+        if attempt < retries:
+            print(f"[remote-scan] attempt {attempt + 1} failed (rc={last_result.returncode}), "
+                  f"retrying in {retry_delay}s: {last_result.stderr[-300:]}", file=sys.stderr)
+            time.sleep(retry_delay)
+    return last_result
+
 # ─── Orphaned Navidrome entries ("husks") ──────────────────────────────────
 # A file deleted straight off disk (by either dedupe sweep above, or by hand)
 # leaves Navidrome's own database row behind unless a *full* scan runs
@@ -2421,7 +2556,7 @@ def genre_relabel_worker(job_id):
     scan_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_GENRE_SCAN_REMOTE_SCRIPT)} "
                                   f"{shlex.quote(ssh_cfg['music_path'])}")
     try:
-        result = subprocess.run(scan_cmd, capture_output=True, text=True, timeout=180)
+        result = _run_remote_scan(scan_cmd, timeout=180)
         if result.returncode != 0:
             raise ValueError(result.stderr[-500:])
         files = json.loads(result.stdout.strip() or "[]")
@@ -4405,7 +4540,7 @@ def verify_tracks_worker(job_id):
         jobs[job_id]["current_track"] = "Reading tags for every track on the Navidrome host…"
     scan_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_VERIFY_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
     try:
-        result = subprocess.run(scan_cmd, capture_output=True, text=True, timeout=180)
+        result = _run_remote_scan(scan_cmd, timeout=180)
         if result.returncode != 0:
             raise ValueError(result.stderr[-500:])
         files = json.loads(result.stdout.strip() or "[]")

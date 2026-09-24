@@ -88,12 +88,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:20p
     <a class="back-link" href="/">← Back to library</a>
   </header>
 
-  <div class="page-title">⏱ Long Tracks <span class="badge count" id="lt-count">—</span></div>
-  <div class="page-sub">Tracks longer than 15 minutes — usually a Let's Play episode, a full album rip, or a DJ mix that slipped past the download-time checks. Whitelist a track to keep it and stop it showing up here again, or remove it to delete it from Navidrome entirely and stop it from ever being downloaded again.</div>
+  <div class="page-title">⏱ Long &amp; Broken-Duration Tracks <span class="badge count" id="lt-count">—</span></div>
+  <div class="page-sub">Tracks longer than 15 minutes — usually a Let's Play episode, a full album rip, or a DJ mix that slipped past the download-time checks — plus tracks Navidrome lists at exactly 0:00, which usually means it failed to read the file's duration at all (a truncated or corrupt download). Whitelist a track to keep it and stop it showing up here again, or remove it to delete it from Navidrome entirely and stop it from ever being downloaded again.</div>
 
   <div class="panel">
     <div class="panel-hd">
-      <span class="panel-title">Over 15 minutes</span>
+      <span class="panel-title">Flagged</span>
       <button class="btn btn-ghost" onclick="loadLongTracks()" id="refresh-btn">↺ Scan library</button>
     </div>
     <div id="lt-list"><div class="empty"><div class="spin"></div></div></div>
@@ -123,16 +123,20 @@ async function loadLongTracks(){
     document.getElementById('lt-count').textContent=items.length;
     const list=document.getElementById('lt-list');
     if(!items.length){
-      list.innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing over 15 minutes.</div>';
+      list.innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing over 15 minutes or stuck at 0:00.</div>';
       return;
     }
-    list.innerHTML=items.map(it=>`<div class="lt-item" data-id="${escA(it.id)}">
+    list.innerHTML=items.map(it=>{
+      const durLabel=it.reason==='zero_duration'
+        ?`0:00 <span style="color:var(--red)">(duration unreadable — likely corrupt/truncated)</span>`
+        :fmtDuration(it.duration);
+      return `<div class="lt-item" data-id="${escA(it.id)}">
       <div class="lt-hd">
         <div>
           <div class="lt-name">${esc(it.title||'Unknown title')}</div>
           <div class="lt-artist">${esc(it.artist||'Unknown artist')}</div>
           <div class="lt-meta">
-            ${it.album?`Album: ${esc(it.album)} · `:''}<span class="lt-dur">${fmtDuration(it.duration)}</span>
+            ${it.album?`Album: ${esc(it.album)} · `:''}<span class="lt-dur">${durLabel}</span>
           </div>
         </div>
       </div>
@@ -141,7 +145,8 @@ async function loadLongTracks(){
         <button class="btn btn-danger" onclick="removeTrack('${escA(it.id)}',this)">🗑 Remove &amp; blocklist</button>
       </div>
       <div class="lt-result"></div>
-    </div>`).join('');
+    </div>`;
+    }).join('');
   }catch(e){
     document.getElementById('lt-list').innerHTML=`<div class="empty">Failed to load: ${esc(e.message)}</div>`;
   }finally{
@@ -220,7 +225,7 @@ async function removeTrack(id,btn){
 function updateCountAfterRemoval(){
   const remaining=document.querySelectorAll('.lt-item').length;
   document.getElementById('lt-count').textContent=remaining;
-  if(!remaining)document.getElementById('lt-list').innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing over 15 minutes.</div>';
+  if(!remaining)document.getElementById('lt-list').innerHTML='<div class="empty"><div class="empty-icon">🎉</div>Nothing over 15 minutes or stuck at 0:00.</div>';
 }
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}

@@ -4267,8 +4267,14 @@ def library_long_tracks():
     """Scan the whole Navidrome library for tracks longer than
     LONG_TRACK_THRESHOLD_SEC (15 min) — these are usually a Let's Play
     episode, a full album/OST rip, or a DJ mix that slipped past the
-    download-time sanity checks (see spotidrome-wrong-track-bugs). Skips
-    anything already whitelisted as a legitimately long track."""
+    download-time sanity checks (see spotidrome-wrong-track-bugs) — PLUS
+    tracks Navidrome lists at exactly 0:00. A real audio file is never
+    genuinely zero-length; a 0 duration means Navidrome's own scanner
+    failed to read the file's duration at all (a truncated/corrupt
+    download, or a tag it couldn't parse), which is just as worth a look
+    as an implausibly long one — same review page, same whitelist/remove
+    actions, just a different "reason" this file got flagged. Skips
+    anything already whitelisted."""
     cfg = load_nd_config()
     if not cfg:
         return jsonify({"error": "Navidrome not configured"}), 400
@@ -4293,7 +4299,11 @@ def library_long_tracks():
         long_tracks = []
         for s in all_songs:
             duration = s.get("duration", 0) or 0
-            if duration <= LONG_TRACK_THRESHOLD_SEC:
+            if duration == 0:
+                reason = "zero_duration"
+            elif duration > LONG_TRACK_THRESHOLD_SEC:
+                reason = "long"
+            else:
                 continue
             if track_ignore_key(s.get("artist"), s.get("title")) in whitelist:
                 continue
@@ -4304,9 +4314,11 @@ def library_long_tracks():
                 "album": s.get("album", ""),
                 "album_artist": s.get("albumArtist") or s.get("artist", ""),
                 "duration": duration,
+                "reason": reason,
                 "bitRate": s.get("bitRate", 0),
                 "path": s.get("path", ""),
             })
+        # Longest first, then zero-duration entries grouped at the end.
         long_tracks.sort(key=lambda t: t["duration"], reverse=True)
 
         return jsonify({
@@ -4358,7 +4370,7 @@ def library_long_tracks_remove():
     ignored[key] = {
         "artist": artist, "title": title,
         "added_at": datetime.utcnow().isoformat(),
-        "reason": "Removed as a long track (> 15 min) via /library/long-tracks",
+        "reason": "Removed via /library/long-tracks (over 15 min, or listed at 0:00)",
     }
     save_ignored_tracks(ignored)
 

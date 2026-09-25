@@ -803,6 +803,16 @@ _ytmusic_disabled = False
 # its _ytmusic_lock. Held around both construction and every actual call.
 _ytmusic_lock = threading.Lock()
 
+class _TimeoutSession(http.Session):
+    """requests session for ytmusicapi with a default timeout. ytmusicapi never
+    passes one, so during a DNS/network outage (seen 2026-09-25: dockerd failing
+    to reach the upstream resolver) every call could block its thread forever -
+    the ThreadPoolExecutor timeouts around the calls only stop *waiting*, the
+    worker threads stay stuck and pile up."""
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", 15)
+        return super().request(*args, **kwargs)
+
 def _get_ytmusic():
     """Lazily construct a shared YTMusic client. If construction ever fails
     (e.g. no network at startup), disable it for the rest of the process
@@ -813,7 +823,7 @@ def _get_ytmusic():
     with _ytmusic_lock:
         if _ytmusic_client is None:
             try:
-                _ytmusic_client = YTMusic()
+                _ytmusic_client = YTMusic(requests_session=_TimeoutSession())
             except Exception as e:
                 print(f"[ytmusic] init failed, disabling YT Music search: {e}", file=sys.stderr)
                 _ytmusic_disabled = True
@@ -1174,18 +1184,18 @@ def _extract_yt_dlp_error(stderr):
 def run_yt_dlp(cmd, job_id, label, timeout=30):
     """
     Run a yt-dlp command with:
-    - os.nice(15) so gunicorn stays responsive
+    - nice 15 so gunicorn stays responsive
     - Hard wall-clock deadline
     - Skip flag support
     - Full process group kill on timeout/skip
     Returns (returncode, killed_reason, stdout, stderr) where killed_reason is None on success
     """
-    def _set_limits():
-        os.setsid()
-        os.nice(15)
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            preexec_fn=_set_limits)
+    # New session + low priority without preexec_fn: running Python code in the
+    # forked child (what preexec_fn does) can deadlock in this multi-threaded
+    # gunicorn worker, per the subprocess docs. start_new_session does the
+    # setsid() in C before exec, and `nice` is applied by the nice binary.
+    proc = subprocess.Popen(["nice", "-n", "15"] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
     deadline = time.time() + timeout
     killed_reason = None
 
@@ -1206,7 +1216,11 @@ def run_yt_dlp(cmd, job_id, label, timeout=30):
 
     if killed_reason:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # Never signal our own group (gunicorn itself) - only the child's session.
+            pgid = os.getpgid(proc.pid)
+            if pgid == os.getpgrp():
+                raise ProcessLookupError("child still in gunicorn's process group")
+            os.killpg(pgid, signal.SIGKILL)
         except Exception:
             try:
                 proc.kill()
@@ -2716,17 +2730,17 @@ NORMALIZE_WORKERS = 2  # matches this container's own CPU limit (see docker-comp
                        # the Navidrome host has only 1 core, which was the actual bottleneck
 
 
-def _nice():
-    """preexec_fn for the local ffmpeg calls below — this container also
-    serves live web/stream requests while up to NORMALIZE_WORKERS of these
-    run, so the CPU-bound encode work shouldn't get to starve it."""
-    os.nice(10)
+# Prefix for the local ffmpeg calls below - this container also serves live
+# web/stream requests while up to NORMALIZE_WORKERS of these run, so the
+# CPU-bound encode work shouldn't get to starve it. (A `nice` prefix rather
+# than preexec_fn=os.nice: preexec_fn can deadlock in a multi-threaded process.)
+_NICE = ["nice", "-n", "10"]
 
 
 def _measure_loudness(local_path):
     cmd = ["ffmpeg", "-i", local_path, "-af", LOUDNORM_FILTER + ":print_format=json",
            "-vn", "-f", "null", "-"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, preexec_fn=_nice)
+    r = subprocess.run(_NICE + cmd, capture_output=True, text=True, timeout=180)
     start = r.stderr.rfind("{")
     end = r.stderr.find("}", start) if start != -1 else -1
     if start == -1 or end == -1:
@@ -2801,7 +2815,7 @@ def _normalize_one_file_local(ssh_cfg, rel_path):
         )
         cmd = (["ffmpeg", "-y", "-i", local_in, "-af", render_filter, "-map_metadata", "-1", "-vn"]
                + codec_args + [local_out])
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=280, preexec_fn=_nice)
+        r = subprocess.run(_NICE + cmd, capture_output=True, text=True, timeout=280)
         if r.returncode != 0:
             return {"action": "failed", "reason": r.stderr[-300:], "rel_path": rel_path}
 
@@ -3486,7 +3500,7 @@ def lunadrome_search_videos(query, limit, exclude_ids):
            [f"ytsearch{limit}:{query}"])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         return []
     if result.returncode != 0:
         return []

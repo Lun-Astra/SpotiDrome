@@ -7,7 +7,7 @@ from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, error as ID3Error
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, TRCK, error as ID3Error
 from ytmusicapi import YTMusic
 
 app = Flask(__name__)
@@ -724,7 +724,8 @@ def lookup_genre(artist):
         _genre_cache[key] = genre
     return genre
 
-def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None, genre=None):
+def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None, genre=None,
+             track_number=None):
     album_artist = album_artist or artist
     try:
         if filepath.endswith('.flac'):
@@ -733,6 +734,8 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags["artist"] = [artist]
             tags["album"] = [album]
             tags["albumartist"] = [album_artist]
+            if track_number:
+                tags["tracknumber"] = [str(track_number)]
             if source_url:
                 tags["comment"] = [source_url]
             if genre:
@@ -753,6 +756,8 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags["TPE1"] = TPE1(encoding=3, text=artist)
             tags["TALB"] = TALB(encoding=3, text=album)
             tags["TPE2"] = TPE2(encoding=3, text=album_artist)
+            if track_number:
+                tags["TRCK"] = TRCK(encoding=3, text=str(track_number))
             if source_url:
                 tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=source_url)
             if genre:
@@ -1515,7 +1520,10 @@ def ytmusic_get_info(url):
     return entries
 
 def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
-                            sync_playlist=True, track_for_sync=True, album_hint=None):
+                            sync_playlist=True, track_for_sync=True, album_hint=None,
+                            complete_album=False, album_artist_hint=None):
+    # complete_album / album_artist_hint: see album_mode below - a whole album into
+    # one folder, tagged with one album artist + track numbers.
     # sync_playlist / track_for_sync: LunaDrome's "Download via SpotiDrome" sends
     # False for both — it only wants the songs/album in the library, not a
     # Navidrome playlist named after the download or an auto-sync entry.
@@ -1550,18 +1558,30 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
     downloaded_tracks = []
     yt_track_list = []
 
-    # Get ALL remote files once (global dedup across all playlists)
-    remote_dir = f"{ssh_cfg['music_path']}/{sanitize(playlist_name)}" if ssh_cfg else ""
-    remote_files = get_remote_files(remote_dir, ssh_cfg) if ssh_cfg else set()
-    remote_files_flat = get_all_remote_files(ssh_cfg) if ssh_cfg else set()
-    remote_title_index = _index_remote_files_by_title(remote_files_flat)
+    # complete_album (LunaDrome album downloads): the album should end up whole in
+    # its own album folder. Only a copy already *in that folder* counts as a
+    # duplicate - a track that exists elsewhere (a single, a compilation) still
+    # gets downloaded into the album. So an album that's partly in the library
+    # gets its missing tracks added; one that isn't gets created with all of them.
+    album_mode = bool(complete_album and album_hint)
+
+    if album_mode and ssh_cfg:
+        album_remote_dir = f"{ssh_cfg['music_path']}/{sanitize(album_hint)}"
+        remote_title_index = _index_remote_files_by_title(get_remote_files(album_remote_dir, ssh_cfg))
+    else:
+        # Get ALL remote files once (global dedup across all playlists)
+        remote_files_flat = get_all_remote_files(ssh_cfg) if ssh_cfg else set()
+        remote_title_index = _index_remote_files_by_title(remote_files_flat)
 
     for i, entry in enumerate(entries):
         track_id = entry.get("id") or entry.get("url", "")
         title = entry.get("title", "Unknown Title")
         artist = entry.get("uploader") or entry.get("channel") or entry.get("artist") or "Unknown Artist"
         artist = re.sub(r" - Topic$", "", artist)
-        album = entry.get("album") or entry.get("release") or album_hint or "Unknown Album"
+        if album_mode:
+            album = album_hint  # every track in the one album folder, under one album name
+        else:
+            album = entry.get("album") or entry.get("release") or album_hint or "Unknown Album"
         track_url = f"https://www.youtube.com/watch?v={track_id}" if not track_id.startswith("http") else track_id
 
         with job_lock:
@@ -1579,7 +1599,9 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
         # "full soundtrack" rips are commonly interleaved with unrelated content
         # (let's plays, trailers, etc.) by whoever uploaded them — so filter
         # those the same way the Spotify path's matcher does.
-        if is_playlist and any(kw in title.lower() for kw in NOT_MUSIC_KEYWORDS):
+        # (not for a LunaDrome album: an official YT Music album is curated, and a real
+        # track can be called "Review" or "Episode 1")
+        if is_playlist and not album_mode and any(kw in title.lower() for kw in NOT_MUSIC_KEYWORDS):
             with job_lock:
                 jobs[job_id]["log"].append(f"🚫 Skipped (looks like non-music content): {artist} - {title}")
             continue
@@ -1595,7 +1617,9 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
         # exact filename check.
         if _remote_duplicate_exists(t, remote_title_index):
             with job_lock:
-                jobs[job_id]["log"].append(f"⏭ Already on Navidrome: {artist} - {title}")
+                jobs[job_id]["log"].append(
+                    f"⏭ Already in this album: {artist} - {title}" if album_mode
+                    else f"⏭ Already on Navidrome: {artist} - {title}")
             downloaded_tracks.append(t)
             yt_track_list.append(t)
             continue
@@ -1679,7 +1703,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
                     jobs[job_id]["log"].append(f"✗ Failed (file missing after download): {artist} - {title}")
                     jobs[job_id]["failed"] += 1
                 continue
-            if is_playlist:
+            if is_playlist and not album_mode:
                 wrong_reason = _downloaded_file_looks_wrong(flac_path, title)
                 if wrong_reason:
                     try:
@@ -1708,10 +1732,20 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
                         f"🏷 Corrected artist: '{artist}' → '{better_artist}' (from the source's own metadata)")
                 artist = better_artist
                 t["artist"] = artist
-            genre = lookup_genre(artist)
-            fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
-            new_album, flac_path = maybe_correct_album(
-                flac_path, title, artist, album, playlist_name, track_url, local_dir)
+            if album_mode:
+                # One album artist for every track (a featured artist on one track
+                # would otherwise split it off into its own album in Navidrome), the
+                # album's genre, and the track number from the album's order.
+                album_artist = album_artist_hint or artist
+                genre = lookup_genre(album_artist)
+                fix_tags(flac_path, title, artist, album, album_artist=album_artist,
+                         source_url=track_url, genre=genre, track_number=i + 1)
+                new_album = album  # the album is known - no correction guessing
+            else:
+                genre = lookup_genre(artist)
+                fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
+                new_album, flac_path = maybe_correct_album(
+                    flac_path, title, artist, album, playlist_name, track_url, local_dir)
             if new_album != album:
                 with job_lock:
                     jobs[job_id]["log"].append(f"🏷 Corrected album: {album} → {new_album}")
@@ -3419,6 +3453,9 @@ def ytmusic_download():
     sync_playlist = bool(data.get("sync_playlist", True))
     track_for_sync = bool(data.get("track_for_sync", True))
     album_hint = (data.get("album") or "").strip() or None
+    album_artist_hint = (data.get("album_artist") or "").strip() or None
+    # A whole album into one album folder (see ytmusic_download_worker's album_mode).
+    complete_album = bool(data.get("complete_album", False))
     label = (data.get("job_label") or "").strip() or f"[YT] {playlist_name}"
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -3430,7 +3467,8 @@ def ytmusic_download():
     threading.Thread(target=ytmusic_download_worker,
                      args=(job_id, url, playlist_name, is_playlist),
                      kwargs={"sync_playlist": sync_playlist, "track_for_sync": track_for_sync,
-                             "album_hint": album_hint},
+                             "album_hint": album_hint, "complete_album": complete_album,
+                             "album_artist_hint": album_artist_hint},
                      daemon=True).start()
     return jsonify({"job_id": job_id})
 

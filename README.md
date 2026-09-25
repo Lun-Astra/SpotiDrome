@@ -40,3 +40,4 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
 ## Notes
 
 - Runtime state (tracked playlists, job history, dead-link/duplicate reports, schedule config) lives under `~/.ssh/` on the host, not in this repository.
+- **LunaDrome integration** ("Download via SpotiDrome" in the LunaDrome player): LunaDrome talks to the same `/api` the web UI uses (`http://<host>:8080/api`). `GET /search?q=` returns YouTube Music songs + albums and plain YouTube videos (Jamidrome's ranking: real releases first); `GET /search/album/<browseId>` returns an album's tracks and the playlist URL to download. Downloads go through `POST /ytmusic/download` with `sync_playlist: false, track_for_sync: false` (library only: no Navidrome playlist, no auto-sync entry), optionally `album` (album name hint) and `job_label`; progress via `GET /jobs/<id>`. There's no authentication - keep it on the internal network.

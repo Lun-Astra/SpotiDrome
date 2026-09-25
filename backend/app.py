@@ -507,8 +507,10 @@ def nd_sync_playlist(playlist_name, tracks, cfg, job_id=None):
         log(f"⚠ {len(not_found)} track(s) not matched")
     return len(song_ids), len(not_found)
 
-def batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, batch_tracks, job_id):
-    """Rsync current downloads to Navidrome, trigger scan, sync playlist, delete local files."""
+def batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, batch_tracks, job_id,
+                             sync_playlist=True):
+    """Rsync current downloads to Navidrome, trigger scan, sync playlist (unless
+    sync_playlist=False), delete local files."""
     if not os.path.exists(local_dir):
         return
     files = []
@@ -535,11 +537,12 @@ def batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, batch_tr
                 jobs[job_id]["log"].append(f"🔄 {msg}")
             if ok:
                 nd_wait_for_scan(nd_cfg, timeout=120)
-            try:
-                nd_sync_playlist(playlist_name, batch_tracks, nd_cfg, job_id)
-            except Exception as e:
-                with job_lock:
-                    jobs[job_id]["log"].append(f"⚠ Batch playlist sync error: {e}")
+            if sync_playlist:
+                try:
+                    nd_sync_playlist(playlist_name, batch_tracks, nd_cfg, job_id)
+                except Exception as e:
+                    with job_lock:
+                        jobs[job_id]["log"].append(f"⚠ Batch playlist sync error: {e}")
 
 # ─── Spotify ──────────────────────────────────────────────────────────────────
 
@@ -1497,7 +1500,14 @@ def ytmusic_get_info(url):
             pass
     return entries
 
-def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
+def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
+                            sync_playlist=True, track_for_sync=True, album_hint=None):
+    # sync_playlist / track_for_sync: LunaDrome's "Download via SpotiDrome" sends
+    # False for both — it only wants the songs/album in the library, not a
+    # Navidrome playlist named after the download or an auto-sync entry.
+    # album_hint: the album name when the caller already knows it (a YT Music
+    # album picked in LunaDrome), used instead of "Unknown Album" when the flat
+    # listing doesn't say.
     with job_lock:
         jobs[job_id]["status"] = "running"
 
@@ -1515,7 +1525,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
             jobs[job_id]["log"].append(f"✗ Failed to fetch info: {e}")
             jobs[job_id]["status"] = "done"
             jobs[job_id]["current_track"] = None
-        if is_playlist:
+        if is_playlist and track_for_sync:
             record_sync_health(yt_playlist_id(url), 0, 0, 0, status="failed")
         return
 
@@ -1537,7 +1547,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
         title = entry.get("title", "Unknown Title")
         artist = entry.get("uploader") or entry.get("channel") or entry.get("artist") or "Unknown Artist"
         artist = re.sub(r" - Topic$", "", artist)
-        album = entry.get("album") or entry.get("release") or "Unknown Album"
+        album = entry.get("album") or entry.get("release") or album_hint or "Unknown Album"
         track_url = f"https://www.youtube.com/watch?v={track_id}" if not track_id.startswith("http") else track_id
 
         with job_lock:
@@ -1583,7 +1593,8 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
             downloaded_tracks.append(t)
             yt_track_list.append(t)
             if len(downloaded_tracks) % 50 == 0 and ssh_cfg:
-                batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(downloaded_tracks), job_id)
+                batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(downloaded_tracks), job_id,
+                                         sync_playlist=sync_playlist)
             continue
 
         # Check skip flag
@@ -1700,7 +1711,8 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 jobs[job_id]["log"].append(f"✓ Downloaded{quality_note}: {artist} - {title}")
                 jobs[job_id]["downloaded"] += 1
             if len(downloaded_tracks) % 50 == 0 and ssh_cfg:
-                batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(downloaded_tracks), job_id)
+                batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(downloaded_tracks), job_id,
+                                         sync_playlist=sync_playlist)
         else:
             reason = _extract_yt_dlp_error(stderr) or f"yt-dlp exited with code {rc}"
             record_failed_track(failed_track_stub, failed_playlist_id, playlist_name, reason)
@@ -1708,7 +1720,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
                 jobs[job_id]["log"].append(f"✗ Failed ({reason}): {artist} - {title}")
                 jobs[job_id]["failed"] += 1
 
-    if is_playlist and yt_track_list:
+    if is_playlist and yt_track_list and track_for_sync:
         url_id = yt_playlist_id(url)
         data = load_tracked()
         data[url_id] = {
@@ -1755,23 +1767,24 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False):
             with job_lock:
                 jobs[job_id]["current_track"] = "Waiting for scan to finish…"
             nd_wait_for_scan(nd_cfg, timeout=300)
-        with job_lock:
-            jobs[job_id]["current_track"] = "Syncing playlist in Navidrome…"
-        try:
-            added, missing = nd_sync_playlist(playlist_name, downloaded_tracks, nd_cfg, job_id)
+        if sync_playlist:
             with job_lock:
-                jobs[job_id]["nd_synced"] = added
-                jobs[job_id]["nd_missing"] = missing
-        except Exception as e:
-            with job_lock:
-                jobs[job_id]["log"].append(f"⚠ Playlist sync error: {e}")
+                jobs[job_id]["current_track"] = "Syncing playlist in Navidrome…"
+            try:
+                added, missing = nd_sync_playlist(playlist_name, downloaded_tracks, nd_cfg, job_id)
+                with job_lock:
+                    jobs[job_id]["nd_synced"] = added
+                    jobs[job_id]["nd_missing"] = missing
+            except Exception as e:
+                with job_lock:
+                    jobs[job_id]["log"].append(f"⚠ Playlist sync error: {e}")
 
     with job_lock:
         jobs[job_id]["status"] = "done"
         jobs[job_id]["current_track"] = None
         downloaded_n, failed_n, total_n = jobs[job_id]["downloaded"], jobs[job_id]["failed"], jobs[job_id]["total"]
         save_jobs()
-    if is_playlist:
+    if is_playlist and track_for_sync:
         record_sync_health(yt_playlist_id(url), downloaded_n, failed_n, total_n)
 
 # ─── Auto-sync scheduler ──────────────────────────────────────────────────────
@@ -3387,16 +3400,172 @@ def ytmusic_download():
     url = data.get("url", "").strip()
     playlist_name = data.get("playlist_name", "YouTube Music")
     is_playlist = data.get("is_playlist", False)
+    # Optional (LunaDrome): library-only downloads - no Navidrome playlist, no
+    # auto-sync entry - plus a known album name and a readable job label.
+    sync_playlist = bool(data.get("sync_playlist", True))
+    track_for_sync = bool(data.get("track_for_sync", True))
+    album_hint = (data.get("album") or "").strip() or None
+    label = (data.get("job_label") or "").strip() or f"[YT] {playlist_name}"
     if not url:
         return jsonify({"error": "No URL provided"}), 400
     job_id = f"yt_{int(time.time()*1000)}"
     with job_lock:
-        jobs[job_id] = {"id": job_id, "playlist": f"[YT] {playlist_name}", "status": "pending",
+        jobs[job_id] = {"id": job_id, "playlist": label, "status": "pending",
                         "total": 0, "current": 0, "downloaded": 0, "failed": 0,
                         "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
     threading.Thread(target=ytmusic_download_worker,
-                     args=(job_id, url, playlist_name, is_playlist), daemon=True).start()
+                     args=(job_id, url, playlist_name, is_playlist),
+                     kwargs={"sync_playlist": sync_playlist, "track_for_sync": track_for_sync,
+                             "album_hint": album_hint},
+                     daemon=True).start()
     return jsonify({"job_id": job_id})
+
+
+# ─── Search (LunaDrome "Download via SpotiDrome") ─────────────────────────────
+# Interactive search for LunaDrome: YouTube Music songs + albums, then plain
+# YouTube videos for covers/live versions. Ranking mirrors Jamidrome's search:
+# YT Music's own "songs" category first (real releases, not reuploads/lyric
+# videos), plain YouTube only filling in what's left, deduped.
+
+def _yt_thumb(video_id):
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+def _best_thumbnail(thumbnails):
+    thumbs = thumbnails or []
+    return thumbs[-1].get("url") if thumbs else None
+
+def _ytm_call(fn, *args, timeout=12, **kwargs):
+    """Run one ytmusicapi call under the shared lock with a hard timeout
+    (ytmusicapi's HTTP calls have none of their own). None on any failure."""
+    ytm = _get_ytmusic()
+    if not ytm:
+        return None
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with _ytmusic_lock:  # serialize against every other caller of ytm — see _ytmusic_lock above
+            return executor.submit(getattr(ytm, fn), *args, **kwargs).result(timeout=timeout)
+    except Exception as e:
+        print(f"[search] ytmusic {fn} failed: {e}", file=sys.stderr)
+        return None
+    finally:
+        executor.shutdown(wait=False)
+
+def _search_words(s):
+    return {w for w in re.split(r"[^\w]+", (s or "").lower()) if len(w) > 2}
+
+def lunadrome_search_songs(query, limit):
+    results = _ytm_call("search", query, filter="songs", limit=limit) or []
+    query_words = _search_words(query)
+    out = []
+    for r in results:
+        video_id = r.get("videoId")
+        if not video_id:
+            continue
+        artists = ", ".join(a.get("name", "") for a in (r.get("artists") or []) if a.get("name"))
+        title = r.get("title") or "Unknown title"
+        # YT Music matches loosely ("linkin park faint" also returns Numb): the
+        # part of the query that isn't the artist's name has to relate to the
+        # title - unless the query was just an artist name.
+        leftover = query_words - _search_words(artists)
+        if leftover and not (leftover & _search_words(title)):
+            continue
+        out.append({
+            "video_id": video_id,
+            "title": title,
+            "artist": artists or "Unknown artist",
+            "album": (r.get("album") or {}).get("name"),
+            "duration": r.get("duration_seconds"),
+            "thumbnail": _yt_thumb(video_id),
+            "url": f"https://music.youtube.com/watch?v={video_id}",
+            "kind": "song",
+        })
+    return out[:limit]
+
+def lunadrome_search_videos(query, limit, exclude_ids):
+    cmd = (["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist"] + YTDLP_POT_ARGS +
+           [f"ytsearch{limit}:{query}"])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+    except subprocess.TimeoutExpired:
+        return []
+    if result.returncode != 0:
+        return []
+    out = []
+    for line in result.stdout.strip().split("\n"):
+        try:
+            e = json.loads(line) if line.strip() else None
+        except Exception:
+            e = None
+        if not e or not e.get("id") or e.get("id") in exclude_ids:
+            continue
+        out.append({
+            "video_id": e["id"],
+            "title": e.get("title") or "Unknown title",
+            "artist": re.sub(r" - Topic$", "", e.get("channel") or e.get("uploader") or "Unknown artist"),
+            "album": None,
+            "duration": e.get("duration"),
+            "thumbnail": _best_thumbnail(e.get("thumbnails")) or _yt_thumb(e["id"]),
+            "url": e.get("webpage_url") or f"https://www.youtube.com/watch?v={e['id']}",
+            "kind": "video",
+        })
+    return out
+
+def lunadrome_search_albums(query, limit):
+    results = _ytm_call("search", query, filter="albums", limit=limit) or []
+    out = []
+    for r in results:
+        browse_id = r.get("browseId")
+        if not browse_id:
+            continue
+        artists = ", ".join(a.get("name", "") for a in (r.get("artists") or []) if a.get("name"))
+        out.append({
+            "browse_id": browse_id,
+            "title": r.get("title") or "Unknown album",
+            "artist": artists or "Unknown artist",
+            "year": r.get("year"),
+            "type": r.get("type") or "Album",
+            "thumbnail": _best_thumbnail(r.get("thumbnails")),
+        })
+    return out[:limit]
+
+@app.route("/search")
+def lunadrome_search():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"songs": [], "albums": [], "videos": []})
+    limit = max(1, min(int(request.args.get("limit", 12)), 30))
+    songs = lunadrome_search_songs(q, limit)
+    albums = lunadrome_search_albums(q, max(4, limit // 2))
+    videos = lunadrome_search_videos(q, limit, {s["video_id"] for s in songs})
+    return jsonify({"songs": songs, "albums": albums, "videos": videos})
+
+@app.route("/search/album/<browse_id>")
+def lunadrome_search_album(browse_id):
+    album = _ytm_call("get_album", browse_id, timeout=15)
+    if not album:
+        return jsonify({"error": "Album not found"}), 404
+    playlist_id = album.get("audioPlaylistId")
+    artists = ", ".join(a.get("name", "") for a in (album.get("artists") or []) if a.get("name"))
+    tracks = []
+    for t in album.get("tracks") or []:
+        tracks.append({
+            "video_id": t.get("videoId"),
+            "title": t.get("title") or "Unknown title",
+            "artist": ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a.get("name")) or artists,
+            "duration": t.get("duration_seconds"),
+            "track_number": t.get("trackNumber"),
+        })
+    return jsonify({
+        "browse_id": browse_id,
+        "title": album.get("title") or "Unknown album",
+        "artist": artists or "Unknown artist",
+        "year": album.get("year"),
+        "thumbnail": _best_thumbnail(album.get("thumbnails")),
+        "track_count": album.get("trackCount") or len(tracks),
+        # What /ytmusic/download takes (is_playlist=true) to fetch the album.
+        "url": f"https://music.youtube.com/playlist?list={playlist_id}" if playlist_id else None,
+        "tracks": tracks,
+    })
 
 @app.route("/library/retag-genres", methods=["POST"])
 def retag_genres():

@@ -2527,40 +2527,41 @@ def prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg):
         else:
             file_error = result.stderr[-300:]
 
-    # Navidrome's own `album` table is a separate aggregate that doesn't
-    # get cleaned up alongside media_file either — found while building
-    # edition consolidation: ~8% of a real library turned out to be album
-    # rows with a real song_count on paper but zero actual media_file rows
-    # left pointing at them (from earlier deletions, before this function
-    # existed to do it properly). Same underlying pattern as the media_file
-    # husks above, just one table over — a scan alone doesn't reconcile it,
-    # only a direct delete does.
-    pruned_albums = 0
-    album_error = None
-    count_cmd = _ssh_cmd(ssh_cfg,
-        "sqlite3 /var/lib/navidrome/navidrome.db "
-        "\"SELECT COUNT(*) FROM album WHERE id NOT IN (SELECT DISTINCT album_id FROM media_file);\"")
-    result = subprocess.run(count_cmd, capture_output=True, text=True, timeout=20)
-    if result.returncode == 0:
+    # Navidrome's own `album` table can also be left with rows that have zero
+    # media_file rows pointing at them (found while building edition
+    # consolidation: ~8% of a real library at the time). These are only
+    # *counted* here, never deleted directly: Navidrome (0.61) purges empty
+    # albums itself during the scan below - verified on a throwaway library.
+    # A direct `DELETE FROM album` with the host's sqlite3 CLI is unsafe: the
+    # album_updated_at / album_created_at indexes are on datetime(...), and the
+    # CLI's SQLite rounds fractional seconds >= .9995 up where Navidrome's
+    # bundled SQLite doesn't, so the two compute different index keys. That
+    # mismatch broke every Navidrome scan that reached an affected album with
+    # "database disk image is malformed" from 2026-08-26 until 2026-09-25.
+    def _count_stale_albums():
+        count_cmd = _ssh_cmd(ssh_cfg,
+            "sqlite3 -readonly /var/lib/navidrome/navidrome.db "
+            "\"SELECT COUNT(*) FROM album WHERE id NOT IN (SELECT DISTINCT album_id FROM media_file);\"")
+        result = subprocess.run(count_cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode != 0:
+            return None, result.stderr[-300:]
         try:
-            pruned_albums = int(result.stdout.strip())
+            return int(result.stdout.strip()), None
         except ValueError:
-            pruned_albums = 0
-        if pruned_albums:
-            del_cmd = _ssh_cmd(ssh_cfg,
-                "sqlite3 /var/lib/navidrome/navidrome.db "
-                "\"DELETE FROM album WHERE id NOT IN (SELECT DISTINCT album_id FROM media_file);\"")
-            result = subprocess.run(del_cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                pruned_albums = 0
-                album_error = result.stderr[-300:]
-    else:
-        album_error = result.stderr[-300:]
+            return None, f"unexpected album count output: {result.stdout[-100:]!r}"
 
-    if (pruned_files or pruned_albums) and nd_cfg:
+    stale_albums, album_error = _count_stale_albums()
+
+    pruned_albums = 0
+    if (pruned_files or stale_albums) and nd_cfg:
         ok, _msg = nd_trigger_scan(nd_cfg, full=True)
         if ok:
             nd_wait_for_scan(nd_cfg, timeout=300)
+            if stale_albums:
+                remaining, err = _count_stale_albums()
+                if remaining is not None:
+                    pruned_albums = max(stale_albums - remaining, 0)
+                album_error = album_error or err
 
     return {"pruned": pruned_files, "entries": orphans, "pruned_albums": pruned_albums,
             "error": file_error or album_error}

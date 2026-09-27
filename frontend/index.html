@@ -314,6 +314,13 @@ header{
 
 /* Divider between sections */
 .section-gap{height:14px}
+
+.auto-sw{display:inline-flex;align-items:center;gap:6px;margin-top:5px;font-size:11px;color:var(--text3);cursor:pointer;user-select:none}
+.auto-sw input{display:none}
+.auto-sw span{position:relative;width:28px;height:16px;border-radius:8px;background:var(--bg4);border:1px solid var(--border2);transition:background .15s}
+.auto-sw span::after{content:'';position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;background:var(--text3);transition:transform .15s,background .15s}
+.auto-sw input:checked+span{background:rgba(139,92,246,.35)}
+.auto-sw input:checked+span::after{transform:translateX(12px);background:#a78bfa}
 </style>
 </head>
 <body>
@@ -495,6 +502,10 @@ header{
         <div class="settings-row">
           <div><div class="settings-label">Relabel Genres</div><div class="settings-sub">Rewrite every track's genre from Spotify (falls back to YouTube) — tags only, nothing re-downloaded</div></div>
           <button class="btn btn-nd" id="btn-relabel-genres" onclick="relabelGenres()" style="flex-shrink:0">🏷 Relabel</button>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-label">Fill in Track Numbers</div><div class="settings-sub">Looks up every album without track numbers (Spotify, falling back to YouTube Music) and adds the official track and disc numbers so albums play in order — only exact album + title matches, never overwrites existing numbers</div></div>
+          <button class="btn btn-nd" id="btn-fill-track-numbers" onclick="fillTrackNumbers()" style="flex-shrink:0">🔢 Fill in</button>
         </div>
         <div class="settings-row">
           <div><div class="settings-label">Normalize Volume</div><div class="settings-sub">Even out loudness across the whole library to the same target new downloads use</div></div>
@@ -1089,7 +1100,7 @@ async function saveSchedule(){
 async function runSyncNow(){await fetch(`${API}/schedule/run`,{method:'POST'});closeScheduleModal();setTimeout(renderJobs,1000);}
 
 // Settings modal
-function openSettingsModal(){loadYtdlpVersion();loadCookieStatus();loadApiKeys();document.getElementById('settings-modal').classList.add('show');}
+function openSettingsModal(){loadYtdlpVersion();loadCookieStatus();loadApiKeys();loadMaintenanceSchedule();document.getElementById('settings-modal').classList.add('show');}
 
 // ─── Access: API keys ───────────────────────────────────────────────────
 document.addEventListener('sd-session',e=>{document.getElementById('session-user').textContent=e.detail.user||'?';});
@@ -1153,6 +1164,41 @@ async function saveCookies(){
 }
 async function deleteCookies(){if(!confirm('Remove cookies?'))return;await fetch(`${API}/cookies/delete`,{method:'DELETE'});await loadCookieStatus();}
 
+// ─── Weekly automatic maintenance switches ─────────────────────────────
+// Each maintenance row gets an on/off switch for a weekly automatic run on
+// its own day; the manual button next to it keeps working as before.
+const AUTO_TASK_ROWS = {track_numbers:'#btn-fill-track-numbers', relabel_genres:'#btn-relabel-genres',
+  normalize_volume:'#btn-normalize-volume', fix_broken_entries:'#btn-prune-orphans',
+  consolidate_editions:'#btn-consolidate-editions', mismatched_tracks:'a[href="/mismatched-tracks.html"]'};
+async function loadMaintenanceSchedule(){
+  let sched;
+  try{const r=await fetch(`${API}/maintenance/schedule`);if(!r.ok)return;sched=await r.json();}catch(e){return;}
+  for(const [task,sel] of Object.entries(AUTO_TASK_ROWS)){
+    const btn=document.querySelector(sel),info=sched[task];if(!btn||!info)continue;
+    const label=btn.closest('.settings-row').firstElementChild;
+    let sw=label.querySelector('.auto-sw');
+    if(!sw){sw=document.createElement('label');sw.className='auto-sw';
+      sw.innerHTML=`<input type="checkbox" onchange="setAutoRun('${task}',this)"><span></span><em style="font-style:normal"></em>`;
+      label.appendChild(sw);}
+    sw.querySelector('input').checked=info.enabled;
+    sw.querySelector('em').textContent=`Run automatically every ${info.day}`+(info.last_run?` · last ${info.last_run}`:'');
+  }
+}
+async function setAutoRun(task,el){
+  try{const r=await fetch(`${API}/maintenance/schedule`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task,enabled:el.checked})});
+    if(!r.ok)el.checked=!el.checked;}catch(e){el.checked=!el.checked;}
+}
+async function fillTrackNumbers(){
+  const btn=document.getElementById('btn-fill-track-numbers');
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
+  try{
+    const r=await fetch(`${API}/library/fill-track-numbers`,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
+    renderJobs();
+  }catch(e){alert('Failed: '+e.message);}
+  finally{btn.disabled=false;btn.innerHTML=orig;}
+}
 async function relabelGenres(){
   if(!confirm('Scan the whole library and relabel genres (Spotify, falling back to YouTube)? This can take a while for a large library — progress shows up in Download Jobs.'))return;
   const btn=document.getElementById('btn-relabel-genres');

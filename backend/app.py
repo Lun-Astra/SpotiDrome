@@ -5685,5 +5685,266 @@ def health_summary():
         "title_duplicate_report": load_title_duplicate_report(),
     })
 
+# ─── Fill in Track Numbers ────────────────────────────────────────────────────
+# Tracks downloaded before track numbers were tagged (and tracks from sources
+# without them) have none. This looks each album up - Spotify first, else the
+# YT Music album of a track's own source video - and writes official track and
+# disc numbers. Safety rules (learned from the first library-wide run):
+# the album name must match exactly (normalized) and the title too; one source
+# per album (YT Music flattens multi-disc albums, so it's never mixed with
+# Spotify); two different songs getting the same number -> both skipped;
+# existing numbers are never overwritten; albums are grouped by folder+album,
+# not album artist (older files may lack that tag).
+_TN_INVENTORY_SCRIPT = r"""
+import os, json, sys
+from mutagen.flac import FLAC
+root = sys.argv[1]; out = []
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        if not f.lower().endswith(".flac"): continue
+        p = os.path.join(dp, f)
+        try:
+            t = FLAC(p); g = lambda k: (t.get(k) or [""])[0]
+            if g("tracknumber"): continue
+            out.append([os.path.relpath(p, root), g("album"), g("albumartist"), g("artist"), g("title"), g("comment") or g("purl")])
+        except Exception:
+            pass
+json.dump(out, sys.stdout)
+"""
+_TN_WRITE_SCRIPT = r"""
+import os, json, sys
+from mutagen.flac import FLAC
+root = sys.argv[1]; plan = json.load(sys.stdin); n = 0
+for rel, (disc, num) in plan.items():
+    try:
+        t = FLAC(os.path.join(root, rel))
+        if (t.get("tracknumber") or [""])[0]: continue
+        t["tracknumber"] = [str(num)]
+        if disc: t["discnumber"] = [str(disc)]
+        t.save(); n += 1
+    except Exception:
+        pass
+print(n)
+"""
+
+def _tn_norm(s):
+    s = re.sub(r"\s*[\(\[]\s*(feat\.?|ft\.?|with|prod\.?)\b[^\)\]]*[\)\]]", "", s or "", flags=re.I)
+    s = re.sub(r"\s+-\s+(feat\.?|ft\.?)\s.*$", "", s, flags=re.I)
+    return re.sub(r"[\W_]+", " ", s.lower()).strip()
+
+
+def _tn_video_id(src):
+    m = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", src or "")
+    return m.group(1) if m else None
+
+
+def tracknumber_worker(job_id):
+    def log(msg):
+        with job_lock:
+            jobs[job_id]["log"].append(msg)
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+    try:
+        ssh_cfg = load_ssh_config()
+        cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_TN_INVENTORY_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+        result = _run_remote_scan(cmd, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-300:] or "inventory failed")
+        rows = json.loads(result.stdout or "[]")
+        groups = {}
+        for rel, album, albumartist, artist, title, src in rows:
+            if album.strip().lower() in BAD_ALBUM_VALUES:
+                continue
+            groups.setdefault((rel.rsplit("/", 1)[0] if "/" in rel else "", album), []).append(
+                {"rel": rel, "albumartist": albumartist, "artist": artist, "title": title, "src": src})
+        log(f"ℹ {len(rows)} track(s) without a track number in {len(groups)} album(s)")
+        with job_lock:
+            jobs[job_id]["total"] = len(groups)
+        sp, _url = get_sp()
+        yt = _get_ytmusic()
+        plan = {}
+        for i, ((folder, album), tracks) in enumerate(sorted(groups.items())):
+            with job_lock:
+                jobs[job_id]["current"] = i + 1
+                jobs[job_id]["current_track"] = album
+                if jobs[job_id].get("cancel_requested"):
+                    log("⏹ Stopped by user request"); break
+            titles = {_tn_norm(t["title"]) for t in tracks}
+            chosen = {}
+            # 1) Spotify: exact album name, overlapping artists (or VA), contains our titles.
+            if sp:
+                aa = next((t["albumartist"] or t["artist"] for t in tracks if (t["albumartist"] or t["artist"])), "")
+                va = aa.strip().lower() in ("", "various artists")
+                q = f'album:"{album}"' + ("" if va else f' artist:"{primary_artist(aa)}"')
+                try:
+                    try:
+                        found = sp.search(q=q, type="album", limit=10)["albums"]["items"]
+                    except Exception:
+                        sp, _url = get_sp()   # access tokens expire after about an hour
+                        found = sp.search(q=q, type="album", limit=10)["albums"]["items"] if sp else []
+                    best = None
+                    for a in found:
+                        if _tn_norm(a["name"]) != _tn_norm(album):
+                            continue
+                        if not va and not (_artist_names(aa) & {x["name"].lower() for x in a["artists"]}):
+                            continue
+                        items, off = [], 0
+                        while True:
+                            page = sp.album_tracks(a["id"], limit=50, offset=off)
+                            items += page["items"]
+                            if not page.get("next"): break
+                            off += 50
+                        tl = {_tn_norm(t["name"]): (t["disc_number"], t["track_number"]) for t in items}
+                        hits = len(titles & set(tl))
+                        if hits and (best is None or hits > best[0]):
+                            best = (hits, tl)
+                    if best:
+                        chosen = {t["rel"]: best[1][_tn_norm(t["title"])] for t in tracks if _tn_norm(t["title"]) in best[1]}
+                except Exception as e:
+                    log(f"⚠ Spotify lookup failed for {album}: {e}")
+            # 2) Only when Spotify matched nothing: the YT Music album of a source video.
+            if not chosen:
+                vid = next((_tn_video_id(t["src"]) for t in tracks if _tn_video_id(t["src"])), None)
+                if vid and yt:
+                    try:
+                        wp = yt.get_watch_playlist(videoId=vid, limit=1)
+                        alb = ((wp.get("tracks") or [{}])[0].get("album") or {})
+                        if alb.get("id") and _tn_norm(alb.get("name")) == _tn_norm(album):
+                            full = yt.get_album(alb["id"])
+                            by_vid = {t.get("videoId"): t.get("trackNumber") for t in full["tracks"] if t.get("trackNumber")}
+                            by_title = {_tn_norm(t["title"]): t.get("trackNumber") for t in full["tracks"] if t.get("trackNumber")}
+                            for t in tracks:
+                                num = by_vid.get(_tn_video_id(t["src"])) or by_title.get(_tn_norm(t["title"]))
+                                if num:
+                                    chosen[t["rel"]] = (1, num)
+                    except Exception:
+                        pass
+            # 3) Two different songs with the same number -> skip both.
+            seen = {}
+            for rel, num in chosen.items():
+                seen.setdefault(num, set()).add(_tn_norm(next(t["title"] for t in tracks if t["rel"] == rel)))
+            for rel, num in chosen.items():
+                if len(seen[num]) == 1:
+                    plan[rel] = list(num)
+            time.sleep(0.1)
+        log(f"ℹ Found official numbers for {len(plan)} track(s)")
+        written = 0
+        if plan:
+            cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_TN_WRITE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+            r = subprocess.run(cmd, input=json.dumps(plan), capture_output=True, text=True, timeout=900)
+            written = int((r.stdout or "0").strip() or 0) if r.returncode == 0 else 0
+            if r.returncode != 0:
+                log(f"✗ Writing tags failed: {r.stderr[-200:]}")
+        log(f"✅ Done: {written} track(s) numbered, {len(rows) - written} left without a confident match")
+        nd_cfg = load_nd_config()
+        if written and nd_cfg:
+            ok, _msg = nd_trigger_scan(nd_cfg)
+            if ok:
+                log("🔄 Library scan triggered (subsonic)")
+    except Exception as e:
+        log(f"✗ {e}")
+    finally:
+        with job_lock:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["current_track"] = None
+        save_jobs()
+
+
+@app.route("/library/fill-track-numbers", methods=["POST"])
+def library_fill_track_numbers():
+    if not load_ssh_config():
+        return jsonify({"error": "SSH not configured"}), 400
+    job_id = f"track_numbers_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Track Numbers] Library", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0, "log": [], "current_track": None}
+    threading.Thread(target=tracknumber_worker, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+# ─── Weekly automatic maintenance ─────────────────────────────────────────────
+# Each Library Maintenance action can run automatically once a week, on its
+# own day (all off by default; the manual buttons stay). It runs after the
+# nightly auto-sync window and waits while any other job is still running.
+MAINTENANCE_SCHEDULE_FILE = "/root/.ssh/maintenance_schedule.json"
+MAINTENANCE_TASKS = {   # task -> (weekday 0=Mon, label, starter endpoint function name)
+    "track_numbers":       (0, "Fill in Track Numbers", "library_fill_track_numbers"),
+    "relabel_genres":      (1, "Relabel Genres", "retag_genres"),
+    "normalize_volume":    (2, "Normalize Volume", "normalize_volume"),
+    "fix_broken_entries":  (3, "Fix Broken Entries", "library_orphans_prune"),
+    "consolidate_editions": (4, "Consolidate Editions", "library_consolidate_editions"),
+    "mismatched_tracks":   (5, "Mismatched Tracks scan", "library_verify_tracks"),
+}
+MAINTENANCE_START_UTC_HOUR = 4   # after the default 03:00 UTC auto-sync
+
+
+def load_maintenance_schedule():
+    try:
+        with open(MAINTENANCE_SCHEDULE_FILE) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    for task in MAINTENANCE_TASKS:
+        cfg.setdefault(task, {"enabled": False, "last_run": None})
+    return cfg
+
+
+def save_maintenance_schedule(cfg):
+    with open(MAINTENANCE_SCHEDULE_FILE, "w") as f:
+        json.dump(cfg, f, indent=1)
+
+
+def _any_job_running():
+    with job_lock:
+        return any(j.get("status") != "done" for j in jobs.values())
+
+
+def maintenance_scheduler_loop():
+    while True:
+        time.sleep(300)
+        try:
+            now = datetime.utcnow()
+            if now.hour < MAINTENANCE_START_UTC_HOUR:
+                continue
+            cfg = load_maintenance_schedule()
+            today = now.strftime("%Y-%m-%d")
+            for task, (weekday, label, starter) in MAINTENANCE_TASKS.items():
+                entry = cfg[task]
+                if not entry.get("enabled") or now.weekday() != weekday or entry.get("last_run") == today:
+                    continue
+                if _any_job_running():
+                    break   # try again in 5 minutes
+                entry["last_run"] = today
+                save_maintenance_schedule(cfg)
+                print(f"[maintenance] starting weekly {label}", flush=True)
+                with app.test_request_context():
+                    globals()[starter]()
+        except Exception as e:
+            print(f"[maintenance] scheduler error: {e}", file=sys.stderr, flush=True)
+
+threading.Thread(target=maintenance_scheduler_loop, daemon=True).start()
+
+
+@app.route("/maintenance/schedule", methods=["GET"])
+def maintenance_schedule_get():
+    cfg = load_maintenance_schedule()
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    return jsonify({task: {"enabled": bool(cfg[task].get("enabled")), "last_run": cfg[task].get("last_run"),
+                           "day": days[wd], "label": label}
+                    for task, (wd, label, _s) in MAINTENANCE_TASKS.items()})
+
+
+@app.route("/maintenance/schedule", methods=["POST"])
+def maintenance_schedule_set():
+    data = request.json or {}
+    task = data.get("task")
+    if task not in MAINTENANCE_TASKS:
+        return jsonify({"error": "Unknown task"}), 400
+    cfg = load_maintenance_schedule()
+    cfg[task]["enabled"] = bool(data.get("enabled"))
+    save_maintenance_schedule(cfg)
+    return jsonify({"ok": True, "task": task, "enabled": cfg[task]["enabled"]})
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

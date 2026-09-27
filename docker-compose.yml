@@ -1,6 +1,8 @@
-version: "3.9"
 services:
   frontend:
+    # Prebuilt image (updated weekly by GitHub Actions); `docker compose up -d --build`
+    # builds it from ./frontend instead.
+    image: ghcr.io/lun-astra/spotidrome-frontend:latest
     build: ./frontend
     ports:
       - "8080:8080"
@@ -13,6 +15,7 @@ services:
     restart: unless-stopped
 
   backend:
+    image: ghcr.io/lun-astra/spotidrome-backend:latest
     build: ./backend
     ports:
       # Only reachable from this host: the reverse proxy and

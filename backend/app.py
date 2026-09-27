@@ -181,7 +181,7 @@ def _require_auth():
     if not who:
         return jsonify({"error": "Login required", "login_required": True}), 401
     # A logged-in browser sends its cookie on any request to this site - also
-    # ones another page (e.g. a sibling *.example.com site, which SameSite
+    # ones another page (e.g. a sibling subdomain of the same domain, which SameSite
     # treats as the same site) makes it send. So a change made with the cookie
     # must also carry the header our own pages add (auth.js); another origin
     # can't add a custom header without a CORS preflight, which fails for
@@ -553,8 +553,8 @@ def get_all_remote_files(cfg):
     look like it's missing, triggering a full redundant redownload of the
     whole library. 30s used to be the timeout; _VERIFY_SCAN_SCRIPT's
     comparable whole-library walk elsewhere in this file already needed
-    180s of headroom on this same (1 CPU/1GB, known to swap heavily)
-    Navidrome host, so 30s was thin margin even though a `find` over ~3300
+    180s of headroom on a small (low-CPU/low-RAM, swapping) Navidrome
+    host, so 30s was thin margin even though a `find` over a few thousand
     files measured well under a second when the host was idle — under any
     real contention (a concurrent rsync batch, Navidrome's own scan) 30s
     isn't a safe bet. Widened to match, and logs loudly on failure instead
@@ -586,12 +586,12 @@ def rsync_to_remote(local_dir, cfg, job_id=None, to_root=True):
     stayed stuck at status 'uploading' forever (nothing ever set it to
     'done'), and every tracked playlist after it in that run never got
     its turn at all, with no error surfaced anywhere except a Python
-    traceback in the container's stderr nobody was looking at. On the
-    underpowered Navidrome host (1 CPU/1GB RAM, known to swap heavily —
-    see muziekapp-open-issues) a big batch rsync taking longer than the
+    traceback in the container's stderr nobody was looking at. On an
+    underpowered Navidrome host (little CPU/RAM, swapping under load)
+    a big batch rsync taking longer than the
     600s timeout below is a completely realistic way to trigger this, and
-    is exactly what happened in practice (GitHub issue: 'Auto Sync
-    staying stuck on RSyncing' — the stuck job's own next-restart cleanup
+    is exactly what happened in practice (auto-sync stuck on "rsyncing"
+    — the stuck job's own next-restart cleanup
     mislabeled it as interrupted by a server restart, when the real cause
     was this uncaught timeout hours earlier)."""
     def log(msg):
@@ -642,7 +642,7 @@ def save_nd_config(url, user, password):
 # ─── Source Navidrome (someone else's server, browsed/pulled from) ─────────
 # Distinct from NAVIDROME_CONFIG_FILE above, which is always *this* app's
 # own sync destination. This is a second, independent Subsonic connection —
-# typically a friend's or another self-hosted Navidrome — used only to
+# typically another self-hosted Navidrome — used only to
 # browse its library and pull tracks from it into the destination above.
 # Same {url, user, password} shape, reuses nd_subsonic() by passing this
 # config in explicitly.
@@ -1153,9 +1153,8 @@ def _artist_ok(candidate_names, expected_artist):
 # e.g. "Missy Elliott"), and manual URL-paste retries can differ again. A
 # track saved via one path and later encountered via another silently failed
 # the exact match and got redownloaded from scratch — confirmed real cause
-# of a 1458-track "Liked Songs" sync redownloading things already in the
-# library (GitHub issue: "Spotidrome saying its downloading a song thats
-# already present"). Fixed by reusing the same _title_ok/_artist_ok fuzzy
+# of a large playlist sync redownloading things already in the library.
+# Fixed by reusing the same _title_ok/_artist_ok fuzzy
 # matchers already trusted elsewhere in this file, indexed by normalized
 # title first so a per-track check stays cheap (O(1) bucket lookup) instead
 # of rescanning the whole remote file list per track — important given the
@@ -1199,8 +1198,8 @@ def _duration_close(candidate_sec, expected_sec, pct=0.15, floor=15):
 # matcher entirely (the whole point is the user hands us an exact URL), so
 # nothing there ever ran _looks_like_non_music or a duration check against
 # it. In practice that let things like a full "let's play" episode get saved
-# and tagged as a 2-minute game OST track (confirmed: several Super Mario
-# Galaxy tracks turned out to be 20-30min commentary videos this way). This
+# and tagged as a 2-minute game OST track (confirmed: several game-soundtrack
+# tracks turned out to be 20-30min commentary videos this way). This
 # is the safety net for both of those paths, applied *after* download so it
 # can inspect the file yt-dlp actually produced instead of trusting the URL.
 #
@@ -1209,10 +1208,9 @@ def _duration_close(candidate_sec, expected_sec, pct=0.15, floor=15):
 # top of _artist_ok's pre-download channel-name check, since that only sees
 # the channel/uploader name, not the richer "artist" field yt-dlp's own
 # --add-metadata pulls from the video itself. Confirmed necessary: several
-# "Nullscape" tracks (artist DIGITAL DESCENDANT) turned out to be a
-# completely different artist's same-titled song — e.g. the track named
-# "Baby Face" was actually "Babyface & Kehlani - Seamless", embedded with
-# TAG:artist=Babyface, a title collision _title_ok alone can't catch.
+# tracks of one album turned out to be a completely different artist's
+# same-titled song (the downloaded file's own TAG:artist named the other
+# artist) - a title collision _title_ok alone can't catch.
 DURATION_MISMATCH_RATIO = 2.5
 DURATION_MISMATCH_FLOOR_SEC = 45
 
@@ -2126,7 +2124,7 @@ def auto_sync_worker():
             # This loop used to have no try/except at all — an uncaught
             # exception anywhere down the call chain (confirmed cause: a
             # slow rsync exceeding rsync_to_remote's 600s timeout, entirely
-            # plausible on the underpowered 1 CPU/1GB Navidrome host under
+            # plausible on an underpowered Navidrome host under
             # load) would kill this whole background thread right then and
             # there. That left the in-progress job stuck in a non-terminal
             # status forever (nothing downstream ever set it to "done"),
@@ -2715,14 +2713,12 @@ def _run_remote_scan(cmd, timeout=180, retries=1, retry_delay=5, **run_kwargs):
     SSH calls (genre scan, title-dedupe scan, orphan scan, verify scan) —
     retries once on failure before giving up. Added after a one-off, never
     reproduced 'ModuleNotFoundError: No module named mutagen' failure on
-    the Navidrome host (GitHub issue: 'Mutagen probleem met library scans')
-    — nothing on that host's package/apt/dpkg logs showed any actual
+    the Navidrome host — nothing on that host's package/apt/dpkg logs showed any actual
     change around the failure time, so the working theory is a transient
-    hiccup (the host is a 1 CPU/1GB box that's known to swap heavily under
-    load — see muziekapp-open-issues) rather than a real, lasting
+    hiccup (a small host swapping under load) rather than a real, lasting
     environment break. A single retry costs nothing when the scan already
     succeeds, and turns a one-off blip into a non-event instead of a
-    failed job Luna has to notice and manually re-run."""
+    failed job someone has to notice and manually re-run."""
     last_result = None
     for attempt in range(retries + 1):
         last_result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **run_kwargs)
@@ -3018,8 +3014,8 @@ def genre_relabel_worker(job_id):
 # 2026-08-27: this used to run entirely over SSH on the Navidrome host —
 # one Python process per file, doing both the measure and encode ffmpeg
 # passes remotely. Very slow in practice, and the reason turned out to be
-# the Navidrome host itself: it has exactly 1 CPU core and 1GB RAM, so
-# 3000+ files' worth of CPU-bound ffmpeg work was always going to run at
+# the Navidrome host itself: a single-core, low-RAM box, so
+# thousands of files' worth of CPU-bound ffmpeg work was always going to run at
 # whatever a single core allows, one file after another, no matter how the
 # code was written. This container has 2 cores and isn't also trying to
 # stay responsive for live streaming at the same time — so the actual
@@ -4054,8 +4050,8 @@ def find_edition_families(albums):
 # genuine multi-edition split in Navidrome's UI, but has nothing to do with
 # edition suffixes — it's the same physical release, same folder, same
 # "album" tag, just one or a few tracks carrying a different (or missing)
-# ALBUMARTIST than the rest. Confirmed root cause of "Nullscape Vol. 2/3
-# tracks aren't joining the rest of the album" (2026-08-31): a track's
+# ALBUMARTIST than the rest. Confirmed root cause of "some tracks of an
+# album don't join the rest of it": a track's
 # ALBUMARTIST tag was either never set (legacy download, predates fix_tags'
 # `album_artist or artist` fallback) or, ironically, set *by a manual
 # /failed/retry fix* that didn't pass through the album's real album_artist
@@ -5488,8 +5484,7 @@ def flag_wrong_track():
     """Replace a track that's already in the library but turned out to be
     the wrong audio under a correct-looking name — most often a title
     collision with a different artist's or soundtrack's same-titled song
-    (see the Nullscape Vol. 1-3 fixes: Baby Face, Dimension, Self Destruct,
-    Find your Flame). Unlike /failed/retry, this track was never a recorded
+    (see the title-collision checks above). Unlike /failed/retry, this track was never a recorded
     failure — the original download looked successful — so the caller
     supplies the track's own expected metadata directly instead of a
     failed_tracks key, and the existing file gets deleted up front rather

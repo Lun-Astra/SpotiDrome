@@ -31,11 +31,32 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
    - `NAVIDROME_URL` / `NAVIDROME_USER` / `NAVIDROME_PASSWORD` — your Navidrome instance's admin credentials.
    - `SSH_HOST` / `SSH_USER` / `SSH_PORT` / `SSH_MUSIC_PATH` — SSH access to the machine hosting Navidrome's music folder, so downloaded files can be rsynced over.
 2. Place an SSH private key (`id_rsa`) authorized on the Navidrome host at `~/.ssh/id_rsa` on the machine running SpotiDrome — it's bind-mounted into the backend container and also doubles as the persistent storage location for the app's runtime state (tracked playlists, job history, schedule config, etc.).
-3. Build and start:
+3. Start it with the prebuilt images:
    ```bash
-   docker compose up -d --build
+   docker compose pull && docker compose up -d
    ```
+   (or build them yourself from this checkout: `docker compose up -d --build`)
 4. Open `http://<host>:8080`, log in with a Navidrome **admin** account, authenticate with Spotify, and start tracking playlists.
+
+## Updating
+
+Prebuilt images for `linux/amd64` and `linux/arm64` are published to GitHub Container Registry by `.github/workflows/docker-images.yml`:
+
+| Image | |
+|---|---|
+| `ghcr.io/lun-astra/spotidrome-backend` | Flask API + download pipeline |
+| `ghcr.io/lun-astra/spotidrome-frontend` | nginx + web UI |
+
+- `:latest` is rebuilt on every push to `main` **and every week** from scratch, so security fixes in the base images and the newest yt-dlp / ytmusicapi (YouTube breaks old versions regularly) arrive even when the code hasn't changed.
+- `:<version>` / `:<major>.<minor>` exist for release tags (`v1.2.3`) if you'd rather pin; change the tag in `docker-compose.yml`.
+
+To update, from the folder with `docker-compose.yml`:
+```bash
+docker compose pull && docker compose up -d
+```
+Your settings and state are untouched: they live in `.env` and `~/.ssh/` on the host, not in the images. To update automatically, run that on a schedule (cron) or use [Watchtower](https://containrrr.dev/watchtower/); [Diun](https://crazymax.dev/diun/) only notifies.
+
+The images contain no configuration or secrets: `.env`, the SSH key and all runtime state are mounted at runtime (see `.dockerignore`).
 
 ## Access & API keys
 

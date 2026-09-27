@@ -74,6 +74,7 @@ SpotiDrome can be exposed to the internet: every API route is deny-by-default in
 ## Notes
 
 - Runtime state (tracked playlists, job history, dead-link/duplicate reports, schedule config) lives under `~/.ssh/` on the host, not in this repository.
+- **Albums are recognised by ID, not only by name.** Spotify downloads store the Spotify album ID (`SPOTIFY_ALBUM_ID`) and the track's ISRC in the tags. A new track whose album ID is already in the library joins that album under the library's existing name, folder and album artist, even after the album was renamed on Spotify. *Fill in Track Numbers* also adds album IDs to existing tracks it can match.
 - **Album names stay consistent with the library.** Streaming services rename and re-spell releases over time (e.g. `X, Vol. 5 (Music from ...)` later becoming `Songs Part Five`, or `Rwby` vs `RWBY`). Before a download picks its album, SpotiDrome reuses an existing album folder whose name only differs in upper/lower case, and applies rename rules from `~/.ssh/album_aliases.json`:
   ```json
   {"Songs Part Five": {"album": "My Album, Vol. 5", "folder": "My Album, Vol. 5", "only_artist": ["Some Artist"]}}

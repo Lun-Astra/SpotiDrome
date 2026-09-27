@@ -7,7 +7,7 @@ from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, TRCK, TPOS, error as ID3Error
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, TRCK, TPOS, TXXX, TSRC, error as ID3Error
 from ytmusicapi import YTMusic
 
 app = Flask(__name__)
@@ -848,6 +848,8 @@ def fetch_playlist_tracks(sp, playlist_id):
                            "album": t["album"]["name"],
                            "album_artist": ", ".join(a["name"] for a in t["album"]["artists"] if a.get("name")),
                            "track_number": t.get("track_number"),
+                           "spotify_album_id": t["album"].get("id"),
+                           "isrc": (t.get("external_ids") or {}).get("isrc"),
                            "disc_number": t.get("disc_number"),
                            "duration_ms": t["duration_ms"],
                            "image": t["album"]["images"][0]["url"] if t["album"].get("images") else None})
@@ -928,6 +930,44 @@ def canonical_album(album, naming, artist=None):
         # change the name (a folder can't hold characters like ':' or '/').
         return (existing if sanitize(album) == album else album), existing
     return album, sanitize(album)
+
+
+_ALBUM_ID_INDEX_SCRIPT = r"""
+import os, json, sys
+from mutagen.flac import FLAC
+root = sys.argv[1]; out = {}
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        if not f.lower().endswith(".flac"): continue
+        try:
+            t = FLAC(os.path.join(dp, f)); aid = (t.get("spotify_album_id") or [""])[0]
+            if aid and aid not in out:
+                out[aid] = [(t.get("album") or [""])[0], (t.get("albumartist") or [""])[0], os.path.relpath(dp, root)]
+        except Exception:
+            pass
+json.dump(out, sys.stdout)
+"""
+
+
+def library_album_for_spotify_id(album_id, naming, ssh_cfg):
+    """(album tag, folder, album artist) the library already uses for this
+    Spotify album ID, else None. Albums get renamed on Spotify over time
+    ("RWBY, Vol. 1 (Music from ...)" became "Songs Part One"), but the ID
+    stays, so a new track of a renamed album still joins the album the
+    library already has - no rename rule needed. One remote scan per run,
+    only when a track actually carries an ID."""
+    if not album_id or not naming or not ssh_cfg:
+        return None
+    if "spotify_ids" not in naming:
+        try:
+            cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_ALBUM_ID_INDEX_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+            r = _run_remote_scan(cmd, timeout=600)
+            naming["spotify_ids"] = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+        except Exception as e:
+            print(f"[albums] album-ID index failed: {e}", file=sys.stderr)
+            naming["spotify_ids"] = {}
+    hit = naming["spotify_ids"].get(album_id)
+    return tuple(hit) if hit and hit[0] else None
 
 
 def _artist_names(s):
@@ -1101,7 +1141,7 @@ def lookup_genre(artist):
     return genre
 
 def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None, genre=None,
-             track_number=None, disc_number=None):
+             track_number=None, disc_number=None, spotify_album_id=None, isrc=None):
     album_artist = album_artist or artist
     try:
         if filepath.endswith('.flac'):
@@ -1114,6 +1154,10 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
                 tags["tracknumber"] = [str(track_number)]
             if disc_number:
                 tags["discnumber"] = [str(disc_number)]
+            if spotify_album_id:
+                tags["spotify_album_id"] = [spotify_album_id]
+            if isrc:
+                tags["isrc"] = [isrc]
             if source_url:
                 tags["comment"] = [source_url]
             if genre:
@@ -1138,6 +1182,10 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
                 tags["TRCK"] = TRCK(encoding=3, text=str(track_number))
             if disc_number:
                 tags["TPOS"] = TPOS(encoding=3, text=str(disc_number))
+            if spotify_album_id:
+                tags["TXXX:SPOTIFY_ALBUM_ID"] = TXXX(encoding=3, desc="SPOTIFY_ALBUM_ID", text=spotify_album_id)
+            if isrc:
+                tags["TSRC"] = TSRC(encoding=3, text=isrc)
             if source_url:
                 tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=source_url)
             if genre:
@@ -1685,10 +1733,15 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
 
         filename = sanitize(f"{track['artist']} - {track['name']}")
         source_album = track['album']
-        track['album'], album_folder = canonical_album(
-            source_album, naming, track.get('album_artist') or track['artist'])
-        track['album_artist'] = library_album_artist(
-            track['album'], f"{track['artist']}, {track.get('album_artist') or ''}", naming) or track.get('album_artist')
+        by_id = library_album_for_spotify_id(track.get('spotify_album_id'), naming, ssh_cfg)
+        if by_id:
+            track['album'], album_folder, existing_aa = by_id
+            track['album_artist'] = existing_aa or track.get('album_artist')
+        else:
+            track['album'], album_folder = canonical_album(
+                source_album, naming, track.get('album_artist') or track['artist'])
+            track['album_artist'] = library_album_artist(
+                track['album'], f"{track['artist']}, {track.get('album_artist') or ''}", naming) or track.get('album_artist')
         album_dir = os.path.join(local_dir, album_folder)
         os.makedirs(album_dir, exist_ok=True)
         out_template = os.path.join(album_dir, f"{filename}.%(ext)s")
@@ -1792,7 +1845,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                             f"🏷 Album: {source_album} → {track['album']} (as it's named in the library)")
                 fix_tags(flac_path, track['name'], track['artist'], track['album'],
                          album_artist=track.get('album_artist'), source_url=source_url, genre=genre,
-                         track_number=track.get('track_number'), disc_number=track.get('disc_number'))
+                         track_number=track.get('track_number'), disc_number=track.get('disc_number'),
+                         spotify_album_id=track.get('spotify_album_id'), isrc=track.get('isrc'))
                 new_album, flac_path = maybe_correct_album(
                     flac_path, track['name'], track['artist'], track['album'],
                     playlist_name, source_url, local_dir, album_artist=track.get('album_artist'),
@@ -5705,8 +5759,8 @@ for dp, dn, fn in os.walk(root):
         p = os.path.join(dp, f)
         try:
             t = FLAC(p); g = lambda k: (t.get(k) or [""])[0]
-            if g("tracknumber"): continue
-            out.append([os.path.relpath(p, root), g("album"), g("albumartist"), g("artist"), g("title"), g("comment") or g("purl")])
+            if g("tracknumber") and g("spotify_album_id"): continue
+            out.append([os.path.relpath(p, root), g("album"), g("albumartist"), g("artist"), g("title"), g("comment") or g("purl"), bool(g("tracknumber"))])
         except Exception:
             pass
 json.dump(out, sys.stdout)
@@ -5715,13 +5769,15 @@ _TN_WRITE_SCRIPT = r"""
 import os, json, sys
 from mutagen.flac import FLAC
 root = sys.argv[1]; plan = json.load(sys.stdin); n = 0
-for rel, (disc, num) in plan.items():
+for rel, (disc, num, aid) in plan.items():
     try:
-        t = FLAC(os.path.join(root, rel))
-        if (t.get("tracknumber") or [""])[0]: continue
-        t["tracknumber"] = [str(num)]
-        if disc: t["discnumber"] = [str(disc)]
-        t.save(); n += 1
+        t = FLAC(os.path.join(root, rel)); changed = False
+        if num and not (t.get("tracknumber") or [""])[0]:
+            t["tracknumber"] = [str(num)]; changed = True
+            if disc: t["discnumber"] = [str(disc)]
+        if aid and not (t.get("spotify_album_id") or [""])[0]:
+            t["spotify_album_id"] = [aid]; changed = True
+        if changed: t.save(); n += 1
     except Exception:
         pass
 print(n)
@@ -5752,12 +5808,12 @@ def tracknumber_worker(job_id):
             raise RuntimeError(result.stderr[-300:] or "inventory failed")
         rows = json.loads(result.stdout or "[]")
         groups = {}
-        for rel, album, albumartist, artist, title, src in rows:
+        for rel, album, albumartist, artist, title, src, numbered in rows:
             if album.strip().lower() in BAD_ALBUM_VALUES:
                 continue
             groups.setdefault((rel.rsplit("/", 1)[0] if "/" in rel else "", album), []).append(
-                {"rel": rel, "albumartist": albumartist, "artist": artist, "title": title, "src": src})
-        log(f"ℹ {len(rows)} track(s) without a track number in {len(groups)} album(s)")
+                {"rel": rel, "albumartist": albumartist, "artist": artist, "title": title, "src": src, "numbered": numbered})
+        log(f"ℹ {len(rows)} track(s) without a track number or album ID in {len(groups)} album(s)")
         with job_lock:
             jobs[job_id]["total"] = len(groups)
         sp, _url = get_sp()
@@ -5797,13 +5853,14 @@ def tracknumber_worker(job_id):
                         tl = {_tn_norm(t["name"]): (t["disc_number"], t["track_number"]) for t in items}
                         hits = len(titles & set(tl))
                         if hits and (best is None or hits > best[0]):
-                            best = (hits, tl)
+                            best = (hits, tl, a["id"])
                     if best:
-                        chosen = {t["rel"]: best[1][_tn_norm(t["title"])] for t in tracks if _tn_norm(t["title"]) in best[1]}
+                        chosen = {t["rel"]: best[1][_tn_norm(t["title"])] + (best[2],)
+                                  for t in tracks if _tn_norm(t["title"]) in best[1]}
                 except Exception as e:
                     log(f"⚠ Spotify lookup failed for {album}: {e}")
             # 2) Only when Spotify matched nothing: the YT Music album of a source video.
-            if not chosen:
+            if not chosen and not all(t["numbered"] for t in tracks):
                 vid = next((_tn_video_id(t["src"]) for t in tracks if _tn_video_id(t["src"])), None)
                 if vid and yt:
                     try:
@@ -5816,16 +5873,18 @@ def tracknumber_worker(job_id):
                             for t in tracks:
                                 num = by_vid.get(_tn_video_id(t["src"])) or by_title.get(_tn_norm(t["title"]))
                                 if num:
-                                    chosen[t["rel"]] = (1, num)
+                                    chosen[t["rel"]] = (1, num, None)
                     except Exception:
                         pass
             # 3) Two different songs with the same number -> skip both.
             seen = {}
-            for rel, num in chosen.items():
-                seen.setdefault(num, set()).add(_tn_norm(next(t["title"] for t in tracks if t["rel"] == rel)))
-            for rel, num in chosen.items():
-                if len(seen[num]) == 1:
-                    plan[rel] = list(num)
+            numbered = {t["rel"] for t in tracks if t["numbered"]}
+            for rel, v in chosen.items():
+                seen.setdefault(v[:2], set()).add(_tn_norm(next(t["title"] for t in tracks if t["rel"] == rel)))
+            for rel, (disc, num, aid) in chosen.items():
+                if len(seen[(disc, num)]) == 1 or rel in numbered:
+                    # an already-numbered track only gets its album ID
+                    plan[rel] = [None, None, aid] if rel in numbered else [disc, num, aid]
             time.sleep(0.1)
         log(f"ℹ Found official numbers for {len(plan)} track(s)")
         written = 0
@@ -5835,7 +5894,7 @@ def tracknumber_worker(job_id):
             written = int((r.stdout or "0").strip() or 0) if r.returncode == 0 else 0
             if r.returncode != 0:
                 log(f"✗ Writing tags failed: {r.stderr[-200:]}")
-        log(f"✅ Done: {written} track(s) numbered, {len(rows) - written} left without a confident match")
+        log(f"✅ Done: {written} track(s) updated (numbers and/or Spotify album IDs), {len(rows) - written} without a confident match")
         nd_cfg = load_nd_config()
         if written and nd_cfg:
             ok, _msg = nd_trigger_scan(nd_cfg)

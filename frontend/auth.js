@@ -7,15 +7,23 @@
   function toLogin(){
     location.href = '/login.html?next=' + encodeURIComponent(location.pathname + location.search);
   }
-  // Any API call that comes back "login required" (session expired, logged
-  // out in another tab) sends the page to the login screen. Other 401s - e.g.
-  // Spotify needing a reconnect - carry no login_required and pass through.
-  window.fetch = (url, opts) => _fetch(url, opts).then(r => {
-    if(r.status === 401 && typeof url === 'string' && url.startsWith('/api/') && !url.startsWith('/api/session')){
-      r.clone().json().then(d => { if(d && d.login_required) toLogin(); }).catch(() => {});
+  // Every /api call gets the X-SD-Web header the backend requires for changes
+  // made with the login cookie (CSRF guard). Any API call that comes back
+  // "login required" (session expired, logged out in another tab) sends the
+  // page to the login screen. Other 401s - e.g. Spotify needing a reconnect -
+  // carry no login_required and pass through.
+  window.fetch = (url, opts = {}) => {
+    const isApi = typeof url === 'string' && url.startsWith('/api/');
+    if(isApi){
+      opts = {...opts, headers: {...(opts.headers || {}), 'X-SD-Web': '1'}};
     }
-    return r;
-  });
+    return _fetch(url, opts).then(r => {
+      if(r.status === 401 && isApi && !url.startsWith('/api/session')){
+        r.clone().json().then(d => { if(d && d.login_required) toLogin(); }).catch(() => {});
+      }
+      return r;
+    });
+  };
   window.sdLogout = async () => {
     try{ await _fetch('/api/session/logout', {method: 'POST'}); }catch(e){}
     toLogin();

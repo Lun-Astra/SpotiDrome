@@ -180,6 +180,15 @@ def _require_auth():
     who = _identify()
     if not who:
         return jsonify({"error": "Login required", "login_required": True}), 401
+    # A logged-in browser sends its cookie on any request to this site - also
+    # ones another page (e.g. a sibling *.example.com site, which SameSite
+    # treats as the same site) makes it send. So a change made with the cookie
+    # must also carry the header our own pages add (auth.js); another origin
+    # can't add a custom header without a CORS preflight, which fails for
+    # credentialed requests here.
+    if who["via"] == "session" and request.method not in ("GET", "HEAD") \
+            and request.headers.get("X-SD-Web") != "1":
+        return jsonify({"error": "Missing X-SD-Web header"}), 403
     if route in SESSION_ONLY_ROUTES and who["via"] != "session":
         return jsonify({"error": "Managing API keys needs a web login, not an API key"}), 403
     allowed = API_KEY_SCOPES.get(who["scope"])

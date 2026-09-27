@@ -74,4 +74,10 @@ SpotiDrome can be exposed to the internet: every API route is deny-by-default in
 ## Notes
 
 - Runtime state (tracked playlists, job history, dead-link/duplicate reports, schedule config) lives under `~/.ssh/` on the host, not in this repository.
+- **Album names stay consistent with the library.** Streaming services rename and re-spell releases over time (e.g. `X, Vol. 5 (Music from ...)` later becoming `Songs Part Five`, or `Rwby` vs `RWBY`). Before a download picks its album, SpotiDrome reuses an existing album folder whose name only differs in upper/lower case, and applies rename rules from `~/.ssh/album_aliases.json`:
+  ```json
+  {"Songs Part Five": {"album": "My Album, Vol. 5", "folder": "My Album, Vol. 5", "only_artist": ["Some Artist"]}}
+  ```
+  Keys are source album names (case-insensitive); `folder` is only needed when an existing folder's name differs from the album tag; `only_artist` limits the rule to tracks whose (album) artist contains one of the names. Renaming happens in the job log as `🏷 Album: … → …`.
+- Spotify downloads are tagged with Spotify's track and disc numbers, so albums play in order. (Tracks from plain YouTube playlists carry no album position, except LunaDrome's whole-album downloads.)
 - **LunaDrome integration** ("Download via SpotiDrome" in the LunaDrome player): LunaDrome talks to the same `/api` the web UI uses (`http://<host>:8080/api`). `GET /search?q=` returns YouTube Music songs + albums and plain YouTube videos (Jamidrome's ranking: real releases first); `GET /search/album/<browseId>` returns an album's tracks and the playlist URL to download. Downloads go through `POST /ytmusic/download` with `sync_playlist: false, track_for_sync: false` (library only: no Navidrome playlist, no auto-sync entry), optionally `album` (album name hint) and `job_label`; for a whole album also `complete_album: true` + `album_artist` (every track goes into that album's folder even if it exists elsewhere, e.g. as a single - only a copy already in that folder is skipped - tagged with one album artist and track numbers); progress via `GET /jobs/<id>`. LunaDrome authenticates with an API key (see **Access & API keys**).

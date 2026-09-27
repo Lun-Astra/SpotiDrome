@@ -7,7 +7,7 @@ from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, TRCK, error as ID3Error
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, TRCK, TPOS, error as ID3Error
 from ytmusicapi import YTMusic
 
 app = Flask(__name__)
@@ -847,6 +847,8 @@ def fetch_playlist_tracks(sp, playlist_id):
                            "artist": ", ".join(a["name"] for a in t["artists"] if a.get("name")),
                            "album": t["album"]["name"],
                            "album_artist": ", ".join(a["name"] for a in t["album"]["artists"] if a.get("name")),
+                           "track_number": t.get("track_number"),
+                           "disc_number": t.get("disc_number"),
                            "duration_ms": t["duration_ms"],
                            "image": t["album"]["images"][0]["url"] if t["album"].get("images") else None})
         if not batch["next"]: break
@@ -857,6 +859,75 @@ def fetch_playlist_tracks(sp, playlist_id):
 
 def sanitize(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name)
+
+# ─── Album naming consistency ─────────────────────────────────────────────────
+# Streaming services rename and re-spell releases over time - e.g. a
+# soundtrack series first published as "X, Vol. 5 (Music from ...)" and
+# later retitled "Songs Part Five", or the same album spelled "Rwby" in one
+# source and "RWBY" in another. Downloads just copied whatever name the
+# source had at that moment, so one album could end up split across several
+# names (and folders) in the library. canonical_album() picks the name a new
+# track's album gets, consistent with what the library already has.
+ALBUM_ALIASES_FILE = "/root/.ssh/album_aliases.json"
+
+
+def get_remote_album_dirs(cfg):
+    """Names of the top-level album folders in the music library (one SSH call)."""
+    try:
+        cmd = ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(cfg["port"]),
+               "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+               f"{cfg['user']}@{cfg['host']}",
+               f"find '{cfg['music_path']}' -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return {line for line in result.stdout.splitlines() if line.strip()}
+    except Exception as e:
+        print(f"[albums] listing album folders failed: {e}", file=sys.stderr)
+        return set()
+
+
+def load_album_naming(ssh_cfg):
+    """What canonical_album() needs, loaded once per download run: the rename
+    rules from ALBUM_ALIASES_FILE and the library's existing album folders.
+
+    album_aliases.json maps a source album name (case-insensitive) to the name
+    it should get in this library, either as a plain string or as
+      {"album": "<album tag>", "folder": "<existing folder, if its name differs>",
+       "only_artist": "<only when the (album) artist contains this>" (or a list)}"""
+    try:
+        with open(ALBUM_ALIASES_FILE) as f:
+            aliases = {k.strip().lower(): v for k, v in json.load(f).items()}
+    except FileNotFoundError:
+        aliases = {}
+    except Exception as e:
+        print(f"[albums] {ALBUM_ALIASES_FILE} unreadable, ignoring it: {e}", file=sys.stderr)
+        aliases = {}
+    folders = get_remote_album_dirs(ssh_cfg) if ssh_cfg else set()
+    return {"aliases": aliases, "folders": {f.lower(): f for f in folders}}
+
+
+def canonical_album(album, naming, artist=None):
+    """(album tag, folder name) for a new track's album:
+    1. a matching rename rule from album_aliases.json wins;
+    2. else an existing album folder whose name only differs in upper/lower
+       case is reused, with that spelling as the album tag too;
+    3. else the name as given (folder = the sanitized name)."""
+    album = (album or "").strip() or "Unknown Album"
+    if not naming:
+        return album, sanitize(album)
+    rule = naming["aliases"].get(album.lower())
+    if isinstance(rule, str):
+        rule = {"album": rule}
+    if rule and rule.get("album"):
+        only = rule.get("only_artist") or []
+        only = [only] if isinstance(only, str) else only
+        if not only or any(o.strip().lower() in (artist or "").lower() for o in only):
+            return rule["album"], rule.get("folder") or sanitize(rule["album"])
+    existing = naming["folders"].get(sanitize(album).lower())
+    if existing and existing != sanitize(album):
+        # Only borrow the folder's spelling as the tag when sanitizing didn't
+        # change the name (a folder can't hold characters like ':' or '/').
+        return (existing if sanitize(album) == album else album), existing
+    return album, sanitize(album)
 
 def primary_artist(artist):
     """First name in a comma-joined multi-artist string, for search queries."""
@@ -993,7 +1064,7 @@ def lookup_genre(artist):
     return genre
 
 def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None, genre=None,
-             track_number=None):
+             track_number=None, disc_number=None):
     album_artist = album_artist or artist
     try:
         if filepath.endswith('.flac'):
@@ -1004,6 +1075,8 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags["albumartist"] = [album_artist]
             if track_number:
                 tags["tracknumber"] = [str(track_number)]
+            if disc_number:
+                tags["discnumber"] = [str(disc_number)]
             if source_url:
                 tags["comment"] = [source_url]
             if genre:
@@ -1026,6 +1099,8 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags["TPE2"] = TPE2(encoding=3, text=album_artist)
             if track_number:
                 tags["TRCK"] = TRCK(encoding=3, text=str(track_number))
+            if disc_number:
+                tags["TPOS"] = TPOS(encoding=3, text=str(disc_number))
             if source_url:
                 tags["COMM"] = COMM(encoding=3, lang="eng", desc="", text=source_url)
             if genre:
@@ -1406,7 +1481,8 @@ def lookup_real_album(url, timeout=15):
     except Exception:
         return None
 
-def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_url, local_dir, album_artist=None):
+def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_url, local_dir, album_artist=None,
+                        naming=None):
     """If album looks like a placeholder (empty/'Unknown Album'/the playlist name
     itself), look up the real album via yt-dlp and move the file into the
     corrected album folder. Returns (album, flac_path), updated if corrected."""
@@ -1416,8 +1492,9 @@ def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_u
     real_album = lookup_real_album(source_url)
     if not real_album or real_album.strip().lower() == normalized:
         return album, flac_path
+    real_album, real_folder = canonical_album(real_album, naming, album_artist or artist)
     try:
-        new_album_dir = os.path.join(local_dir, sanitize(real_album))
+        new_album_dir = os.path.join(local_dir, real_folder)
         os.makedirs(new_album_dir, exist_ok=True)
         new_path = os.path.join(new_album_dir, os.path.basename(flac_path))
         if os.path.abspath(new_path) != os.path.abspath(flac_path):
@@ -1557,6 +1634,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
     remote_files = get_remote_files(remote_dir, ssh_cfg) if ssh_cfg else set()
     remote_files_flat = get_all_remote_files(ssh_cfg) if ssh_cfg else set()
     remote_title_index = _index_remote_files_by_title(remote_files_flat)
+    naming = load_album_naming(ssh_cfg)
 
     for i, track in enumerate(tracks):
         with job_lock:
@@ -1569,7 +1647,10 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
             continue
 
         filename = sanitize(f"{track['artist']} - {track['name']}")
-        album_dir = os.path.join(local_dir, sanitize(track['album'] or "Unknown Album"))
+        source_album = track['album']
+        track['album'], album_folder = canonical_album(
+            source_album, naming, track.get('album_artist') or track['artist'])
+        album_dir = os.path.join(local_dir, album_folder)
         os.makedirs(album_dir, exist_ok=True)
         out_template = os.path.join(album_dir, f"{filename}.%(ext)s")
 
@@ -1666,11 +1747,17 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 source_url = extract_resolved_url(stdout)
                 track["source_url"] = source_url
                 genre = lookup_genre(track['artist'])
+                if source_album and source_album != track['album']:
+                    with job_lock:
+                        jobs[job_id]["log"].append(
+                            f"🏷 Album: {source_album} → {track['album']} (as it's named in the library)")
                 fix_tags(flac_path, track['name'], track['artist'], track['album'],
-                         album_artist=track.get('album_artist'), source_url=source_url, genre=genre)
+                         album_artist=track.get('album_artist'), source_url=source_url, genre=genre,
+                         track_number=track.get('track_number'), disc_number=track.get('disc_number'))
                 new_album, flac_path = maybe_correct_album(
                     flac_path, track['name'], track['artist'], track['album'],
-                    playlist_name, source_url, local_dir, album_artist=track.get('album_artist'))
+                    playlist_name, source_url, local_dir, album_artist=track.get('album_artist'),
+                    naming=naming)
                 if new_album != track['album']:
                     with job_lock:
                         jobs[job_id]["log"].append(f"🏷 Corrected album: {track['album']} → {new_album}")
@@ -1830,9 +1917,14 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
     # gets downloaded into the album. So an album that's partly in the library
     # gets its missing tracks added; one that isn't gets created with all of them.
     album_mode = bool(complete_album and album_hint)
+    naming = load_album_naming(ssh_cfg)
+    if album_mode:
+        # e.g. LunaDrome asks for YT Music's "Songs Part Five": land in (and
+        # dedupe against) the album the library already has under another name.
+        album_hint, album_hint_folder = canonical_album(album_hint, naming, album_artist_hint)
 
     if album_mode and ssh_cfg:
-        album_remote_dir = f"{ssh_cfg['music_path']}/{sanitize(album_hint)}"
+        album_remote_dir = f"{ssh_cfg['music_path']}/{album_hint_folder}"
         remote_title_index = _index_remote_files_by_title(get_remote_files(album_remote_dir, ssh_cfg))
     else:
         # Get ALL remote files once (global dedup across all playlists)
@@ -1845,9 +1937,11 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
         artist = entry.get("uploader") or entry.get("channel") or entry.get("artist") or "Unknown Artist"
         artist = re.sub(r" - Topic$", "", artist)
         if album_mode:
-            album = album_hint  # every track in the one album folder, under one album name
+            # every track in the one album folder, under one album name
+            album, album_folder = album_hint, album_hint_folder
         else:
-            album = entry.get("album") or entry.get("release") or album_hint or "Unknown Album"
+            album, album_folder = canonical_album(
+                entry.get("album") or entry.get("release") or album_hint or "Unknown Album", naming, artist)
         track_url = f"https://www.youtube.com/watch?v={track_id}" if not track_id.startswith("http") else track_id
 
         with job_lock:
@@ -1873,7 +1967,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
             continue
 
         filename = sanitize(f"{artist} - {title}")
-        album_dir = os.path.join(local_dir, sanitize(album or "Unknown Album"))
+        album_dir = os.path.join(local_dir, album_folder)
         os.makedirs(album_dir, exist_ok=True)
         out_template = os.path.join(album_dir, f"{filename}.%(ext)s")
         t = {"id": track_id, "name": title, "artist": artist, "album": album, "duration_ms": 0, "image": None, "source_url": track_url}
@@ -2011,7 +2105,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
                 genre = lookup_genre(artist)
                 fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
                 new_album, flac_path = maybe_correct_album(
-                    flac_path, title, artist, album, playlist_name, track_url, local_dir)
+                    flac_path, title, artist, album, playlist_name, track_url, local_dir, naming=naming)
             if new_album != album:
                 with job_lock:
                     jobs[job_id]["log"].append(f"🏷 Corrected album: {album} → {new_album}")

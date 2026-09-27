@@ -46,7 +46,9 @@ SpotiDrome can be exposed to the internet: every API route is deny-by-default in
   - **LunaDrome:** `GET /session`, `GET /search`, `GET /search/album/<browseId>`, `POST /ytmusic/info`, `POST /ytmusic/download`, `GET /jobs`, `GET /jobs/<id>`, `POST /jobs/<id>/skip|cancel`, `GET /ytdlp/version`. Anything else is `403`.
   - **Full access:** everything the web UI can do, except managing API keys (that always needs a web login).
 - `GET /session` tells a client who it is (`logged_in`, `via: session|api_key`, `scope`) - handy as a connection test for an API key.
-- The backend port (`5000`) is bound to `127.0.0.1` only; everything goes through the frontend's `/api/` proxy. Put a TLS reverse proxy in front of port `8080` for internet access (it should send `X-Forwarded-Proto: https`).
+- The backend port (`5000`) is bound to `127.0.0.1` only; everything goes through the frontend's `/api/` proxy. Put a TLS reverse proxy in front of port `8080` for internet access (it should send `X-Forwarded-Proto: https`):
+  - Proxy **everything** (one `location /`) to `http://<host>:8080`, and keep the path unchanged: no separate `location /api/` pointing at `:5000` (not reachable from the LAN), and no `proxy_pass http://<host>:8080/;` with a trailing slash inside `location /api/` (that strips `/api`, so API calls get the web page back).
+  - Symptom of either: the page loads but shows a red "Can't reach the SpotiDrome API" bar (HTTP 403/502 or 200 with HTML).
 
 ## Notes
 

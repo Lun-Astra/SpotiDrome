@@ -15,10 +15,10 @@ services:
   backend:
     build: ./backend
     ports:
-      # Published on the LAN because the reverse proxy sends
-      # music.example.com/api/ straight here. Safe: every route needs a
-      # login session or API key (_require_auth in backend/app.py).
-      - "5000:5000"
+      # Only reachable from this host: the reverse proxy and
+      # everything else go through the frontend's /api/ on :8080 (which adds
+      # the security headers), and the backend checks login/API key itself.
+      - "127.0.0.1:5000:5000"
     depends_on:
       - bgutil-pot
     environment:

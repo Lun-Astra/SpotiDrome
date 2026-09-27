@@ -929,6 +929,43 @@ def canonical_album(album, naming, artist=None):
         return (existing if sanitize(album) == album else album), existing
     return album, sanitize(album)
 
+
+def _artist_names(s):
+    return {n.strip().lower() for n in re.split(r",|&|;| x | and ", s or "") if n.strip()}
+
+
+def library_album_artist(album, artist, naming):
+    """The album artist the library already uses for `album`, if a new track by
+    `artist` belongs to it - else None (the caller keeps its own value).
+
+    Navidrome groups an album by name *and* album artist, so a new track whose
+    album artist differs from the rest of its album splits it off. That happens
+    when YouTube playlist downloads fall back to the per-track artist (which
+    varies on soundtracks: "Lyn" vs "Lyn, <studio>"), or when Spotify changes an
+    album's credited artists later. Only reused when the artists overlap (or the
+    library's album is a Various Artists / "... Sound Team" compilation), so two
+    different albums that just share a name stay apart. Cached per run."""
+    if not naming or not album or album.strip().lower() in BAD_ALBUM_VALUES:
+        return None
+    cache = naming.setdefault("album_artists", {})
+    key = album.strip().lower()
+    if key not in cache:
+        try:
+            found = nd_subsonic("search3", query=album, albumCount=20, songCount=0, artistCount=0)
+            # Biggest first: when an album is already split, the main entry
+            # (not the stray fragment) is the one to join.
+            matches = sorted((a for a in found.get("searchResult3", {}).get("album", [])
+                              if (a.get("name") or "").strip().lower() == key),
+                             key=lambda a: a.get("songCount") or 0, reverse=True)
+            cache[key] = [a.get("artist") or "" for a in matches]
+        except Exception:
+            cache[key] = []
+    for existing in cache[key]:
+        low = existing.strip().lower()
+        if low == "various artists" or low.endswith("sound team") or _artist_names(existing) & _artist_names(artist):
+            return existing
+    return None
+
 def primary_artist(artist):
     """First name in a comma-joined multi-artist string, for search queries."""
     return artist.split(",")[0].strip()
@@ -1650,6 +1687,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
         source_album = track['album']
         track['album'], album_folder = canonical_album(
             source_album, naming, track.get('album_artist') or track['artist'])
+        track['album_artist'] = library_album_artist(
+            track['album'], f"{track['artist']}, {track.get('album_artist') or ''}", naming) or track.get('album_artist')
         album_dir = os.path.join(local_dir, album_folder)
         os.makedirs(album_dir, exist_ok=True)
         out_template = os.path.join(album_dir, f"{filename}.%(ext)s")
@@ -2096,16 +2135,19 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
                 # One album artist for every track (a featured artist on one track
                 # would otherwise split it off into its own album in Navidrome), the
                 # album's genre, and the track number from the album's order.
-                album_artist = album_artist_hint or artist
+                album_artist = (library_album_artist(album, f"{artist}, {album_artist_hint or ''}", naming)
+                                or album_artist_hint or artist)
                 genre = lookup_genre(album_artist)
                 fix_tags(flac_path, title, artist, album, album_artist=album_artist,
                          source_url=track_url, genre=genre, track_number=i + 1)
                 new_album = album  # the album is known - no correction guessing
             else:
                 genre = lookup_genre(artist)
-                fix_tags(flac_path, title, artist, album, source_url=track_url, genre=genre)
+                album_artist = library_album_artist(album, artist, naming)   # None -> the track artist
+                fix_tags(flac_path, title, artist, album, album_artist=album_artist, source_url=track_url, genre=genre)
                 new_album, flac_path = maybe_correct_album(
-                    flac_path, title, artist, album, playlist_name, track_url, local_dir, naming=naming)
+                    flac_path, title, artist, album, playlist_name, track_url, local_dir,
+                    album_artist=album_artist, naming=naming)
             if new_album != album:
                 with job_lock:
                     jobs[job_id]["log"].append(f"🏷 Corrected album: {album} → {new_album}")

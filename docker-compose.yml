@@ -15,7 +15,9 @@ services:
   backend:
     build: ./backend
     ports:
-      - "5000:5000"
+      # Only reachable from this host: everything else goes through the
+      # frontend's /api/ proxy (and the backend's own login/API-key check).
+      - "127.0.0.1:5000:5000"
     depends_on:
       - bgutil-pot
     environment:

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpotiDrome · Log in</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0d12;--bg2:#13131a;--bg3:#1a1a24;--border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);
+  --sp:#1ed760;--nd:#8b5cf6;--yt:#ff3333;--text:#f0f0f8;--text2:#9090b0;--text3:#5a5a7a;--r:10px;--r2:14px;
+  --font:'Inter',sans-serif;--font2:'Space Grotesk',sans-serif}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+body::before{content:'';position:fixed;inset:0;
+  background-image:radial-gradient(circle at 20% 20%,rgba(139,92,246,0.06) 0%,transparent 50%),
+    radial-gradient(circle at 80% 80%,rgba(30,215,96,0.04) 0%,transparent 50%),
+    linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:100% 100%,100% 100%,32px 32px,32px 32px;pointer-events:none;z-index:0}
+.card{position:relative;z-index:1;width:100%;max-width:360px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);padding:28px 24px}
+.logo{font-family:var(--font2);font-size:24px;font-weight:700;text-align:center;margin-bottom:6px}
+.logo .sp{color:var(--sp)} .logo .arr{color:var(--text3);margin:0 4px} .logo .nd{color:var(--nd)}
+.sub{text-align:center;color:var(--text2);font-size:13px;margin-bottom:22px;line-height:1.5}
+.field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
+.field label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;font-weight:500}
+.field input{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);padding:10px 12px;color:var(--text);font-family:var(--font);font-size:14px;outline:none}
+.field input:focus{border-color:rgba(139,92,246,.5)}
+button{width:100%;background:var(--sp);color:#000;border:none;border-radius:var(--r);padding:11px;font-family:var(--font);font-size:14px;font-weight:600;cursor:pointer;margin-top:4px}
+button:disabled{opacity:.5;cursor:not-allowed}
+.err{color:var(--yt);font-size:13px;min-height:18px;margin-top:12px;text-align:center}
+</style>
+</head>
+<body>
+<form class="card" id="login-form">
+  <div class="logo"><span class="sp">Spoti</span><span class="arr">→</span><span class="nd">Drome</span></div>
+  <div class="sub">Log in with your Navidrome admin account</div>
+  <div class="field"><label for="u">Username</label><input id="u" autocomplete="username" required autofocus></div>
+  <div class="field"><label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required></div>
+  <button type="submit" id="go">Log in</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+// Only ever go back to a page on this site after logging in.
+function nextUrl(){
+  const n = new URLSearchParams(location.search).get('next') || '/';
+  return (n.startsWith('/') && !n.startsWith('//')) ? n : '/';
+}
+fetch('/api/session').then(r => r.json()).then(d => { if(d.logged_in) location.replace(nextUrl()); }).catch(() => {});
+document.getElementById('login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = document.getElementById('go'), err = document.getElementById('err');
+  btn.disabled = true; err.textContent = '';
+  try{
+    const r = await fetch('/api/session/login', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: document.getElementById('u').value.trim(), password: document.getElementById('p').value})});
+    const d = await r.json().catch(() => ({}));
+    if(r.ok){ location.replace(nextUrl()); return; }
+    err.textContent = d.error || 'Login failed';
+  }catch(ex){ err.textContent = 'Could not reach SpotiDrome'; }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>

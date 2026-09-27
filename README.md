@@ -35,9 +35,20 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
    ```bash
    docker compose up -d --build
    ```
-4. Open `http://<host>:8080`, authenticate with Spotify, and start tracking playlists.
+4. Open `http://<host>:8080`, log in with a Navidrome **admin** account, authenticate with Spotify, and start tracking playlists.
+
+## Access & API keys
+
+SpotiDrome can be exposed to the internet: every API route is deny-by-default in `backend/app.py` (`_require_auth`).
+
+- **Web UI:** log in with a Navidrome account that is an **admin** on the destination Navidrome (`NAVIDROME_URL`); the credentials are checked by Navidrome's own `/auth/login`. You get an `HttpOnly`, `SameSite=Lax` session cookie (`Secure` behind https) valid for 30 days. Log out from Settings → Access. 10 failed logins within 10 minutes lock password login for everyone for 10 minutes; existing sessions and API keys keep working.
+- **API keys (apps like LunaDrome):** create one in Settings → Access → API keys. The key (`sdk_…`) is shown **once**; only its SHA-256 hash is stored (`~/.ssh/api_keys.json`). Send it as `Authorization: Bearer <key>` (or `X-API-Key: <key>`). Revoke it there at any time. Each key has a scope:
+  - **LunaDrome:** `GET /session`, `GET /search`, `GET /search/album/<browseId>`, `POST /ytmusic/info`, `POST /ytmusic/download`, `GET /jobs`, `GET /jobs/<id>`, `POST /jobs/<id>/skip|cancel`, `GET /ytdlp/version`. Anything else is `403`.
+  - **Full access:** everything the web UI can do, except managing API keys (that always needs a web login).
+- `GET /session` tells a client who it is (`logged_in`, `via: session|api_key`, `scope`) - handy as a connection test for an API key.
+- The backend port (`5000`) is bound to `127.0.0.1` only; everything goes through the frontend's `/api/` proxy. Put a TLS reverse proxy in front of port `8080` for internet access (it should send `X-Forwarded-Proto: https`).
 
 ## Notes
 
 - Runtime state (tracked playlists, job history, dead-link/duplicate reports, schedule config) lives under `~/.ssh/` on the host, not in this repository.
-- **LunaDrome integration** ("Download via SpotiDrome" in the LunaDrome player): LunaDrome talks to the same `/api` the web UI uses (`http://<host>:8080/api`). `GET /search?q=` returns YouTube Music songs + albums and plain YouTube videos (Jamidrome's ranking: real releases first); `GET /search/album/<browseId>` returns an album's tracks and the playlist URL to download. Downloads go through `POST /ytmusic/download` with `sync_playlist: false, track_for_sync: false` (library only: no Navidrome playlist, no auto-sync entry), optionally `album` (album name hint) and `job_label`; for a whole album also `complete_album: true` + `album_artist` (every track goes into that album's folder even if it exists elsewhere, e.g. as a single - only a copy already in that folder is skipped - tagged with one album artist and track numbers); progress via `GET /jobs/<id>`. There's no authentication - keep it on the internal network.
+- **LunaDrome integration** ("Download via SpotiDrome" in the LunaDrome player): LunaDrome talks to the same `/api` the web UI uses (`http://<host>:8080/api`). `GET /search?q=` returns YouTube Music songs + albums and plain YouTube videos (Jamidrome's ranking: real releases first); `GET /search/album/<browseId>` returns an album's tracks and the playlist URL to download. Downloads go through `POST /ytmusic/download` with `sync_playlist: false, track_for_sync: false` (library only: no Navidrome playlist, no auto-sync entry), optionally `album` (album name hint) and `job_label`; for a whole album also `complete_album: true` + `album_artist` (every track goes into that album's folder even if it exists elsewhere, e.g. as a single - only a copy already in that folder is skipped - tagged with one album artist and track numbers); progress via `GET /jobs/<id>`. LunaDrome authenticates with an API key (see **Access & API keys**).

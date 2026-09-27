@@ -1,4 +1,4 @@
-import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib, uuid, base64
+import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib, uuid, base64, hashlib, secrets
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import requests as http
@@ -47,6 +47,265 @@ SYNC_HEALTH_FILE      = "/root/.ssh/sync_health.json"
 FAILED_TRACKS_FILE    = "/root/.ssh/failed_tracks.json"
 LONG_TRACK_WHITELIST_FILE = "/root/.ssh/long_track_whitelist.json"
 LONG_TRACK_THRESHOLD_SEC  = 15 * 60  # 15 minutes
+
+# ─── Access control (web login sessions + API keys) ────────────────────────
+# SpotiDrome is reachable from the internet, so every route is deny-by-default:
+# a request needs either a web session (cookie, from logging in with a
+# Navidrome *admin* account) or an API key (for apps like LunaDrome). Only
+# the login endpoint and the "who am I" check are public. Keys and session
+# tokens are stored as SHA-256 hashes, never in the clear.
+SESSIONS_FILE    = "/root/.ssh/web_sessions.json"
+API_KEYS_FILE    = "/root/.ssh/api_keys.json"
+SESSION_COOKIE   = "sd_session"
+SESSION_TTL_SEC  = 30 * 24 * 3600
+LAST_SEEN_WRITE_SEC = 300   # don't rewrite the store on every single request
+
+# What an API key may call, per scope. "lunadrome" is what LunaDrome needs:
+# search, album lookup, YT Music downloads and following its jobs - it can't
+# change settings, delete tracks or mint keys. "full" is everything the web
+# UI can do except managing API keys (that always needs a real login).
+API_KEY_SCOPES = {
+    "lunadrome": {
+        ("GET", "/session"),
+        ("GET", "/search"),
+        ("GET", "/search/album/<browse_id>"),
+        ("POST", "/ytmusic/info"),
+        ("POST", "/ytmusic/download"),
+        ("GET", "/jobs"),
+        ("GET", "/jobs/<job_id>"),
+        ("POST", "/jobs/<job_id>/skip"),
+        ("POST", "/jobs/<job_id>/cancel"),
+        ("GET", "/ytdlp/version"),
+    },
+    "full": None,  # None = every route
+}
+PUBLIC_ROUTES = {("POST", "/session/login"), ("GET", "/session"), ("POST", "/session/logout")}
+SESSION_ONLY_ROUTES = {("GET", "/api-keys"), ("POST", "/api-keys"), ("DELETE", "/api-keys/<key_id>")}
+
+# Password guessing is limited globally (not per client, so it can't be
+# dodged by spreading guesses over many IPs): 10 wrong logins within 10
+# minutes lock password login for 10 minutes. Existing sessions and API keys
+# keep working during a lockout.
+LOGIN_MAX_FAILURES = 10
+LOGIN_FAILURE_WINDOW_SEC = 600
+LOGIN_LOCKOUT_SEC = 600
+
+_auth_lock = threading.Lock()
+_login_failures = []
+_login_locked_until = 0.0
+
+
+def _hash_secret(secret):
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+def _load_auth_store(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_auth_store(path, data):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def _request_is_https():
+    return request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+
+def _session_from_request():
+    """Returns (token_hash, session dict) for a live session cookie, else (None, None)."""
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not token:
+        return None, None
+    h = _hash_secret(token)
+    now = time.time()
+    with _auth_lock:
+        sessions = _load_auth_store(SESSIONS_FILE)
+        s = sessions.get(h)
+        if not s or s.get("expires_at", 0) <= now:
+            return None, None
+        if now - s.get("last_seen_at", 0) > LAST_SEEN_WRITE_SEC:
+            s["last_seen_at"] = now
+            _save_auth_store(SESSIONS_FILE, sessions)
+    return h, s
+
+
+def _api_key_from_request():
+    """Returns the key record for a valid API key header, else None."""
+    auth = request.headers.get("Authorization", "")
+    key = auth[7:].strip() if auth[:7].lower() == "bearer " else request.headers.get("X-API-Key", "").strip()
+    if not key:
+        return None
+    h = _hash_secret(key)
+    now = time.time()
+    with _auth_lock:
+        keys = _load_auth_store(API_KEYS_FILE)
+        for k in keys.values():
+            if secrets.compare_digest(k.get("hash", ""), h):
+                if now - (k.get("last_used_at") or 0) > LAST_SEEN_WRITE_SEC:
+                    k["last_used_at"] = now
+                    _save_auth_store(API_KEYS_FILE, keys)
+                return k
+    return None
+
+
+def _identify():
+    """Who is making this request: a dict describing the session or key, or None."""
+    _h, s = _session_from_request()
+    if s:
+        return {"via": "session", "user": s["user"], "scope": "full"}
+    k = _api_key_from_request()
+    if k:
+        return {"via": "api_key", "key_id": k["id"], "key_name": k["name"], "scope": k["scope"]}
+    return None
+
+
+@app.before_request
+def _require_auth():
+    if request.method == "OPTIONS":   # CORS preflight carries no credentials
+        return None
+    rule = request.url_rule.rule if request.url_rule else None
+    if rule is None:                  # unknown URL - let Flask answer 404
+        return None
+    route = (request.method, rule)
+    if route in PUBLIC_ROUTES:
+        return None
+    who = _identify()
+    if not who:
+        return jsonify({"error": "Login required", "login_required": True}), 401
+    if route in SESSION_ONLY_ROUTES and who["via"] != "session":
+        return jsonify({"error": "Managing API keys needs a web login, not an API key"}), 403
+    allowed = API_KEY_SCOPES.get(who["scope"])
+    if who["via"] == "api_key" and allowed is not None and route not in allowed:
+        return jsonify({"error": f"This API key's scope ({who['scope']}) doesn't allow "
+                                 f"{request.method} {rule}"}), 403
+    return None
+
+
+def _navidrome_admin_login(username, password):
+    """Checks the credentials against the destination Navidrome's own login.
+    Returns (ok, error). Only Navidrome admins may log in to SpotiDrome."""
+    cfg = load_nd_config()
+    if not cfg:
+        return False, "Navidrome isn't configured on the server"
+    try:
+        r = http.post(f"{cfg['url']}/auth/login", json={"username": username, "password": password}, timeout=15)
+    except Exception:
+        return False, "Couldn't reach Navidrome to check the login"
+    if r.status_code != 200:
+        return False, "Wrong username or password"
+    if not r.json().get("isAdmin"):
+        return False, "Only Navidrome admins can use SpotiDrome"
+    return True, None
+
+
+@app.route("/session", methods=["GET"])
+def session_get():
+    who = _identify()
+    if not who:
+        return jsonify({"logged_in": False})
+    return jsonify({"logged_in": True, **who})
+
+
+@app.route("/session/login", methods=["POST"])
+def session_login():
+    global _login_locked_until
+    data = request.json or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+    with _auth_lock:
+        if time.time() < _login_locked_until:
+            return jsonify({"error": "Too many failed logins - try again in a few minutes"}), 429
+    ok, err = _navidrome_admin_login(username, password)
+    if not ok:
+        now = time.time()
+        with _auth_lock:
+            _login_failures[:] = [t for t in _login_failures if now - t < LOGIN_FAILURE_WINDOW_SEC] + [now]
+            if len(_login_failures) >= LOGIN_MAX_FAILURES:
+                _login_locked_until = now + LOGIN_LOCKOUT_SEC
+                _login_failures.clear()
+                print(f"[auth] {LOGIN_MAX_FAILURES} failed logins in {LOGIN_FAILURE_WINDOW_SEC}s - "
+                      f"password login locked for {LOGIN_LOCKOUT_SEC}s", file=sys.stderr, flush=True)
+        time.sleep(1)
+        return jsonify({"error": err}), 403
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _auth_lock:
+        sessions = _load_auth_store(SESSIONS_FILE)
+        sessions = {h: s for h, s in sessions.items() if s.get("expires_at", 0) > now}
+        sessions[_hash_secret(token)] = {"user": username, "created_at": now, "last_seen_at": now,
+                                         "expires_at": now + SESSION_TTL_SEC}
+        _save_auth_store(SESSIONS_FILE, sessions)
+    resp = jsonify({"logged_in": True, "user": username})
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SEC, httponly=True,
+                    secure=_request_is_https(), samesite="Lax", path="/")
+    return resp
+
+
+@app.route("/session/logout", methods=["POST"])
+def session_logout():
+    h, _s = _session_from_request()
+    if h:
+        with _auth_lock:
+            sessions = _load_auth_store(SESSIONS_FILE)
+            sessions.pop(h, None)
+            _save_auth_store(SESSIONS_FILE, sessions)
+    resp = jsonify({"logged_in": False})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+
+def _public_key_record(k):
+    return {f: k.get(f) for f in ("id", "name", "scope", "prefix", "created_at", "created_by", "last_used_at")}
+
+
+@app.route("/api-keys", methods=["GET"])
+def api_keys_list():
+    keys = _load_auth_store(API_KEYS_FILE)
+    return jsonify(sorted((_public_key_record(k) for k in keys.values()),
+                          key=lambda k: k.get("created_at") or 0, reverse=True))
+
+
+@app.route("/api-keys", methods=["POST"])
+def api_keys_create():
+    data = request.json or {}
+    name = (data.get("name") or "").strip()[:60]
+    scope = data.get("scope") or "lunadrome"
+    if not name:
+        return jsonify({"error": "Give the key a name (e.g. \"LunaDrome on my PC\")"}), 400
+    if scope not in API_KEY_SCOPES:
+        return jsonify({"error": f"Unknown scope - use one of: {', '.join(API_KEY_SCOPES)}"}), 400
+    key = "sdk_" + secrets.token_urlsafe(32)
+    now = time.time()
+    record = {"id": uuid.uuid4().hex[:12], "name": name, "scope": scope, "prefix": key[:10],
+              "hash": _hash_secret(key), "created_at": now, "created_by": _identify()["user"],
+              "last_used_at": None}
+    with _auth_lock:
+        keys = _load_auth_store(API_KEYS_FILE)
+        keys[record["id"]] = record
+        _save_auth_store(API_KEYS_FILE, keys)
+    # The only time the full key is ever returned - only its hash is stored.
+    return jsonify({**_public_key_record(record), "key": key}), 201
+
+
+@app.route("/api-keys/<key_id>", methods=["DELETE"])
+def api_keys_revoke(key_id):
+    with _auth_lock:
+        keys = _load_auth_store(API_KEYS_FILE)
+        if key_id not in keys:
+            return jsonify({"error": "No such key"}), 404
+        keys.pop(key_id)
+        _save_auth_store(API_KEYS_FILE, keys)
+    return jsonify({"ok": True})
 
 jobs = {}
 job_lock = threading.Lock()

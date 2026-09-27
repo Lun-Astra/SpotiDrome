@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SpotiDrome</title>
+<script src="/auth.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -430,6 +431,32 @@ header{
     </div>
     <div class="modal-body">
       <div class="settings-sec">
+        <div class="settings-sec-title">Access</div>
+        <div class="settings-row">
+          <div><div class="settings-label">Logged in as <span id="session-user">…</span></div><div class="settings-sub">Navidrome admin login · stays logged in for 30 days on this browser</div></div>
+          <button class="btn btn-ghost" onclick="sdLogout()" style="flex-shrink:0">Log out</button>
+        </div>
+        <div class="settings-label" style="margin:10px 0 6px">API keys</div>
+        <div class="settings-sub" style="margin-bottom:8px">For apps like LunaDrome. Send the key as <code>Authorization: Bearer &lt;key&gt;</code>. A <b>LunaDrome</b> key can only search, download from YT Music and follow its jobs; <b>Full access</b> can do everything except manage keys.</div>
+        <div id="api-keys-list" class="settings-sub" style="margin-bottom:8px">…</div>
+        <div id="api-key-new" style="display:none;margin-bottom:10px;padding:10px;border:1px solid rgba(30,215,96,.3);border-radius:var(--r);background:rgba(30,215,96,.06)">
+          <div class="settings-sub" style="margin-bottom:6px;color:var(--text)">Copy this key now — it won't be shown again:</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <code id="api-key-new-value" style="flex:1;min-width:0;overflow-wrap:anywhere;font-size:12px;color:var(--sp)"></code>
+            <button class="btn btn-ghost" onclick="copyNewApiKey(this)" style="flex-shrink:0">Copy</button>
+          </div>
+        </div>
+        <div class="field" style="flex-direction:row;gap:6px;flex-wrap:wrap">
+          <input id="api-key-name" placeholder="Key name, e.g. LunaDrome on my PC" style="flex:1;min-width:160px" maxlength="60">
+          <select id="api-key-scope" style="flex-shrink:0">
+            <option value="lunadrome">LunaDrome</option>
+            <option value="full">Full access</option>
+          </select>
+          <button class="btn btn-primary" onclick="createApiKey()" style="flex-shrink:0">+ Create key</button>
+        </div>
+      </div>
+      <div style="height:1px;background:var(--border);margin:4px 0"></div>
+      <div class="settings-sec" style="margin-top:12px">
         <div class="settings-sec-title">yt-dlp</div>
         <div class="settings-row">
           <div><div class="settings-label">Current version</div><div class="settings-sub">Used for all downloads</div></div>
@@ -1062,7 +1089,46 @@ async function saveSchedule(){
 async function runSyncNow(){await fetch(`${API}/schedule/run`,{method:'POST'});closeScheduleModal();setTimeout(renderJobs,1000);}
 
 // Settings modal
-function openSettingsModal(){loadYtdlpVersion();loadCookieStatus();document.getElementById('settings-modal').classList.add('show');}
+function openSettingsModal(){loadYtdlpVersion();loadCookieStatus();loadApiKeys();document.getElementById('settings-modal').classList.add('show');}
+
+// ─── Access: API keys ───────────────────────────────────────────────────
+document.addEventListener('sd-session',e=>{document.getElementById('session-user').textContent=e.detail.user||'?';});
+function fmtWhen(ts){return ts?new Date(ts*1000).toLocaleString():'never';}
+async function loadApiKeys(){
+  const el=document.getElementById('api-keys-list');
+  if(window.SD_SESSION)document.getElementById('session-user').textContent=window.SD_SESSION.user||'?';
+  try{
+    const r=await fetch(`${API}/api-keys`),keys=await r.json();
+    if(!r.ok){el.textContent=keys.error||'Could not load keys';return;}
+    if(!keys.length){el.textContent='No API keys yet.';return;}
+    el.innerHTML=keys.map(k=>`<div class="settings-row" style="margin-bottom:6px">
+      <div style="min-width:0"><div class="settings-label">${esc(k.name)} <span class="ver-badge">${k.scope==='full'?'Full access':'LunaDrome'}</span></div>
+      <div class="settings-sub"><code>${esc(k.prefix)}…</code> · created ${fmtWhen(k.created_at)} · last used ${fmtWhen(k.last_used_at)}</div></div>
+      <button class="btn btn-ghost" style="flex-shrink:0" onclick="revokeApiKey('${esc(k.id)}',this)">Revoke</button></div>`).join('');
+  }catch(e){el.textContent='Could not load keys';}
+}
+async function createApiKey(){
+  const name=document.getElementById('api-key-name').value.trim(),scope=document.getElementById('api-key-scope').value;
+  if(!name){document.getElementById('api-key-name').focus();return;}
+  const r=await fetch(`${API}/api-keys`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,scope})});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok){alert(d.error||'Could not create key');return;}
+  document.getElementById('api-key-name').value='';
+  document.getElementById('api-key-new-value').textContent=d.key;
+  document.getElementById('api-key-new').style.display='block';
+  loadApiKeys();
+}
+function copyNewApiKey(btn){
+  navigator.clipboard.writeText(document.getElementById('api-key-new-value').textContent).then(()=>{btn.textContent='Copied';setTimeout(()=>btn.textContent='Copy',1500);});
+}
+// Arm-then-confirm instead of confirm(): browsers start suppressing native
+// dialogs after a few in a row (see the Long Tracks page).
+async function revokeApiKey(id,btn){
+  if(!btn.dataset.armed){btn.dataset.armed='1';btn.textContent='Click again to revoke';setTimeout(()=>{delete btn.dataset.armed;btn.textContent='Revoke';},4000);return;}
+  const r=await fetch(`${API}/api-keys/${encodeURIComponent(id)}`,{method:'DELETE'});
+  if(!r.ok){const d=await r.json().catch(()=>({}));alert(d.error||'Could not revoke key');}
+  loadApiKeys();
+}
 function closeSettingsModal(){document.getElementById('settings-modal').classList.remove('show');}
 async function loadYtdlpVersion(){try{const r=await fetch(`${API}/ytdlp/version`),d=await r.json();document.getElementById('ytdlp-version').textContent=d.version||'Unknown';}catch(e){}}
 async function updateYtdlp(){

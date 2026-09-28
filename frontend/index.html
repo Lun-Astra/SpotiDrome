@@ -291,6 +291,7 @@ header{
 .ck-badge.on{background:rgba(30,215,96,.1);color:#4ade80}
 .ck-badge.off{background:var(--bg3);color:var(--text3)}
 .upd-out{display:none;margin-top:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text2);white-space:pre-wrap;max-height:90px;overflow-y:auto;font-family:monospace}
+#app-upd-out{max-height:180px}
 
 /* YT tracked items */
 .yt-item{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s}
@@ -461,6 +462,19 @@ header{
           </select>
           <button class="btn btn-primary" onclick="createApiKey()" style="flex-shrink:0">+ Create key</button>
         </div>
+      </div>
+      <div style="height:1px;background:var(--border);margin:4px 0"></div>
+      <div class="settings-sec" style="margin-top:12px">
+        <div class="settings-sec-title">SpotiDrome</div>
+        <div class="settings-row">
+          <div><div class="settings-label">Version</div><div class="settings-sub" id="app-upd-sub">Checks GitHub for a newer version</div></div>
+          <span class="ver-badge" id="app-version">…</span>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-label">Updates</div><div class="settings-sub">Updating is one command on the server</div></div>
+          <button class="btn btn-ghost" id="btn-check-app" onclick="checkAppUpdate(true)">↻ Check for updates</button>
+        </div>
+        <div class="upd-out" id="app-upd-out"></div>
       </div>
       <div style="height:1px;background:var(--border);margin:4px 0"></div>
       <div class="settings-sec" style="margin-top:12px">
@@ -1100,7 +1114,7 @@ async function saveSchedule(){
 async function runSyncNow(){await fetch(`${API}/schedule/run`,{method:'POST'});closeScheduleModal();setTimeout(renderJobs,1000);}
 
 // Settings modal
-function openSettingsModal(){loadYtdlpVersion();loadCookieStatus();loadApiKeys();loadMaintenanceSchedule();document.getElementById('settings-modal').classList.add('show');}
+function openSettingsModal(){checkAppUpdate(false);loadYtdlpVersion();loadCookieStatus();loadApiKeys();loadMaintenanceSchedule();document.getElementById('settings-modal').classList.add('show');}
 
 // ─── Access: API keys ───────────────────────────────────────────────────
 document.addEventListener('sd-session',e=>{document.getElementById('session-user').textContent=e.detail.user||'?';});
@@ -1142,6 +1156,29 @@ async function revokeApiKey(id,btn){
 }
 function closeSettingsModal(){document.getElementById('settings-modal').classList.remove('show');}
 async function loadYtdlpVersion(){try{const r=await fetch(`${API}/ytdlp/version`),d=await r.json();document.getElementById('ytdlp-version').textContent=d.version||'Unknown';}catch(e){}}
+// Settings > SpotiDrome: which version runs, and whether GitHub has a newer one.
+// Only tells you - the update itself is `docker compose pull && docker compose up -d`.
+async function checkAppUpdate(force){
+  const btn=document.getElementById('btn-check-app'),out=document.getElementById('app-upd-out');
+  const badge=document.getElementById('app-version'),sub=document.getElementById('app-upd-sub');
+  if(force){btn.disabled=true;btn.innerHTML='<span class="spin"></span>';}
+  try{
+    const r=await fetch(`${API}/update/check${force?'?force=1':''}`),d=await r.json();
+    badge.textContent=d.current?d.current:'unknown';
+    const cmd=`\n\nTo update, run this where SpotiDrome's docker-compose.yml is:\n  ${d.command}`;
+    if(d.status==='up_to_date'){sub.textContent='Up to date';out.style.display=force?'block':'none';out.textContent='✓ You have the newest version.';}
+    else if(d.status==='update_available'){
+      sub.textContent=`${d.behind_by} update${d.behind_by===1?'':'s'} available`;
+      out.style.display='block';
+      out.textContent=`Newer version ${d.latest} is available (${d.behind_by} change${d.behind_by===1?'':'s'}):\n`+
+        (d.changes||[]).map(c=>'• '+c).join('\n')+(d.behind_by>(d.changes||[]).length?'\n• …':'')+cmd;
+    }
+    else if(d.status==='unknown'){sub.textContent='Version unknown';out.style.display=force?'block':'none';
+      out.textContent=`This build doesn't say which version it is (built locally?). The newest version is ${d.latest||'?'}.`+cmd;}
+    else{sub.textContent='Update check failed';out.style.display=force?'block':'none';out.textContent=d.error||'Update check failed';}
+  }catch(e){if(force){out.style.display='block';out.textContent='Error: '+e.message;}}
+  finally{btn.disabled=false;btn.innerHTML='↻ Check for updates';}
+}
 async function updateYtdlp(){
   const btn=document.getElementById('btn-upd-ytdlp'),out=document.getElementById('ytdlp-upd-out');
   btn.disabled=true;btn.innerHTML='<span class="spin"></span>';out.style.display='none';

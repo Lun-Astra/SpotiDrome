@@ -16,7 +16,12 @@ services:
 
   backend:
     image: ghcr.io/lun-astra/spotidrome-backend:latest
-    build: ./backend
+    build:
+      context: ./backend
+      # Local builds: `APP_COMMIT=$(git rev-parse HEAD) docker compose up -d --build`
+      # lets Settings > Check for updates know which version is running.
+      args:
+        APP_COMMIT: ${APP_COMMIT:-}
     ports:
       # Only reachable from this host: the reverse proxy and
       # everything else go through the frontend's /api/ on :8080 (which adds

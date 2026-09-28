@@ -4063,7 +4063,7 @@ def lunadrome_search():
         return jsonify({"songs": [], "albums": [], "videos": []})
     limit = max(1, min(int(request.args.get("limit", 12)), 30))
     songs = lunadrome_search_songs(q, limit)
-    albums = lunadrome_search_albums(q, max(4, limit // 2))
+    albums = lunadrome_search_albums(q, max(4, limit))   # the Albums tab is a grid; half the limit (6) was too few
     videos = lunadrome_search_videos(q, limit, {s["video_id"] for s in songs})
     return jsonify({"songs": songs, "albums": albums, "videos": videos})
 

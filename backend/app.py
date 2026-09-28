@@ -814,7 +814,10 @@ def batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, batch_tr
 
 # ─── Spotify ──────────────────────────────────────────────────────────────────
 
-def get_sp():
+def get_sp(no_retry=False):
+    """no_retry: raise on a 429 instead of sleeping. spotipy otherwise honours
+    Retry-After, which after heavy use can be hours - long jobs (Fill in Track
+    Numbers) then sat on one album all afternoon."""
     auth = SpotifyOAuth(
         client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET,
         redirect_uri=SPOTIFY_REDIRECT_URI,
@@ -834,6 +837,8 @@ def get_sp():
             # reconnect" state. Treat it the same as "not authenticated".
             print(f"[spotify] Token refresh failed: {e}", file=sys.stderr)
             return None, auth.get_authorize_url()
+    if no_retry:
+        return spotipy.Spotify(auth=token["access_token"], retries=0, status_retries=0), None
     return spotipy.Spotify(auth=token["access_token"]), None
 
 def fetch_playlist_tracks(sp, playlist_id):
@@ -5837,7 +5842,7 @@ def tracknumber_worker(job_id):
         log(f"ℹ {len(rows)} track(s) without a track number or album ID in {len(groups)} album(s)")
         with job_lock:
             jobs[job_id]["total"] = len(groups)
-        sp, _url = get_sp()
+        sp, _url = get_sp(no_retry=True)
         yt = _get_ytmusic()
         plan = {}
         for i, ((folder, album), tracks) in enumerate(sorted(groups.items())):
@@ -5856,8 +5861,10 @@ def tracknumber_worker(job_id):
                 try:
                     try:
                         found = sp.search(q=q, type="album", limit=10)["albums"]["items"]
-                    except Exception:
-                        sp, _url = get_sp()   # access tokens expire after about an hour
+                    except Exception as e:
+                        if getattr(e, "http_status", None) == 429:
+                            raise
+                        sp, _url = get_sp(no_retry=True)   # access tokens expire after about an hour
                         found = sp.search(q=q, type="album", limit=10)["albums"]["items"] if sp else []
                     best = None
                     for a in found:
@@ -5879,7 +5886,13 @@ def tracknumber_worker(job_id):
                         chosen = {t["rel"]: best[1][_tn_norm(t["title"])] + (best[2],)
                                   for t in tracks if _tn_norm(t["title"]) in best[1]}
                 except Exception as e:
-                    log(f"⚠ Spotify lookup failed for {album}: {e}")
+                    if getattr(e, "http_status", None) == 429:
+                        wait = (getattr(e, "headers", None) or {}).get("Retry-After")
+                        log("⚠ Spotify rate limit" + (f" (retry after {wait}s)" if wait else "")
+                            + " - continuing with YouTube Music only")
+                        sp = None
+                    else:
+                        log(f"⚠ Spotify lookup failed for {album}: {e}")
             # 2) Only when Spotify matched nothing: the YT Music album of a source video.
             if not chosen and not all(t["numbered"] for t in tracks):
                 vid = next((_tn_video_id(t["src"]) for t in tracks if _tn_video_id(t["src"])), None)

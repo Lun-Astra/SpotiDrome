@@ -1217,7 +1217,26 @@ NOT_MUSIC_KEYWORDS = (
     "breakdown", "explained", "documentary", "trailer", "teaser",
     "behind the scenes", "tier list", "top 10", "top ten", "compilation",
     "let's play", "gameplay", "unboxing", "vlog", "asmr", "full episode",
+    # also episodes/streams that slipped through before (SpotiDrome #4); like every
+    # keyword here it only rejects when the requested title doesn't contain it itself
+    "walkthrough", "playthrough", "livestream", "live stream", "vod", "season ",
+    "ep. ", "1 hour", "10 hours", "hour loop", "full album", "full ost", "all songs",
 )
+
+# Versions of a song that are not the song itself (SpotiDrome #4: an instrumental,
+# live or sped-up upload was saved as the normal track, or the other way round).
+# A marker present in only one of the two titles means it's a different version.
+_VERSION_MARKER_RE = re.compile(
+    r"\b(instrumental|inst|karaoke|off vocal|acapella|a cappella|acoustic|remix|live|sped up|"
+    r"speed up|slowed|reverb(?:ed)?|nightcore|cover|8 ?bit|piano ver(?:sion)?|orchestral|"
+    r"extended|demo)\b")
+
+
+def _version_markers(title):
+    t = re.sub(r"[^\w\s]", " ", (title or "").lower())
+    found = {m.group(1) for m in _VERSION_MARKER_RE.finditer(re.sub(r"\s+", " ", t))}
+    return {"sped up" if m == "speed up" else "reverb" if m.startswith("reverb") else
+            "instrumental" if m == "inst" else m for m in found}
 
 YTMUSIC_OFFICIAL_VIDEO_TYPES = {"MUSIC_VIDEO_TYPE_ATV", "MUSIC_VIDEO_TYPE_OMV"}
 
@@ -1276,6 +1295,8 @@ def _title_ok(candidate_title, expected_title):
     exp_n = _normalize_title(expected_title)
     if not exp_n or not cand_n:
         return False
+    if _version_markers(candidate_title) != _version_markers(expected_title):
+        return False   # e.g. "Song (Instrumental)" is not "Song"
     if exp_n in cand_n:
         return True
     if difflib.SequenceMatcher(None, cand_n, exp_n).ratio() >= 0.72:

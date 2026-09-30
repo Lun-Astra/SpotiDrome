@@ -965,7 +965,7 @@ def library_album_for_spotify_id(album_id, naming, ssh_cfg):
         return None
     if "spotify_ids" not in naming:
         try:
-            cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_ALBUM_ID_INDEX_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+            cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_ALBUM_ID_INDEX_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
             r = _run_remote_scan(cmd, timeout=600)
             naming["spotify_ids"] = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
         except Exception as e:
@@ -2571,7 +2571,7 @@ def scan_and_dedupe_remote(ssh_cfg, nd_cfg):
     cmd = ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(ssh_cfg["port"]),
            "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
            f"{ssh_cfg['user']}@{ssh_cfg['host']}",
-           f"python3 -c {shlex.quote(_DEDUPE_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
+           f"{_remote_python(ssh_cfg)} -c {shlex.quote(_DEDUPE_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if result.returncode != 0:
@@ -2747,7 +2747,7 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
     cmd = ["ssh", "-i", "/root/.ssh/id_rsa", "-p", str(ssh_cfg["port"]),
            "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
            f"{ssh_cfg['user']}@{ssh_cfg['host']}",
-           f"python3 -c {shlex.quote(_TITLE_DEDUPE_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
+           f"{_remote_python(ssh_cfg)} -c {shlex.quote(_TITLE_DEDUPE_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
     try:
         result = _run_remote_scan(cmd, timeout=300)
         if result.returncode != 0:
@@ -2924,6 +2924,58 @@ def _ssh_cmd(ssh_cfg, remote_command):
             "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
             f"{ssh_cfg['user']}@{ssh_cfg['host']}", remote_command]
 
+# The remote scripts below import mutagen on the Navidrome host. Instead of asking
+# everyone to install it there (newer Debian/Ubuntu also block a plain `pip install`),
+# the backend copies its own mutagen - pure Python - to ~/.cache/spotidrome/py on the
+# host, once per mutagen version, and runs the scripts with that on PYTHONPATH.
+_REMOTE_PY_DIR = ".cache/spotidrome/py"
+_REMOTE_MUTAGEN_RETRY_SEC = 600
+_remote_mutagen_state = {}   # (user, host, port) -> True, or the time of the last failed copy
+_remote_mutagen_lock = threading.Lock()
+
+def _ensure_remote_mutagen(ssh_cfg):
+    import mutagen
+    version = mutagen.version_string
+    marker = f'"$HOME/{_REMOTE_PY_DIR}/mutagen/.spotidrome-version"'
+    r = subprocess.run(_ssh_cmd(ssh_cfg, f"cat {marker} 2>/dev/null"),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode == 0 and r.stdout.strip() == version:
+        return True
+    site = os.path.dirname(os.path.dirname(mutagen.__file__))
+    pack = subprocess.Popen(["tar", "-C", site, "--exclude=__pycache__", "-cf", "-", "mutagen"],
+                            stdout=subprocess.PIPE)
+    unpack = (f'rm -rf "$HOME/{_REMOTE_PY_DIR}/mutagen" && mkdir -p "$HOME/{_REMOTE_PY_DIR}" && '
+              f'tar -C "$HOME/{_REMOTE_PY_DIR}" -xf - && echo {shlex.quote(version)} > {marker}')
+    try:
+        r = subprocess.run(_ssh_cmd(ssh_cfg, unpack), stdin=pack.stdout,
+                           capture_output=True, text=True, timeout=120)
+    finally:
+        pack.stdout.close()
+        pack.wait()
+    if r.returncode != 0:
+        print(f"[remote-python] copying mutagen {version} to the Navidrome host failed: "
+              f"{r.stderr[-300:]}", file=sys.stderr)
+        return False
+    print(f"[remote-python] copied mutagen {version} to ~/{_REMOTE_PY_DIR} on the Navidrome host",
+          file=sys.stderr)
+    return True
+
+def _remote_python(ssh_cfg):
+    """The python3 command for the remote scripts, with our mutagen on its path. Falls back to
+    the host's plain python3 (and its own mutagen, if any) when the copy can't be made."""
+    key = (ssh_cfg["user"], ssh_cfg["host"], str(ssh_cfg["port"]))
+    with _remote_mutagen_lock:
+        state = _remote_mutagen_state.get(key)
+        if state is not True and (state is None or time.time() - state > _REMOTE_MUTAGEN_RETRY_SEC):
+            try:
+                ok = _ensure_remote_mutagen(ssh_cfg)
+            except Exception as e:
+                print(f"[remote-python] mutagen copy error: {e}", file=sys.stderr)
+                ok = False
+            _remote_mutagen_state[key] = True if ok else time.time()
+        ready = _remote_mutagen_state[key] is True
+    return f'env PYTHONPATH="$HOME/{_REMOTE_PY_DIR}" python3' if ready else "python3"
+
 def _run_remote_scan(cmd, timeout=180, retries=1, retry_delay=5, **run_kwargs):
     """subprocess.run() wrapper for the remote "python3 -c <scan script>"
     SSH calls (genre scan, title-dedupe scan, orphan scan, verify scan) —
@@ -2986,7 +3038,7 @@ def find_orphaned_navidrome_entries(ssh_cfg):
         rows[id_] = path
 
     filter_cmd = _ssh_cmd(ssh_cfg,
-        f"python3 -c {shlex.quote(_ORPHAN_SCAN_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+        f"{_remote_python(ssh_cfg)} -c {shlex.quote(_ORPHAN_SCAN_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
     result = subprocess.run(filter_cmd, input=result.stdout, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-300:] or "orphan filter failed")
@@ -3095,7 +3147,7 @@ def genre_relabel_worker(job_id):
 
     with job_lock:
         jobs[job_id]["current_track"] = "Scanning library on the Navidrome host…"
-    scan_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_GENRE_SCAN_REMOTE_SCRIPT)} "
+    scan_cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_GENRE_SCAN_REMOTE_SCRIPT)} "
                                   f"{shlex.quote(ssh_cfg['music_path'])}")
     try:
         result = _run_remote_scan(scan_cmd, timeout=180)
@@ -3180,7 +3232,7 @@ def genre_relabel_worker(job_id):
                     save_jobs()
                     return
             batch = updates[i:i + BATCH]
-            apply_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_GENRE_APPLY_REMOTE_SCRIPT)}")
+            apply_cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_GENRE_APPLY_REMOTE_SCRIPT)}")
             try:
                 result = subprocess.run(apply_cmd, input=json.dumps(batch),
                                          capture_output=True, text=True, timeout=120)
@@ -3355,7 +3407,7 @@ def _normalize_one_file_local(ssh_cfg, rel_path):
         swap_script = ("import os; "
                         f"p={remote_path!r}; t={remote_tmp!r}; "
                         "os.chmod(t, os.stat(p).st_mode); os.replace(t, p)")
-        swap_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(swap_script)}")
+        swap_cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(swap_script)}")
         r = subprocess.run(swap_cmd, capture_output=True, text=True, timeout=20)
         if r.returncode != 0:
             subprocess.run(_ssh_cmd(ssh_cfg, f"rm -f -- {shlex.quote(remote_tmp)}"),
@@ -4349,7 +4401,7 @@ def scan_albumartist_splits(ssh_cfg):
     """Runs _ALBUMARTIST_SCAN_REMOTE_SCRIPT over the whole library in one
     SSH round-trip. Returns {folder_name: {artist: [paths]}} for every
     folder with 2+ distinct non-blank ALBUMARTIST values."""
-    cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_ALBUMARTIST_SCAN_REMOTE_SCRIPT)} "
+    cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_ALBUMARTIST_SCAN_REMOTE_SCRIPT)} "
                              f"{shlex.quote(ssh_cfg['music_path'])}")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0 or not result.stdout.strip():
@@ -4385,7 +4437,7 @@ def apply_albumartist_split_fixes(ssh_cfg, fixes):
               for info in fixes.values() for p in info["paths"]]
     if not batch:
         return 0, 0
-    cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_REALIGN_ALBUMARTIST_REMOTE_SCRIPT)} "
+    cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_REALIGN_ALBUMARTIST_REMOTE_SCRIPT)} "
                              f"{shlex.quote(json.dumps(batch))}")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     try:
@@ -4486,7 +4538,7 @@ def _apply_cover_art(ssh_cfg, album_folder_name, cover_url):
         return 0, [f"cover art download failed: {e}"]
 
     folder_path = f"{ssh_cfg['music_path']}/{sanitize(album_folder_name)}"
-    cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_APPLY_COVER_ART_REMOTE_SCRIPT)} "
+    cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_APPLY_COVER_ART_REMOTE_SCRIPT)} "
                              f"{shlex.quote(folder_path)} {shlex.quote(mime)}")
     try:
         result = subprocess.run(cmd, input=base64.b64encode(img_data).decode(),
@@ -4639,7 +4691,7 @@ def consolidate_editions_worker(job_id):
 
                 if batch:
                     script_cmd = _ssh_cmd(ssh_cfg,
-                        f"python3 -c {shlex.quote(_CONSOLIDATE_REMOTE_SCRIPT)} {shlex.quote(json.dumps(batch))}")
+                        f"{_remote_python(ssh_cfg)} -c {shlex.quote(_CONSOLIDATE_REMOTE_SCRIPT)} {shlex.quote(json.dumps(batch))}")
                     result = subprocess.run(script_cmd, capture_output=True, text=True, timeout=120)
                     try:
                         outcomes = json.loads(result.stdout.strip())
@@ -5252,7 +5304,7 @@ def verify_tracks_worker(job_id):
 
     with job_lock:
         jobs[job_id]["current_track"] = "Reading tags for every track on the Navidrome host…"
-    scan_cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_VERIFY_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+    scan_cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_VERIFY_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
     try:
         result = _run_remote_scan(scan_cmd, timeout=180)
         if result.returncode != 0:
@@ -5885,7 +5937,7 @@ def tracknumber_worker(job_id):
         jobs[job_id]["status"] = "running"
     try:
         ssh_cfg = load_ssh_config()
-        cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_TN_INVENTORY_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+        cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_TN_INVENTORY_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
         result = _run_remote_scan(cmd, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(result.stderr[-300:] or "inventory failed")
@@ -5980,7 +6032,7 @@ def tracknumber_worker(job_id):
         log(f"ℹ Found official numbers for {len(plan)} track(s)")
         written = 0
         if plan:
-            cmd = _ssh_cmd(ssh_cfg, f"python3 -c {shlex.quote(_TN_WRITE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
+            cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_TN_WRITE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
             r = subprocess.run(cmd, input=json.dumps(plan), capture_output=True, text=True, timeout=900)
             written = int((r.stdout or "0").strip() or 0) if r.returncode == 0 else 0
             if r.returncode != 0:

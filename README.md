@@ -29,7 +29,7 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
 1. Copy `.env.example` to `.env` and fill in:
    - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` / `SPOTIFY_REDIRECT_URI` — from a [Spotify Developer app](https://developer.spotify.com/dashboard).
    - `NAVIDROME_URL` / `NAVIDROME_USER` / `NAVIDROME_PASSWORD` — your Navidrome instance's admin credentials.
-   - `SSH_HOST` / `SSH_USER` / `SSH_PORT` / `SSH_MUSIC_PATH` — SSH access to the machine hosting Navidrome's music folder, so downloaded files can be rsynced over.
+   - `SSH_HOST` / `SSH_USER` / `SSH_PORT` / `SSH_MUSIC_PATH` — SSH access to the machine hosting Navidrome's music folder, so downloaded files can be rsynced over. That machine needs `python3` and `rsync`. The Library Maintenance tools read and write tags there with mutagen; SpotiDrome copies its own copy to `~/.cache/spotidrome/py` on that machine the first time, so you don't have to install it.
 2. Place an SSH private key (`id_rsa`) authorized on the Navidrome host at `~/.ssh/id_rsa` on the machine running SpotiDrome — it's bind-mounted into the backend container and also doubles as the persistent storage location for the app's runtime state (tracked playlists, job history, schedule config, etc.).
 3. Start it with the prebuilt images:
    ```bash

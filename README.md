@@ -2,6 +2,15 @@
 
 A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome](https://www.navidrome.org/) server. SpotiDrome downloads tracks as FLAC via `yt-dlp`, tags them, and rsyncs them straight into your Navidrome music library — keeping playlists in sync on a schedule.
 
+## Screenshots
+
+![The SpotiDrome dashboard: Spotify playlists on the left, download jobs on the right with a Normalize Volume run in progress](docs/screenshots/dashboard.png)
+
+<p>
+  <img src="docs/screenshots/playlist.png" alt="A Spotify playlist opened in SpotiDrome, with Download All and Sync to Navidrome" width="63%">
+  <img src="docs/screenshots/maintenance.png" alt="Settings: YouTube cookies and the Library Maintenance tools, each with a weekly automatic run switch" width="35%">
+</p>
+
 ## Features
 
 - **Spotify playlist sync** — authenticate with Spotify, browse your playlists, download any of them as FLAC.

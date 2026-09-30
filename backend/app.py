@@ -913,9 +913,67 @@ def load_album_naming(ssh_cfg):
     return {"aliases": aliases, "folders": {f.lower(): f for f in folders}}
 
 
+# Edition endings that name another release of the *same* album. "(Live)",
+# "(Acoustic)", "(Remixes)" and the like are left alone - those are different music.
+_EDITION_KEYWORD = r"(?:super\s+)?deluxe|bonus|expanded|anniversary|remaster(?:ed)?|reissue"
+_EDITION_NAMED = (r"(?:special|collector'?s|legacy|platinum|tour|complete|limited|standard|"
+                  r"international|japan(?:ese)?)\s+(?:edition|version)")
+_EDITION_TAIL_RE = re.compile(
+    r"\s*(?:"
+    rf"[\(\[][^\)\]]*\b(?:{_EDITION_KEYWORD}|{_EDITION_NAMED})\b[^\)\]]*[\)\]]"   # (Bonus Edition), [2011 Remaster]
+    rf"|\s[-–—:]\s[^-–—:]*\b(?:{_EDITION_KEYWORD}|{_EDITION_NAMED})\b[^-–—:]*"      # - 20th Anniversary Edition
+    r"|\s+\d+(?:st|nd|rd|th)\s+anniversary(?:\s+(?:edition|version))?"             # 20th Anniversary Edition
+    rf"|\s+(?:{_EDITION_KEYWORD})(?:\s+(?:edition|version))?"                        # Deluxe Edition
+    r")\s*$", re.I)
+
+
+def edition_base(album):
+    """ "Meteora (Bonus Edition)" / "Meteora - 20th Anniversary Edition" -> "Meteora"."""
+    name = (album or "").strip()
+    while True:
+        shorter = _EDITION_TAIL_RE.sub("", name).strip()
+        if not shorter or shorter == name:
+            return name
+        name = shorter
+
+
+def library_edition_album(album, artist, naming):
+    """The album a new track should join when the library already has another
+    edition of it by the same artist: "Meteora" and "Meteora (Bonus Edition)"
+    (or "- 20th Anniversary Edition") would otherwise become separate albums in
+    Navidrome, depending on which name each track's source used. Joins the
+    biggest existing edition; None when there's nothing to join (or only this
+    exact name). Artists must overlap, so same-named albums by different artists
+    stay apart. One Navidrome search per base name per run."""
+    if not naming or not album or album.strip().lower() in BAD_ALBUM_VALUES or not artist:
+        return None
+    base = edition_base(album)
+    if not base:
+        return None
+    cache = naming.setdefault("editions", {})
+    key = base.lower()
+    if key not in cache:
+        try:
+            found = nd_subsonic("search3", query=base, albumCount=40, songCount=0, artistCount=0)
+            albums = found.get("searchResult3", {}).get("album", [])
+            cache[key] = sorted(((a.get("name") or "", a.get("artist") or "", a.get("songCount") or 0)
+                                 for a in albums if edition_base(a.get("name")).lower() == key),
+                                key=lambda a: a[2], reverse=True)
+        except Exception as e:
+            print(f"[albums] edition lookup for {base!r} failed: {e}", file=sys.stderr)
+            cache[key] = []
+    for name, existing_artist, _count in cache[key]:
+        low = existing_artist.strip().lower()
+        if low == "various artists" or _artist_names(existing_artist) & _artist_names(artist):
+            return name if name.strip().lower() != album.strip().lower() else None
+    return None
+
+
 def canonical_album(album, naming, artist=None):
     """(album tag, folder name) for a new track's album:
     1. a matching rename rule from album_aliases.json wins;
+    1b. another edition of the same album by the same artist already in the
+       library is joined (library_edition_album);
     2. else an existing album folder whose name only differs in upper/lower
        case is reused, with that spelling as the album tag too;
     3. else the name as given (folder = the sanitized name)."""
@@ -930,6 +988,9 @@ def canonical_album(album, naming, artist=None):
         only = [only] if isinstance(only, str) else only
         if not only or any(o.strip().lower() in (artist or "").lower() for o in only):
             return rule["album"], rule.get("folder") or sanitize(rule["album"])
+    joined = library_edition_album(album, artist, naming)
+    if joined:
+        album = joined
     existing = naming["folders"].get(sanitize(album).lower())
     if existing and existing != sanitize(album):
         # Only borrow the folder's spelling as the tag when sanitizing didn't

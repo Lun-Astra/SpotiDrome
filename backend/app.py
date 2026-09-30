@@ -6,6 +6,7 @@ from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+import mutagen
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, TRCK, TPOS, TXXX, TSRC, error as ID3Error
 from ytmusicapi import YTMusic
@@ -1592,6 +1593,38 @@ def lookup_real_album(url, timeout=15):
     except Exception:
         return None
 
+def lookup_album_via_ytm_songs(title, artist, duration_sec=None):
+    """A music video has no album of its own, so yt-dlp finds none. Look the same song up in
+    YouTube Music's "Songs" catalog and take its album - only if title, artist and length all
+    match, so a cover or another version doesn't hand us the wrong album."""
+    if not title or not artist:
+        return None
+    for r in (_ytm_call("search", f"{artist} {title}", filter="songs", limit=5) or [])[:5]:
+        album = ((r.get("album") or {}).get("name") or "").strip()
+        names = [a.get("name", "") for a in r.get("artists") or []]
+        if not album or not _title_ok(r.get("title", ""), title) or not _artist_ok(names, artist):
+            continue
+        if duration_sec and not _duration_close(r.get("duration_seconds"), duration_sec, pct=0.05, floor=8):
+            continue
+        return album
+    return None
+
+_VIDEO_TITLE_SUFFIX = re.compile(
+    r"\s*[\(\[](official\s+(music\s+|lyric\s+)?(video|audio|visualizer)|music\s+video|official|hd|hq|4k)[\)\]]\s*$",
+    re.I)
+
+def clean_video_title(title, artist):
+    """"Radiohead - Creep (Official Video)" by Radiohead -> "Creep". Only strips an
+    "Artist - " prefix when it really is this artist, so "A - B" song titles stay intact."""
+    t = (title or "").strip()
+    for _ in range(2):
+        t = _VIDEO_TITLE_SUFFIX.sub("", t).strip()
+    a = (artist or "").strip()
+    m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", t)
+    if a and m and m.group(1).strip().lower() == a.lower():
+        t = m.group(2).strip()
+    return t or (title or "").strip()
+
 def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_url, local_dir, album_artist=None,
                         naming=None):
     """If album looks like a placeholder (empty/'Unknown Album'/the playlist name
@@ -1601,6 +1634,12 @@ def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_u
     if normalized not in BAD_ALBUM_VALUES and normalized != (playlist_name or "").strip().lower():
         return album, flac_path
     real_album = lookup_real_album(source_url)
+    if not real_album:
+        try:
+            duration = mutagen.File(flac_path).info.length
+        except Exception:
+            duration = None
+        real_album = lookup_album_via_ytm_songs(title, artist, duration)
     if not real_album or real_album.strip().lower() == normalized:
         return album, flac_path
     real_album, real_folder = canonical_album(real_album, naming, album_artist or artist)
@@ -2055,6 +2094,8 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
         title = entry.get("title", "Unknown Title")
         artist = entry.get("uploader") or entry.get("channel") or entry.get("artist") or "Unknown Artist"
         artist = re.sub(r" - Topic$", "", artist)
+        if not album_mode:
+            title = clean_video_title(title, artist)
         if album_mode:
             # every track in the one album folder, under one album name
             album, album_folder = album_hint, album_hint_folder
@@ -3334,7 +3375,7 @@ def _measure_integrated_loudness(local_path):
     its input_i. Enough to decide whether a file needs normalizing at all; only those get the
     full loudnorm pass. Returns None if it couldn't be measured."""
     cmd = ["ffmpeg", "-nostats", "-i", local_path, "-af", "ebur128=framelog=quiet", "-vn", "-f", "null", "-"]
-    r = subprocess.run(_NICE + cmd, capture_output=True, text=True, timeout=180)
+    r = subprocess.run(_NICE + cmd, capture_output=True, text=True, errors="replace", timeout=180)
     values = re.findall(r"^\s*I:\s*(-?[\d.]+|-inf) LUFS", r.stderr, re.M)
     if not values:
         return None
@@ -3347,7 +3388,7 @@ def _measure_integrated_loudness(local_path):
 def _measure_loudness(local_path):
     cmd = ["ffmpeg", "-i", local_path, "-af", LOUDNORM_FILTER + ":print_format=json",
            "-vn", "-f", "null", "-"]
-    r = subprocess.run(_NICE + cmd, capture_output=True, text=True, timeout=180)
+    r = subprocess.run(_NICE + cmd, capture_output=True, text=True, errors="replace", timeout=180)
     start = r.stderr.rfind("{")
     end = r.stderr.find("}", start) if start != -1 else -1
     if start == -1 or end == -1:
@@ -3432,7 +3473,7 @@ def _normalize_one_file_local(ssh_cfg, rel_path, stat=None):
         )
         cmd = (["ffmpeg", "-y", "-i", local_in, "-af", render_filter, "-map_metadata", "-1", "-vn"]
                + codec_args + [local_out])
-        r = subprocess.run(_NICE + cmd, capture_output=True, text=True, timeout=280)
+        r = subprocess.run(_NICE + cmd, capture_output=True, text=True, errors="replace", timeout=280)
         if r.returncode != 0:
             return {"action": "failed", "reason": r.stderr[-300:], "rel_path": rel_path}
 

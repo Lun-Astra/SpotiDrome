@@ -3304,6 +3304,46 @@ NORMALIZE_WORKERS = 2  # matches this container's own CPU limit (see docker-comp
 _NICE = ["nice", "-n", "10"]
 
 
+# Remembers which files were already checked, by (size, mtime) as the Navidrome host's `find`
+# reports them, so a later run skips unchanged files without downloading them again.
+NORMALIZE_STATE_FILE = "/root/.ssh/volume_normalize_state.json"
+
+
+def _load_normalize_state():
+    try:
+        with open(NORMALIZE_STATE_FILE) as f:
+            state = json.load(f)
+    except Exception:
+        return {}
+    # A different target or tolerance means every earlier "within target" verdict is stale.
+    if state.get("target_i") != _LOUDNORM_TARGET_I or state.get("tolerance") != _LOUDNORM_TOLERANCE_LU:
+        return {}
+    return state.get("files", {})
+
+
+def _save_normalize_state(files):
+    tmp = NORMALIZE_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"target_i": _LOUDNORM_TARGET_I, "tolerance": _LOUDNORM_TOLERANCE_LU, "files": files}, f)
+    os.replace(tmp, NORMALIZE_STATE_FILE)
+
+
+def _measure_integrated_loudness(local_path):
+    """Integrated loudness (LUFS) via ffmpeg's ebur128 filter - about 7x faster than a loudnorm
+    analysis pass (which also computes true peak by upsampling to 192 kHz) and within 0.1 LU of
+    its input_i. Enough to decide whether a file needs normalizing at all; only those get the
+    full loudnorm pass. Returns None if it couldn't be measured."""
+    cmd = ["ffmpeg", "-nostats", "-i", local_path, "-af", "ebur128=framelog=quiet", "-vn", "-f", "null", "-"]
+    r = subprocess.run(_NICE + cmd, capture_output=True, text=True, timeout=180)
+    values = re.findall(r"^\s*I:\s*(-?[\d.]+|-inf) LUFS", r.stderr, re.M)
+    if not values:
+        return None
+    try:
+        return float(values[-1])
+    except ValueError:
+        return None
+
+
 def _measure_loudness(local_path):
     cmd = ["ffmpeg", "-i", local_path, "-af", LOUDNORM_FILTER + ":print_format=json",
            "-vn", "-f", "null", "-"]
@@ -3318,7 +3358,7 @@ def _measure_loudness(local_path):
         return None
 
 
-def _normalize_one_file_local(ssh_cfg, rel_path):
+def _normalize_one_file_local(ssh_cfg, rel_path, stat=None):
     """Downloads one file, measures it, and — only if it's actually
     outside the target — re-encodes it locally and uploads just the
     result, finishing with the exact same safety properties the old
@@ -3329,7 +3369,8 @@ def _normalize_one_file_local(ssh_cfg, rel_path):
     (see the ~74%-of-the-library-unplayable incident this app already had
     from getting exactly that wrong), and the original never touched
     unless a full, verified replacement is ready. Returns a result dict
-    shaped like {"action": "normalized"|"skipped"|"failed", ...}."""
+    shaped like {"action": "normalized"|"skipped"|"failed", ...}; "stat" is the
+    file's (size, mtime) afterwards, for NORMALIZE_STATE_FILE."""
     remote_path = f"{ssh_cfg['music_path']}/{rel_path}"
     ext = os.path.splitext(rel_path)[1].lower()
     if ext not in (".flac", ".mp3"):
@@ -3346,6 +3387,15 @@ def _normalize_one_file_local(ssh_cfg, rel_path):
         if r.returncode != 0:
             return {"action": "failed", "reason": f"download failed: {r.stderr[-200:]}", "rel_path": rel_path}
 
+        # Most of the library is already within target, so decide with the fast measurement
+        # and only run the slow loudnorm analysis for files that really get re-encoded.
+        quick_i = _measure_integrated_loudness(local_in)
+        if quick_i is None:
+            return {"action": "failed", "reason": "loudness measurement failed", "rel_path": rel_path}
+        # ebur128 reports -70 LUFS (its gate) or -inf for silence - nothing to normalize.
+        if quick_i <= -69 or abs(quick_i - _LOUDNORM_TARGET_I) <= _LOUDNORM_TOLERANCE_LU:
+            return {"action": "skipped", "lufs": quick_i, "rel_path": rel_path, "stat": stat}
+
         summary = _measure_loudness(local_in)
         if summary is None:
             return {"action": "failed", "reason": "loudness measurement failed", "rel_path": rel_path}
@@ -3354,7 +3404,7 @@ def _normalize_one_file_local(ssh_cfg, rel_path):
         except Exception:
             input_i = 0.0
         if input_i == float("-inf") or abs(input_i - _LOUDNORM_TARGET_I) <= _LOUDNORM_TOLERANCE_LU:
-            return {"action": "skipped", "lufs": input_i, "rel_path": rel_path}
+            return {"action": "skipped", "lufs": input_i, "rel_path": rel_path, "stat": stat}
 
         if ext == ".flac":
             orig = FLAC(local_in)
@@ -3406,7 +3456,8 @@ def _normalize_one_file_local(ssh_cfg, rel_path):
 
         swap_script = ("import os; "
                         f"p={remote_path!r}; t={remote_tmp!r}; "
-                        "os.chmod(t, os.stat(p).st_mode); os.replace(t, p)")
+                        "os.chmod(t, os.stat(p).st_mode); os.replace(t, p); "
+                        "st = os.stat(p); print(st.st_size, int(st.st_mtime))")
         swap_cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(swap_script)}")
         r = subprocess.run(swap_cmd, capture_output=True, text=True, timeout=20)
         if r.returncode != 0:
@@ -3414,7 +3465,12 @@ def _normalize_one_file_local(ssh_cfg, rel_path):
                             capture_output=True, timeout=10)
             return {"action": "failed", "reason": f"remote swap failed: {r.stderr[-200:]}", "rel_path": rel_path}
 
-        return {"action": "normalized", "lufs_before": input_i, "rel_path": rel_path}
+        try:
+            size, mtime = r.stdout.split()[-2:]
+            new_stat = [int(size), int(mtime)]
+        except Exception:
+            new_stat = None  # just gets checked again next run
+        return {"action": "normalized", "lufs_before": input_i, "rel_path": rel_path, "stat": new_stat}
     except Exception as e:
         return {"action": "failed", "reason": str(e)[:200], "rel_path": rel_path}
     finally:
@@ -3445,21 +3501,32 @@ def volume_normalize_worker(job_id):
         jobs[job_id]["current_track"] = "Listing library files on the Navidrome host…"
     list_cmd = _ssh_cmd(ssh_cfg,
         f"find {shlex.quote(ssh_cfg['music_path'])} "
-        f"\\( -iname '*.flac' -o -iname '*.mp3' \\) -type f -printf '%P\\n'")
+        f"\\( -iname '*.flac' -o -iname '*.mp3' \\) -type f -printf '%s\\t%T@\\t%P\\n'")
     try:
         result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
             raise ValueError(result.stderr[-500:])
-        rel_paths = [p for p in result.stdout.splitlines() if p.strip()]
+        listing = {}
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) == 3 and parts[2].strip():
+                listing[parts[2]] = [int(parts[0]), int(float(parts[1]))]
     except Exception as e:
         with job_lock:
             jobs[job_id]["log"].append(f"✗ Failed to list library: {e}")
             jobs[job_id]["status"] = "done"
         return
 
+    # Unchanged since they were last checked (or normalized): skipped without downloading.
+    checked = {p: st for p, st in _load_normalize_state().items() if listing.get(p) == st}
+    rel_paths = [p for p in listing if p not in checked]
+    unchanged = len(checked)
+
     with job_lock:
         jobs[job_id]["total"] = len(rel_paths)
-        jobs[job_id]["log"].append(f"ℹ Found {len(rel_paths)} file(s) on the Navidrome host")
+        jobs[job_id]["log"].append(
+            f"ℹ Found {len(listing)} file(s) on the Navidrome host; {unchanged} unchanged since the "
+            f"last check are skipped, {len(rel_paths)} to check")
 
     normalized = failed = skipped = 0
     completed = 0
@@ -3471,7 +3538,7 @@ def volume_normalize_worker(job_id):
     # just finish naturally; there's no single "current file" to interrupt
     # once several run concurrently.
     with ThreadPoolExecutor(max_workers=NORMALIZE_WORKERS) as executor:
-        future_to_path = {executor.submit(_normalize_one_file_local, ssh_cfg, rel_path): rel_path
+        future_to_path = {executor.submit(_normalize_one_file_local, ssh_cfg, rel_path, listing[rel_path]): rel_path
                            for rel_path in rel_paths}
         for future in as_completed(future_to_path):
             rel_path = future_to_path[future]
@@ -3492,6 +3559,13 @@ def volume_normalize_worker(job_id):
             except Exception as e:
                 evt = {"action": "failed", "reason": str(e)[:200]}
             action = evt.get("action")
+            if action in ("normalized", "skipped") and evt.get("stat"):
+                checked[rel_path] = evt["stat"]
+            if completed % 100 == 0:
+                try:
+                    _save_normalize_state(checked)
+                except Exception as e:
+                    print(f"[normalize] saving state failed: {e}", file=sys.stderr)
 
             if action == "normalized":
                 normalized += 1
@@ -3512,9 +3586,15 @@ def volume_normalize_worker(job_id):
                 jobs[job_id]["downloaded"] = normalized
                 jobs[job_id]["failed"] = failed
 
+    try:
+        _save_normalize_state(checked)
+    except Exception as e:
+        print(f"[normalize] saving state failed: {e}", file=sys.stderr)
+
     with job_lock:
         jobs[job_id]["log"].append(
-            f"✅ Done: {normalized} normalized, {skipped} already within target/skipped, {failed} failed")
+            f"✅ Done: {normalized} normalized, {skipped} already within target/skipped, {failed} failed"
+            f" ({unchanged} unchanged since the last check)")
 
     if normalized and nd_cfg:
         with job_lock:

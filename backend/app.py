@@ -981,7 +981,7 @@ json.dump(out, sys.stdout)
 
 
 def library_album_for_spotify_id(album_id, naming, ssh_cfg):
-    """(album tag, folder, album artist) the library already uses for this
+    """(album tag, album artist, folder) the library already uses for this
     Spotify album ID, else None. Albums get renamed on Spotify over time
     ("RWBY, Vol. 1 (Music from ...)" became "Songs Part One"), but the ID
     stays, so a new track of a renamed album still joins the album the
@@ -1825,7 +1825,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
         source_album = track['album']
         by_id = library_album_for_spotify_id(track.get('spotify_album_id'), naming, ssh_cfg)
         if by_id:
-            track['album'], album_folder, existing_aa = by_id
+            # The index stores [album tag, album artist, folder].
+            track['album'], existing_aa, album_folder = by_id
             track['album_artist'] = existing_aa or track.get('album_artist')
         else:
             track['album'], album_folder = canonical_album(

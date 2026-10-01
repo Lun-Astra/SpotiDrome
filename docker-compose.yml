@@ -40,6 +40,7 @@ services:
       - SSH_USER=${SSH_USER}
       - SSH_PORT=${SSH_PORT:-22}
       - SSH_MUSIC_PATH=${SSH_MUSIC_PATH}
+      - REMOTE_SCAN_TIMEOUT=${REMOTE_SCAN_TIMEOUT:-3600}
     deploy:
       resources:
         limits:

@@ -992,7 +992,7 @@ def library_album_for_spotify_id(album_id, naming, ssh_cfg):
     if "spotify_ids" not in naming:
         try:
             cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_ALBUM_ID_INDEX_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
-            r = _run_remote_scan(cmd, timeout=600)
+            r = _run_remote_scan(cmd, timeout=REMOTE_SCAN_TIMEOUT)
             naming["spotify_ids"] = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
         except Exception as e:
             print(f"[albums] album-ID index failed: {e}", file=sys.stderr)
@@ -2639,7 +2639,7 @@ def scan_and_dedupe_remote(ssh_cfg, nd_cfg):
            f"{ssh_cfg['user']}@{ssh_cfg['host']}",
            f"{_remote_python(ssh_cfg)} -c {shlex.quote(_DEDUPE_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=REMOTE_SCAN_TIMEOUT)
         if result.returncode != 0:
             report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": result.stderr[-300:]}
             save_duplicate_report(report)
@@ -2815,7 +2815,7 @@ def scan_and_dedupe_by_title(ssh_cfg, nd_cfg):
            f"{ssh_cfg['user']}@{ssh_cfg['host']}",
            f"{_remote_python(ssh_cfg)} -c {shlex.quote(_TITLE_DEDUPE_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}"]
     try:
-        result = _run_remote_scan(cmd, timeout=300)
+        result = _run_remote_scan(cmd, timeout=REMOTE_SCAN_TIMEOUT)
         if result.returncode != 0:
             report = {"last_run": datetime.utcnow().isoformat(), "removed": [], "error": result.stderr[-300:], "history": history}
             save_title_duplicate_report(report)
@@ -3042,6 +3042,22 @@ def _remote_python(ssh_cfg):
         ready = _remote_mutagen_state[key] is True
     return f'env PYTHONPATH="$HOME/{_REMOTE_PY_DIR}" python3' if ready else "python3"
 
+# Limit for the remote scripts that walk the whole music library (tag scans,
+# dedupe, track numbers...). Their run time grows with the library and with the
+# storage (a NAS share is far slower than a local disk), so a fixed few minutes
+# failed on big libraries. Override with REMOTE_SCAN_TIMEOUT (seconds) in .env.
+REMOTE_SCAN_TIMEOUT = int(os.environ.get("REMOTE_SCAN_TIMEOUT") or 3600)
+
+
+def _scan_error(e):
+    """A readable reason for a failed library scan: a timeout otherwise shows the
+    whole multi-line remote script in the job log."""
+    if isinstance(e, subprocess.TimeoutExpired):
+        return (f"the scan took longer than {REMOTE_SCAN_TIMEOUT // 60} min. For a big or slow "
+                f"library (e.g. on a NAS), raise REMOTE_SCAN_TIMEOUT (seconds) in .env")
+    return str(e)
+
+
 def _run_remote_scan(cmd, timeout=180, retries=1, retry_delay=5, **run_kwargs):
     """subprocess.run() wrapper for the remote "python3 -c <scan script>"
     SSH calls (genre scan, title-dedupe scan, orphan scan, verify scan) —
@@ -3105,7 +3121,7 @@ def find_orphaned_navidrome_entries(ssh_cfg):
 
     filter_cmd = _ssh_cmd(ssh_cfg,
         f"{_remote_python(ssh_cfg)} -c {shlex.quote(_ORPHAN_SCAN_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
-    result = subprocess.run(filter_cmd, input=result.stdout, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(filter_cmd, input=result.stdout, capture_output=True, text=True, timeout=REMOTE_SCAN_TIMEOUT)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-300:] or "orphan filter failed")
     missing_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -3216,13 +3232,13 @@ def genre_relabel_worker(job_id):
     scan_cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_GENRE_SCAN_REMOTE_SCRIPT)} "
                                   f"{shlex.quote(ssh_cfg['music_path'])}")
     try:
-        result = _run_remote_scan(scan_cmd, timeout=180)
+        result = _run_remote_scan(scan_cmd, timeout=REMOTE_SCAN_TIMEOUT)
         if result.returncode != 0:
             raise ValueError(result.stderr[-500:])
         files = json.loads(result.stdout.strip() or "[]")
     except Exception as e:
         with job_lock:
-            jobs[job_id]["log"].append(f"✗ Failed to scan library: {e}")
+            jobs[job_id]["log"].append(f"✗ Failed to scan library: {_scan_error(e)}")
             jobs[job_id]["status"] = "done"
         return
 
@@ -4546,7 +4562,7 @@ def scan_albumartist_splits(ssh_cfg):
     folder with 2+ distinct non-blank ALBUMARTIST values."""
     cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_ALBUMARTIST_SCAN_REMOTE_SCRIPT)} "
                              f"{shlex.quote(ssh_cfg['music_path'])}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=REMOTE_SCAN_TIMEOUT)
     if result.returncode != 0 or not result.stdout.strip():
         return {}
     try:
@@ -5449,13 +5465,13 @@ def verify_tracks_worker(job_id):
         jobs[job_id]["current_track"] = "Reading tags for every track on the Navidrome host…"
     scan_cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_VERIFY_SCAN_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
     try:
-        result = _run_remote_scan(scan_cmd, timeout=180)
+        result = _run_remote_scan(scan_cmd, timeout=REMOTE_SCAN_TIMEOUT)
         if result.returncode != 0:
             raise ValueError(result.stderr[-500:])
         files = json.loads(result.stdout.strip() or "[]")
     except Exception as e:
         with job_lock:
-            jobs[job_id]["log"].append(f"✗ Failed to scan library: {e}")
+            jobs[job_id]["log"].append(f"✗ Failed to scan library: {_scan_error(e)}")
             jobs[job_id]["status"] = "done"
         return
 
@@ -6081,7 +6097,7 @@ def tracknumber_worker(job_id):
     try:
         ssh_cfg = load_ssh_config()
         cmd = _ssh_cmd(ssh_cfg, f"{_remote_python(ssh_cfg)} -c {shlex.quote(_TN_INVENTORY_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
-        result = _run_remote_scan(cmd, timeout=600)
+        result = _run_remote_scan(cmd, timeout=REMOTE_SCAN_TIMEOUT)
         if result.returncode != 0:
             raise RuntimeError(result.stderr[-300:] or "inventory failed")
         rows = json.loads(result.stdout or "[]")

@@ -5863,19 +5863,6 @@ def _download_and_replace_track(artist, title, album, album_artist, duration_ms,
                             "downloaded": 0, "failed": 0, "nd_synced": None, "nd_missing": None,
                             "current_track": f"{artist} - {title}", "log": []}
 
-    # Unlike a failed download (nothing to overwrite), a flagged-wrong track
-    # already has a file sitting in Navidrome under this exact name — delete
-    # it up front so a rejected replacement doesn't leave the known-wrong
-    # file in place, and so a stale Navidrome DB row doesn't survive
-    # alongside the new one if the filename ever ends up differing.
-    if delete_existing_remote and ssh_cfg:
-        remote_path = f"{ssh_cfg['music_path']}/{sanitize(album)}/{filename}.flac"
-        rm_cmd = _ssh_cmd(ssh_cfg, f"rm -f -- {shlex.quote(remote_path)}")
-        result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
-        with job_lock:
-            jobs[tmp_job_id]["log"].append(f"🗑 Removed existing file at {remote_path}")
-        print(f"[flag-wrong] rm '{remote_path}' -> rc={result.returncode} err={result.stderr}", file=sys.stderr)
-
     is_youtube_url = "youtube.com" in url or "youtu.be" in url
     use_cookies = is_youtube_url and os.path.exists(COOKIES_FILE)
     rc, killed, stdout, stderr = _download_via_yt_dlp(
@@ -5910,15 +5897,25 @@ def _download_and_replace_track(artist, title, album, album_artist, duration_ms,
     if not os.path.exists(flac_path):
         return {"success": False, "message": "File missing after download"}
 
+    # The link was pasted by hand, so it's trusted (#6): the automatic checks
+    # (non-music content, artist tag, duration) only add a note, they don't reject.
     wrong_reason = _downloaded_file_looks_wrong(flac_path, title, duration_ms, expected_artist=artist)
     if wrong_reason:
-        try:
-            os.remove(flac_path)
-        except Exception:
-            pass
         with job_lock:
-            jobs[tmp_job_id]["log"].append(f"✗ Rejected pasted link ({wrong_reason}): {artist} - {title}")
-        return {"success": False, "message": f"Rejected — {wrong_reason}. Try a different link."}
+            jobs[tmp_job_id]["log"].append(f"⚠ Pasted link kept although {wrong_reason}: {artist} - {title}")
+
+    # Unlike a failed download (nothing to overwrite), a flagged-wrong track
+    # already has a file sitting in Navidrome under this exact name — delete
+    # it before uploading the new one (only now that the download worked, so
+    # a failed one keeps the old file), so a stale Navidrome DB row doesn't
+    # survive alongside the new one if the filename ever ends up differing.
+    if delete_existing_remote and ssh_cfg:
+        remote_path = f"{ssh_cfg['music_path']}/{sanitize(album)}/{filename}.flac"
+        rm_cmd = _ssh_cmd(ssh_cfg, f"rm -f -- {shlex.quote(remote_path)}")
+        result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
+        with job_lock:
+            jobs[tmp_job_id]["log"].append(f"🗑 Removed existing file at {remote_path}")
+        print(f"[flag-wrong] rm '{remote_path}' -> rc={result.returncode} err={result.stderr}", file=sys.stderr)
 
     source_url = extract_resolved_url(stdout) or url
     genre = lookup_genre(artist)
@@ -5936,6 +5933,7 @@ def _download_and_replace_track(artist, title, album, album_artist, duration_ms,
         synced_to_navidrome = True
 
     clear_failed_track(artist, title)
+    _trust_pasted_track(artist, title)
     with job_lock:
         jobs[tmp_job_id]["downloaded"] = 1
 
@@ -5943,7 +5941,25 @@ def _download_and_replace_track(artist, title, album, album_artist, duration_ms,
     message += " and synced to Navidrome" if synced_to_navidrome else " — no SSH configured, file left in local storage"
     if used_android_fallback:
         message += " — ⚠ lower quality (android fallback after repeated YouTube 403s)"
+    if wrong_reason:
+        message += f" — note: {wrong_reason}, kept because you pasted this link"
     return {"success": True, "message": message}
+
+def _trust_pasted_track(artist, title):
+    """A track replaced from a hand-pasted link isn't checked by Verify
+    Tracks again (#6): it goes on the mismatch whitelist and off the
+    current report."""
+    key = track_ignore_key(artist, title)
+    whitelist = load_track_mismatch_whitelist()
+    whitelist[key] = {"artist": artist, "title": title, "added_at": datetime.utcnow().isoformat(),
+                      "reason": "pasted link"}
+    save_track_mismatch_whitelist(whitelist)
+    report = load_track_mismatch_report()
+    kept = [m for m in report.get("mismatches", [])
+            if track_ignore_key(m.get("artist", ""), m.get("title", "")) != key]
+    if len(kept) != len(report.get("mismatches", [])):
+        report["mismatches"] = kept
+        save_track_mismatch_report(report)
 
 @app.route("/failed/retry", methods=["POST"])
 def retry_failed_track():

@@ -189,13 +189,26 @@ header{
 .track-flag-btn{background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px;padding:2px 4px;flex-shrink:0;opacity:.5;transition:opacity .15s,color .15s}
 .track-item:hover .track-flag-btn{opacity:1}
 .track-flag-btn:hover{color:var(--red)}
-.track-flag-row{display:none;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);background:var(--bg3)}
+.track-flag-row{display:none;align-items:center;flex-wrap:wrap;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);background:var(--bg3)}
 .track-flag-url{flex:1;background:var(--bg4);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-family:var(--font);font-size:12px;padding:7px 10px;outline:none;transition:border-color .15s}
 .track-flag-url:focus{border-color:rgba(139,92,246,.5)}
 .track-flag-url::placeholder{color:var(--text3)}
 .track-flag-result{font-size:11px;flex-basis:100%;display:none;padding:6px 10px;border-radius:6px;margin-top:2px}
 .track-flag-result.ok{display:block;background:rgba(30,215,96,.1);border:1px solid rgba(30,215,96,.2);color:#4ade80}
 .track-flag-result.err{display:block;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:var(--red)}
+.tracks-filter{display:none;padding:8px 16px;border-bottom:1px solid var(--border)}
+.tracks-filter.show{display:block}
+.tracks-filter input{width:100%;box-sizing:border-box;background:var(--bg4);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-family:var(--font);font-size:12px;padding:7px 10px;outline:none}
+.tracks-filter input:focus{border-color:rgba(139,92,246,.5)}
+.flag-search{flex-basis:100%;display:none;flex-direction:column;gap:2px;max-height:220px;overflow-y:auto}
+.flag-search.show{display:flex}
+.flag-hit{display:flex;align-items:center;gap:10px;padding:5px 8px;border-radius:6px;cursor:pointer;font-size:12px}
+.flag-hit:hover{background:var(--bg4)}
+.flag-hit img{width:28px;height:28px;border-radius:4px;object-fit:cover;flex-shrink:0}
+.flag-hit .fh-info{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.flag-hit .fh-sub{color:var(--text3);font-size:11px}
+.flag-hit .fh-dur{color:var(--text3);font-size:11px;flex-shrink:0}
+.flag-hit .fh-dur.off{color:#f87171}
 
 /* Sync row */
 .sync-row{
@@ -666,6 +679,7 @@ header{
               <button class="btn btn-primary" id="btn-download" disabled>↓ Download All</button>
             </div>
           </div>
+          <div class="tracks-filter" id="tracks-filter"><input type="search" id="tracks-filter-input" placeholder="Search this playlist (title, artist, album)…" oninput="renderTracks()"></div>
           <div id="tracks-list"></div>
           <div class="sync-row">
             <label class="toggle"><input type="checkbox" id="toggle-sync" checked><span class="toggle-sl"></span></label>
@@ -773,6 +787,7 @@ async function selectSourceAlbum(id,name){
   document.getElementById('selected-name').textContent=name;
   document.getElementById('selected-meta').textContent='Loading…';
   document.getElementById('tracks-list').innerHTML='<div class="empty"><div class="spin"></div></div>';
+  document.getElementById('tracks-filter-input').value='';
   document.getElementById('btn-download').disabled=true;
   const r=await fetch(`${API}/source-navidrome/albums/${id}/tracks`);
   allTracks=await r.json();
@@ -855,6 +870,7 @@ async function selectPlaylist(id,name){
   document.getElementById('selected-name').textContent=name;
   document.getElementById('selected-meta').textContent='Loading…';
   document.getElementById('tracks-list').innerHTML='<div class="empty"><div class="spin"></div></div>';
+  document.getElementById('tracks-filter-input').value='';
   document.getElementById('btn-download').disabled=true;
   const r=await fetch(`${API}/playlist/${id}/tracks`);allTracks=await r.json();
   document.getElementById('selected-meta').textContent=`${allTracks.length} tracks`;
@@ -864,13 +880,21 @@ async function selectPlaylist(id,name){
 
 function renderTracks(){
   const list=document.getElementById('tracks-list');
+  document.getElementById('tracks-filter').classList.toggle('show',allTracks.length>0);
   if(!allTracks.length){list.innerHTML='<div class="empty">No tracks</div>';return;}
+  // Search box: every word has to appear in the title, artist or album.
+  const words=document.getElementById('tracks-filter-input').value.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown=allTracks.map((t,i)=>[t,i]).filter(([t])=>{
+    const hay=`${t.name} ${t.artist} ${t.album||''}`.toLowerCase();
+    return words.every(w=>hay.includes(w));
+  });
+  if(!shown.length){list.innerHTML='<div class="empty">No tracks match</div>';return;}
   // "Flag as wrong" only makes sense for tracks that are (or will be) in
   // *your* library via the Spotify/YouTube pipeline — a source-Navidrome
   // album is just a preview of someone else's library pre-pull, nothing
   // to replace yet.
   const showFlag=currentSource==='spotify';
-  list.innerHTML=allTracks.map((t,i)=>`<div class="track-item">
+  list.innerHTML=shown.map(([t,i])=>`<div class="track-item">
     <div class="track-num">${i+1}</div>
     <div class="track-art">${t.image?`<img src="${t.image.startsWith('/')?API+t.image:t.image}" loading="lazy">`:''}</div>
     <div class="track-info"><div class="track-name">${esc(t.name)}</div><div class="track-artist">${esc(t.artist)}</div></div>
@@ -878,9 +902,11 @@ function renderTracks(){
     ${showFlag?`<button class="track-flag-btn" title="Flag as wrong audio — paste a corrected link to replace it" onclick="toggleFlagWrong(${i})">🚩</button>`:''}
   </div>
   ${showFlag?`<div class="track-flag-row" id="flag-row-${i}">
-    <input class="track-flag-url" type="url" placeholder="Paste the correct YouTube / YouTube Music / SoundCloud link…">
+    <input class="track-flag-url" type="text" placeholder="Paste the correct link, or type words and press Search…">
+    <button class="btn btn-ghost" style="padding:6px 10px;font-size:11px" title="Search YouTube Music / YouTube for the right version" onclick="searchFlagWrong(${i},this)">🔍 Search</button>
     <button class="btn btn-primary" style="padding:6px 10px;font-size:11px" onclick="submitFlagWrong(${i},this)">↓ Replace</button>
     <button class="btn btn-ghost" style="padding:6px 10px;font-size:11px" onclick="toggleFlagWrong(${i})">Cancel</button>
+    <div class="flag-search"></div>
     <div class="track-flag-result"></div>
   </div>`:''}`).join('');
 }
@@ -894,7 +920,43 @@ function toggleFlagWrong(i){
     row.style.display='flex';
     const input=row.querySelector('.track-flag-url');
     input.value='';input.focus();
+    const hits=row.querySelector('.flag-search');
+    hits.classList.remove('show');hits.innerHTML='';
   }
+}
+
+// Search YT Music (songs) and YouTube (videos) for the track, so the right
+// version can be picked instead of pasting a link found elsewhere.
+async function searchFlagWrong(i,btn){
+  const t=allTracks[i];
+  const row=btn.closest('.track-flag-row');
+  const hits=row.querySelector('.flag-search');
+  const input=row.querySelector('.track-flag-url');
+  const typed=input.value.trim();
+  const q=typed&&!/^https?:/i.test(typed)?typed:`${(t.artist||'').split(',')[0]} ${t.name}`.trim();
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span>';
+  hits.classList.add('show');hits.innerHTML='<div class="fh-sub" style="padding:5px 8px">Searching…</div>';
+  try{
+    const r=await fetch(`${API}/search?q=${encodeURIComponent(q)}&limit=6`);
+    const d=await r.json();
+    const results=[...(d.songs||[]),...(d.videos||[])];
+    if(!results.length){hits.innerHTML=`<div class="fh-sub" style="padding:5px 8px">Nothing found for "${esc(q)}". Type other words in the box and search again.</div>`;return;}
+    const want=t.duration_ms?t.duration_ms/1000:0;
+    hits.innerHTML=results.map((h,k)=>{
+      const off=want&&h.duration&&Math.abs(h.duration-want)>15;
+      return `<div class="flag-hit" data-k="${k}" title="${esc(h.url)}">
+        ${h.thumbnail?`<img src="${esc(h.thumbnail)}" loading="lazy">`:''}
+        <div class="fh-info">${esc(h.title)}<div class="fh-sub">${esc(h.artist)}${h.album?' · '+esc(h.album):''} · ${h.kind==='song'?'YT Music':'YouTube'}</div></div>
+        <div class="fh-dur${off?' off':''}" title="${off?'Length differs from the Spotify track':''}">${h.duration?fmt(h.duration*1000):''}</div>
+      </div>`;}).join('');
+    hits.querySelectorAll('.flag-hit').forEach(el=>el.addEventListener('click',()=>{
+      input.value=results[+el.dataset.k].url;
+      hits.querySelectorAll('.flag-hit').forEach(x=>x.style.background='');
+      el.style.background='var(--bg4)';
+    }));
+  }catch(e){
+    hits.innerHTML=`<div class="fh-sub" style="padding:5px 8px">Search failed: ${esc(e.message)}</div>`;
+  }finally{btn.disabled=false;btn.innerHTML=orig;}
 }
 
 async function submitFlagWrong(i,btn){
@@ -904,6 +966,7 @@ async function submitFlagWrong(i,btn){
   const url=input.value.trim();
   const resultEl=row.querySelector('.track-flag-result');
   if(!url){resultEl.className='track-flag-result err';resultEl.textContent='Paste a link first.';return;}
+  if(!/^https?:\/\//i.test(url)){resultEl.className='track-flag-result err';resultEl.textContent='That isn\'t a link. Press Search to look it up, then pick a result.';return;}
   btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span>';
   resultEl.className='track-flag-result';resultEl.textContent='';
   try{

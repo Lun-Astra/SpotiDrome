@@ -1226,6 +1226,40 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags.save(filepath)
     except Exception as e:
         print(f"Tag fix failed for {filepath}: {e}")
+    try:
+        _fix_downloaded_cover(filepath, spotify_album_id)
+    except Exception as e:
+        print(f"[album-art] cover fix failed for {filepath}: {e}", file=sys.stderr)
+
+
+def _fix_downloaded_cover(filepath, spotify_album_id=None):
+    """A new download's cover: the official Spotify one when the album is known, else the
+    YouTube thumbnail yt-dlp embedded with its flat bars trimmed off (see Fix Album Art)."""
+    mime, data = None, None
+    if spotify_album_id:
+        sp, _url = get_sp(no_retry=True)
+        url = _spotify_cover_urls(sp, [spotify_album_id]).get(spotify_album_id) if sp else None
+        if url:
+            mime, data = _download_cover(url)
+    is_flac = filepath.endswith('.flac')
+    tags = FLAC(filepath) if is_flac else ID3(filepath)
+    if not data:
+        pics = tags.pictures if is_flac else tags.getall("APIC")
+        data = _trim_thumbnail_to_cover(pics[0].data) if pics else None
+        mime = "image/jpeg"
+    if not data:
+        return
+    if is_flac:
+        from mutagen.flac import Picture
+        tags.clear_pictures()
+        pic = Picture(); pic.data = data; pic.type = 3; pic.mime = mime
+        tags.add_picture(pic)
+        tags.save()
+    else:
+        from mutagen.id3 import APIC
+        tags.delall("APIC")
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+        tags.save(filepath)
 
 def extract_resolved_url(stdout):
     """Pull the last printed URL line out of yt-dlp's --print output."""
@@ -6240,6 +6274,366 @@ def library_fill_track_numbers():
     return jsonify({"job_id": job_id})
 
 
+# ─── Fix Album Art ────────────────────────────────────────────────────────────
+# yt-dlp embeds the YouTube thumbnail as a track's cover, and Navidrome shows an
+# album's first track's picture. A thumbnail is 16:9: at best the real cover with
+# flat bars beside it, at worst a frame of the music video or a lyric-video card.
+# This gives every album one square cover on all its tracks: the official one from
+# Spotify (the album's Spotify ID, else an exact album + artist search), else the
+# thumbnail with its flat bars trimmed off. Albums whose tracks already share one
+# square picture are left alone; thumbnails that aren't a cover are only reported.
+# Every replaced picture is backed up on the host first (see _ART_WRITE_SCRIPT).
+_ART_INVENTORY_SCRIPT = r"""
+import os, json, sys, hashlib, struct
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3
+def dims(b):
+    try:
+        if b[:8] == b'\x89PNG\r\n\x1a\n': return list(struct.unpack('>II', b[16:24]))
+        if b[:2] == b'\xff\xd8':
+            i = 2
+            while i < len(b) - 9:
+                if b[i] != 0xFF: i += 1; continue
+                m = b[i+1]
+                if m in (0xC0,0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xC9,0xCA,0xCB,0xCD,0xCE,0xCF):
+                    h, w = struct.unpack('>HH', b[i+5:i+9]); return [w, h]
+                i += 2 + struct.unpack('>H', b[i+2:i+4])[0]
+    except Exception: pass
+    return [0, 0]
+root = sys.argv[1]; out = []
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        ext = f.lower().rsplit('.', 1)[-1]
+        if ext not in ('flac', 'mp3'): continue
+        p = os.path.join(dp, f)
+        try:
+            if ext == 'flac':
+                t = FLAC(p); g = lambda k: (t.get(k) or [''])[0]
+                pics = t.pictures; data = pics[0].data if pics else None
+                row = [g('album'), g('albumartist'), g('artist'), g('spotify_album_id')]
+            else:
+                t = ID3(p); g = lambda k: str(t.get(k) or '')
+                ap = t.getall('APIC'); data = ap[0].data if ap else None
+                sid = [x.text[0] for x in t.getall('TXXX') if x.desc.lower() == 'spotify_album_id' and x.text]
+                row = [g('TALB'), g('TPE2'), g('TPE1'), sid[0] if sid else '']
+            out.append([os.path.relpath(p, root)] + row + [dims(data) if data else None, hashlib.md5(data).hexdigest() if data else None])
+        except Exception:
+            pass
+json.dump(out, sys.stdout)
+"""
+_ART_READ_SCRIPT = r"""
+import os, json, sys, base64
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3
+root = sys.argv[1]; out = {}
+for rel in json.load(sys.stdin):
+    try:
+        p = os.path.join(root, rel)
+        if p.lower().endswith('.flac'):
+            pics = FLAC(p).pictures; data = pics[0].data if pics else None
+        else:
+            ap = ID3(p).getall('APIC'); data = ap[0].data if ap else None
+        if data: out[rel] = base64.b64encode(data).decode()
+    except Exception:
+        pass
+json.dump(out, sys.stdout)
+"""
+# stdin: {"backup": dir, "covers": {key: [mime, base64]}, "files": {rel: key}}. Before a
+# file's pictures are replaced they're saved as <backup>/<md5>.bin (once per picture) and
+# listed in <backup>/manifest.jsonl, so _ART_RESTORE_SCRIPT can put them back.
+_ART_WRITE_SCRIPT = r"""
+import os, json, sys, base64, hashlib
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3, APIC, error as ID3Error
+root = sys.argv[1]; job = json.load(sys.stdin)
+backup = os.path.expanduser(job['backup']); os.makedirs(backup, exist_ok=True)
+covers = {k: (m, base64.b64decode(b)) for k, (m, b) in job['covers'].items()}
+def keep(data):
+    h = hashlib.md5(data).hexdigest(); f = os.path.join(backup, h + '.bin')
+    if not os.path.exists(f):
+        with open(f, 'wb') as o: o.write(data)
+    return h
+done, failed = 0, []
+with open(os.path.join(backup, 'manifest.jsonl'), 'a') as man:
+    for rel, key in job['files'].items():
+        p = os.path.join(root, rel); mime, data = covers[key]
+        try:
+            if p.lower().endswith('.flac'):
+                t = FLAC(p)
+                old = [{'md5': keep(x.data), 'mime': x.mime, 'type': x.type, 'desc': x.desc} for x in t.pictures]
+                t.clear_pictures(); pic = Picture(); pic.data = data; pic.type = 3; pic.mime = mime
+                t.add_picture(pic); t.save()
+            else:
+                try: t = ID3(p)
+                except ID3Error: t = ID3()
+                old = [{'md5': keep(x.data), 'mime': x.mime, 'type': int(x.type), 'desc': x.desc} for x in t.getall('APIC')]
+                t.delall('APIC'); t.add(APIC(encoding=3, mime=mime, type=3, desc='Cover', data=data)); t.save(p)
+            man.write(json.dumps({'file': rel, 'pictures': old}) + '\n'); done += 1
+        except Exception as e:
+            failed.append([rel, str(e)[:150]])
+print(json.dumps({'updated': done, 'failed': failed}))
+"""
+# Manual undo: python3 -c "$_ART_RESTORE_SCRIPT" <music path> <backup dir> on the host.
+_ART_RESTORE_SCRIPT = r"""
+import os, json, sys
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3, APIC
+root, backup = sys.argv[1], os.path.expanduser(sys.argv[2]); entries = {}
+for line in open(os.path.join(backup, 'manifest.jsonl')):
+    e = json.loads(line); entries.setdefault(e['file'], e)   # the first entry = the original
+n = 0
+for rel, e in entries.items():
+    p = os.path.join(root, rel)
+    if not os.path.exists(p): continue
+    pics = [(x, open(os.path.join(backup, x['md5'] + '.bin'), 'rb').read()) for x in e['pictures']]
+    if p.lower().endswith('.flac'):
+        t = FLAC(p); t.clear_pictures()
+        for x, data in pics:
+            pic = Picture(); pic.data = data; pic.type = x['type']; pic.mime = x['mime']; pic.desc = x['desc']; t.add_picture(pic)
+        t.save()
+    else:
+        t = ID3(p); t.delall('APIC')
+        for x, data in pics: t.add(APIC(encoding=3, mime=x['mime'], type=x['type'], desc=x['desc'], data=data))
+        t.save(p)
+    n += 1
+print(n)
+"""
+
+
+def _art_is_square(d):
+    return bool(d) and d[0] > 0 and d[1] > 0 and abs(d[0] - d[1]) <= 0.02 * max(d)
+
+
+def _trim_thumbnail_to_cover(data):
+    """A YouTube thumbnail with the real cover on flat bars -> just the cover (JPEG bytes).
+    None when the picture isn't that (a video frame, blurred bars, already square)."""
+    from PIL import Image, ImageChops
+    import io
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    w, h = img.size
+    if _art_is_square([w, h]):
+        return None
+    # The bar colour from the four corners; they must agree, or there are no flat bars.
+    corners = [img.getpixel(xy) for xy in ((1, 1), (w - 2, 1), (1, h - 2), (w - 2, h - 2))]
+    bar = tuple(sum(c[i] for c in corners) // 4 for i in range(3))
+    if any(abs(c[i] - bar[i]) > 12 for c in corners for i in range(3)):
+        return None
+    diff = ImageChops.difference(img, Image.new("RGB", img.size, bar)).convert("L")
+    box = diff.point(lambda v: 255 if v > 24 else 0).getbbox()
+    if not box:
+        return None
+    cw, ch = box[2] - box[0], box[3] - box[1]
+    # What's left must be (nearly) square and of a decent size: that's the cover. Some
+    # uploads stretch it a little; its centre square is used then.
+    if min(cw, ch) < 0.45 * min(w, h) or min(cw, ch) < 0.8 * max(cw, ch):
+        return None
+    side = min(cw, ch)
+    cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+    cover = img.crop((cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side))
+    out = io.BytesIO()
+    cover.save(out, "JPEG", quality=92)
+    return out.getvalue()
+
+
+_spotify_cover_cache = {}   # Spotify album ID -> cover URL (or None)
+
+def _spotify_cover_urls(sp, album_ids):
+    """Cover URLs for Spotify album IDs (20 per request), cached."""
+    todo = [a for a in dict.fromkeys(album_ids) if a and a not in _spotify_cover_cache]
+    for i in range(0, len(todo), 20):
+        for a, alb in zip(todo[i:i + 20], sp.albums(todo[i:i + 20])["albums"]):
+            imgs = (alb or {}).get("images") or []
+            _spotify_cover_cache[a] = max(imgs, key=lambda x: x.get("width") or 0)["url"] if imgs else None
+    return {a: _spotify_cover_cache.get(a) for a in album_ids}
+
+
+def _spotify_search_cover(sp, album, album_artist):
+    """The cover of the Spotify album with exactly this name (and an overlapping artist,
+    unless it's Various Artists) - same matching rules as Fill in Track Numbers."""
+    va = album_artist.strip().lower() in ("", "various artists")
+    q = f'album:"{album}"' + ("" if va else f' artist:"{primary_artist(album_artist)}"')
+    for a in sp.search(q=q, type="album", limit=10)["albums"]["items"]:
+        if _tn_norm(a["name"]) != _tn_norm(album):
+            continue
+        if not va and not (_artist_names(album_artist) & {x["name"].lower() for x in a["artists"]}):
+            continue
+        imgs = a.get("images") or []
+        if imgs:
+            return max(imgs, key=lambda x: x.get("width") or 0)["url"]
+    return None
+
+
+def _download_cover(url):
+    resp = http.get(url, timeout=15)
+    resp.raise_for_status()
+    mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip() or "image/jpeg"
+    return mime, resp.content
+
+
+def album_art_worker(job_id, only_albums=None):
+    def log(msg):
+        with job_lock:
+            jobs[job_id]["log"].append(msg)
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+    try:
+        ssh_cfg = load_ssh_config()
+        root = ssh_cfg["music_path"]
+        py = _remote_python(ssh_cfg)
+        result = _run_remote_scan(_ssh_cmd(ssh_cfg, f"{py} -c {shlex.quote(_ART_INVENTORY_SCRIPT)} {shlex.quote(root)}"),
+                                  timeout=REMOTE_SCAN_TIMEOUT)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-300:] or "inventory failed")
+        groups = {}
+        for rel, album, albumartist, artist, sid, dims, md5 in json.loads(result.stdout or "[]"):
+            if album.strip().lower() in BAD_ALBUM_VALUES:
+                continue
+            if only_albums and album.strip().lower() not in only_albums:
+                continue
+            groups.setdefault((rel.rsplit("/", 1)[0] if "/" in rel else "", album), []).append(
+                {"rel": rel, "albumartist": albumartist or artist, "sid": sid, "dims": dims, "md5": md5})
+        todo = {k: v for k, v in groups.items()
+                if not (len({t["md5"] for t in v}) == 1 and _art_is_square(v[0]["dims"]))}
+        log(f"ℹ {len(groups)} album(s); {len(groups) - len(todo)} already have one square cover, {len(todo)} to check")
+        with job_lock:
+            jobs[job_id]["total"] = len(todo)
+        sp, _url = get_sp(no_retry=True)
+        if not sp:
+            log("⚠ Spotify isn't connected - only trimming thumbnails")
+
+        # 1) Covers by the albums' own Spotify IDs (the ID most of an album's tracks carry).
+        main_sid = {}
+        for k, tracks in todo.items():
+            ids = [t["sid"] for t in tracks if t["sid"]]
+            if ids:
+                main_sid[k] = max(set(ids), key=ids.count)
+        urls = {}
+        if sp and main_sid:
+            try:
+                urls = _spotify_cover_urls(sp, list(main_sid.values()))
+            except Exception as e:
+                log(f"⚠ Spotify album lookup failed: {e}")
+
+        BATCH = 40
+        backup = f".cache/spotidrome/art-backup/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        pending = {"covers": {}, "files": {}}
+        stats = {"spotify": 0, "search": 0, "trimmed": 0, "files": 0}
+        unfixed = []
+
+        def flush():
+            if not pending["files"]:
+                return
+            body = json.dumps({"backup": backup, **pending})
+            r = subprocess.run(_ssh_cmd(ssh_cfg, f"{py} -c {shlex.quote(_ART_WRITE_SCRIPT)} {shlex.quote(root)}"),
+                               input=body, capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                log(f"✗ Writing covers failed: {r.stderr[-200:]}")
+            else:
+                res = json.loads(r.stdout or "{}")
+                stats["files"] += res.get("updated", 0)
+                for rel, err in res.get("failed", []):
+                    log(f"✗ {rel}: {err}")
+            pending["covers"].clear(); pending["files"].clear()
+
+        need_thumb = []
+        for i, (key, tracks) in enumerate(sorted(todo.items())):
+            folder, album = key
+            with job_lock:
+                jobs[job_id]["current"] = i + 1
+                jobs[job_id]["current_track"] = album
+                if jobs[job_id].get("cancel_requested"):
+                    log("⏹ Stopped by user request"); break
+            url, how = urls.get(main_sid.get(key)), "spotify"
+            if not url and sp:
+                try:
+                    url, how = _spotify_search_cover(sp, album, tracks[0]["albumartist"]), "search"
+                except Exception as e:
+                    if getattr(e, "http_status", None) == 429:
+                        log("⚠ Spotify rate limit - continuing by trimming thumbnails only"); sp = None
+                    else:
+                        sp, _url = get_sp(no_retry=True)   # access tokens expire after about an hour
+                time.sleep(0.1)
+            if url:
+                try:
+                    mime, data = _download_cover(url)
+                    pending["covers"][album + "\x00" + folder] = [mime, base64.b64encode(data).decode()]
+                    for t in tracks:
+                        pending["files"][t["rel"]] = album + "\x00" + folder
+                    stats[how] += 1
+                    if len(pending["covers"]) >= BATCH:
+                        flush()
+                    continue
+                except Exception as e:
+                    log(f"⚠ {album}: cover download failed ({e})")
+            need_thumb.append((key, tracks))
+        flush()
+
+        # 2) No Spotify cover: trim the bars off the album's (most common) thumbnail.
+        for j in range(0, len(need_thumb), BATCH):
+            chunk = need_thumb[j:j + BATCH]
+            firsts = {}
+            for key, tracks in chunk:
+                pics = [t for t in tracks if t["md5"]]
+                if pics:
+                    common = max({t["md5"] for t in pics}, key=lambda m: sum(t["md5"] == m for t in pics))
+                    firsts[key] = next(t["rel"] for t in pics if t["md5"] == common)
+            r = subprocess.run(_ssh_cmd(ssh_cfg, f"{py} -c {shlex.quote(_ART_READ_SCRIPT)} {shlex.quote(root)}"),
+                               input=json.dumps(list(firsts.values())), capture_output=True, text=True, timeout=300)
+            pictures = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+            for key, tracks in chunk:
+                folder, album = key
+                data = pictures.get(firsts.get(key))
+                cover = None
+                try:
+                    cover = _trim_thumbnail_to_cover(base64.b64decode(data)) if data else None
+                except Exception:
+                    pass
+                if not cover:
+                    unfixed.append(f"{album} ({tracks[0]['albumartist']})")
+                    continue
+                pending["covers"][album + "\x00" + folder] = ["image/jpeg", base64.b64encode(cover).decode()]
+                for t in tracks:
+                    pending["files"][t["rel"]] = album + "\x00" + folder
+                stats["trimmed"] += 1
+            flush()
+
+        log(f"✅ Done: {stats['spotify']} album(s) got their Spotify cover, {stats['search']} found by a Spotify search, "
+            f"{stats['trimmed']} had the bars trimmed off their thumbnail - {stats['files']} track(s) updated")
+        if unfixed:
+            log(f"⚠ {len(unfixed)} album(s) without an official cover, and their thumbnail isn't one either "
+                f"(a video frame, or a cover on blurred bars) - left as they were:")
+            for name in unfixed[:300]:
+                log(f"   • {name}")
+        if stats["files"]:
+            log(f"ℹ The old pictures are backed up on the Navidrome host in ~/{backup}")
+            nd_cfg = load_nd_config()
+            if nd_cfg:
+                ok, _msg = nd_trigger_scan(nd_cfg, full=True)
+                if ok:
+                    log("🔄 Library scan triggered (subsonic)")
+    except Exception as e:
+        log(f"✗ {e}")
+    finally:
+        with job_lock:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["current_track"] = None
+        save_jobs()
+
+
+@app.route("/library/fix-album-art", methods=["POST"])
+def library_fix_album_art():
+    """Optional JSON {"albums": [names]} limits the run to those albums."""
+    if not load_ssh_config():
+        return jsonify({"error": "SSH not configured"}), 400
+    only = {a.strip().lower() for a in ((request.get_json(silent=True) or {}).get("albums") or []) if a.strip()} or None
+    job_id = f"album_art_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Album Art] Library", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0, "log": [], "current_track": None}
+    threading.Thread(target=album_art_worker, args=(job_id, only), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
 # ─── Weekly automatic maintenance ─────────────────────────────────────────────
 # Each Library Maintenance action can run automatically once a week, on its
 # own day (all off by default; the manual buttons stay). It runs after the
@@ -6252,6 +6646,7 @@ MAINTENANCE_TASKS = {   # task -> (weekday 0=Mon, label, starter endpoint functi
     "fix_broken_entries":  (3, "Fix Broken Entries", "library_orphans_prune"),
     "consolidate_editions": (4, "Consolidate Editions", "library_consolidate_editions"),
     "mismatched_tracks":   (5, "Mismatched Tracks scan", "library_verify_tracks"),
+    "album_art":           (6, "Fix Album Art", "library_fix_album_art"),
 }
 MAINTENANCE_START_UTC_HOUR = 4   # after the default 03:00 UTC auto-sync
 

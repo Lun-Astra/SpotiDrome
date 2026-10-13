@@ -535,6 +535,10 @@ header{
           <button class="btn btn-nd" id="btn-fill-track-numbers" onclick="fillTrackNumbers()" style="flex-shrink:0">🔢 Fill in</button>
         </div>
         <div class="settings-row">
+          <div><div class="settings-label">Fix Album Art</div><div class="settings-sub">Gives every album one square cover on all its tracks: the official one from Spotify, else the YouTube thumbnail with its bars trimmed off — albums that already have one are skipped, and the old pictures are backed up on the Navidrome host</div></div>
+          <button class="btn btn-nd" id="btn-fix-album-art" onclick="fixAlbumArt()" style="flex-shrink:0">🖼 Fix</button>
+        </div>
+        <div class="settings-row">
           <div><div class="settings-label">Normalize Volume</div><div class="settings-sub">Even out loudness across the whole library to the same target new downloads use</div></div>
           <button class="btn btn-nd" id="btn-normalize-volume" onclick="normalizeVolume()" style="flex-shrink:0">🔊 Normalize</button>
         </div>
@@ -1267,7 +1271,7 @@ async function deleteCookies(){if(!confirm('Remove cookies?'))return;await fetch
 // ─── Weekly automatic maintenance switches ─────────────────────────────
 // Each maintenance row gets an on/off switch for a weekly automatic run on
 // its own day; the manual button next to it keeps working as before.
-const AUTO_TASK_ROWS = {track_numbers:'#btn-fill-track-numbers', relabel_genres:'#btn-relabel-genres',
+const AUTO_TASK_ROWS = {track_numbers:'#btn-fill-track-numbers', album_art:'#btn-fix-album-art', relabel_genres:'#btn-relabel-genres',
   normalize_volume:'#btn-normalize-volume', fix_broken_entries:'#btn-prune-orphans',
   consolidate_editions:'#btn-consolidate-editions', mismatched_tracks:'a[href="/mismatched-tracks.html"]'};
 async function loadMaintenanceSchedule(){
@@ -1293,6 +1297,18 @@ async function fillTrackNumbers(){
   btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
   try{
     const r=await fetch(`${API}/library/fill-track-numbers`,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
+    renderJobs();
+  }catch(e){alert('Failed: '+e.message);}
+  finally{btn.disabled=false;btn.innerHTML=orig;}
+}
+async function fixAlbumArt(){
+  if(!confirm('Fix the album art of the whole library? Albums get their official Spotify cover, or their YouTube thumbnail with the bars trimmed off. Progress shows up in Download Jobs.'))return;
+  const btn=document.getElementById('btn-fix-album-art');
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
+  try{
+    const r=await fetch(`${API}/library/fix-album-art`,{method:'POST'});
     const d=await r.json();
     if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
     renderJobs();

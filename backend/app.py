@@ -1261,6 +1261,23 @@ def _fix_downloaded_cover(filepath, spotify_album_id=None):
         tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
         tags.save(filepath)
 
+def _finished_local_download(album_dir, filename):
+    """True when this track already finished downloading into album_dir (its .flac is there).
+    Anything else starting with the same name is left over from an attempt that timed out or
+    failed - a half-downloaded .mp4/.webm/.part, the thumbnail - and used to count as "Already
+    local", so the track was never downloaded again and never reached Navidrome. Those
+    leftovers are deleted here so the next download starts clean."""
+    finished = os.path.join(album_dir, f"{filename}.flac")
+    if os.path.isfile(finished) and os.path.getsize(finished) > 0:
+        return True
+    for f in os.listdir(album_dir):
+        if f.startswith(filename + "."):
+            try:
+                os.remove(os.path.join(album_dir, f))
+            except OSError:
+                pass
+    return False
+
 def extract_resolved_url(stdout):
     """Pull the last printed URL line out of yt-dlp's --print output."""
     for line in reversed((stdout or "").splitlines()):
@@ -1881,7 +1898,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
             continue
 
         # Check local
-        if [f for f in os.listdir(album_dir) if f.startswith(filename)]:
+        if _finished_local_download(album_dir, filename):
             with job_lock:
                 jobs[job_id]["log"].append(f"⏭ Already local: {track['artist']} - {track['name']}")
             newly_downloaded.append(track)
@@ -2205,7 +2222,7 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
             continue
 
         # Check local
-        if [f for f in os.listdir(album_dir) if f.startswith(filename)]:
+        if _finished_local_download(album_dir, filename):
             with job_lock:
                 jobs[job_id]["log"].append(f"⏭ Already local: {artist} - {title}")
             downloaded_tracks.append(t)
@@ -4087,9 +4104,17 @@ def start_download():
 
 @app.route("/jobs")
 def list_jobs():
+    """Polled by the UI every few seconds, so keep it cheap: the full job
+    history (every log line of every job) is many MB, and dumping it to disk
+    and to JSON on each poll — while holding job_lock, which the download
+    threads need too — pinned the CPU and starved running downloads. The UI
+    only shows the last 25 log lines, so send those plus the total count;
+    /jobs/<id> still returns a whole job."""
     with job_lock:
-        save_jobs()
-        return jsonify(list(jobs.values()))
+        summary = [{**job, "log": job.get("log", [])[-25:],
+                    "log_count": len(job.get("log", []))}
+                   for job in jobs.values()]
+    return jsonify(summary)
 
 @app.route("/jobs/<job_id>")
 def get_job(job_id):

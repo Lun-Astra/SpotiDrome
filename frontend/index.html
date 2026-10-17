@@ -1015,7 +1015,7 @@ document.getElementById('btn-refresh').addEventListener('click',()=>{
 
 async function renderJobs(){
   const r=await fetch(`${API}/jobs`),jobs=await r.json();
-  const hash=JSON.stringify(jobs.map(j=>[j.id,j.status,j.current,j.downloaded,j.failed,j.current_track,(j.log||[]).length,j.cancel_requested]));
+  const hash=JSON.stringify(jobs.map(j=>[j.id,j.status,j.current,j.downloaded,j.failed,j.current_track,j.log_count??(j.log||[]).length,j.cancel_requested]));
   if(hash===_lastJobsHash)return;_lastJobsHash=hash;
   document.getElementById('jobs-count').textContent=jobs.length;
   const list=document.getElementById('jobs-list');

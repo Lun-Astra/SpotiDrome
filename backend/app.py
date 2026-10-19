@@ -461,6 +461,8 @@ def record_failed_track(track, playlist_id, playlist_name, reason):
             "album": track.get("album"),
             "album_artist": track.get("album_artist"),
             "duration_ms": track.get("duration_ms", 0),
+            "explicit": track.get("explicit"),
+            "spotify_album_id": track.get("spotify_album_id"),
             "playlist_id": playlist_id,
             "playlist_name": playlist_name,
             "reason": reason,
@@ -858,6 +860,7 @@ def fetch_playlist_tracks(sp, playlist_id):
                            "isrc": (t.get("external_ids") or {}).get("isrc"),
                            "disc_number": t.get("disc_number"),
                            "duration_ms": t["duration_ms"],
+                           "explicit": t.get("explicit"),
                            "image": t["album"]["images"][0]["url"] if t["album"].get("images") else None})
         if not batch["next"]: break
         offset += 100
@@ -1227,20 +1230,22 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
     except Exception as e:
         print(f"Tag fix failed for {filepath}: {e}")
     try:
-        _fix_downloaded_cover(filepath, spotify_album_id)
+        _fix_downloaded_cover(filepath, spotify_album_id, album, album_artist)
     except Exception as e:
         print(f"[album-art] cover fix failed for {filepath}: {e}", file=sys.stderr)
 
 
-def _fix_downloaded_cover(filepath, spotify_album_id=None):
-    """A new download's cover: the official Spotify one when the album is known, else the
-    YouTube thumbnail yt-dlp embedded with its flat bars trimmed off (see Fix Album Art)."""
+def _fix_downloaded_cover(filepath, spotify_album_id=None, album=None, album_artist=None):
+    """A new download's cover: the official one (_official_cover_url: Spotify by album ID, a
+    Spotify album search, YouTube Music's album artwork), else the YouTube thumbnail yt-dlp
+    embedded with its flat bars trimmed off (see Fix Album Art)."""
     mime, data = None, None
-    if spotify_album_id:
-        sp, _url = get_sp(no_retry=True)
-        url = _spotify_cover_urls(sp, [spotify_album_id]).get(spotify_album_id) if sp else None
-        if url:
+    url = _official_cover_url(album, album_artist, spotify_album_id)
+    if url:
+        try:
             mime, data = _download_cover(url)
+        except Exception as e:
+            print(f"[album-art] cover download failed for {album}: {e}", file=sys.stderr)
     is_flac = filepath.endswith('.flac')
     tags = FLAC(filepath) if is_flac else ID3(filepath)
     if not data:
@@ -1543,7 +1548,21 @@ def _embedded_artist_tag(flac_path):
     raw = (tags.get("artist") or [""])[0].strip()
     return raw or None
 
-def _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec):
+_CENSORED_WORDS = re.compile(r"\b(clean|censored|radio\s+edit|edited|family\s+friendly)\b", re.I)
+
+def _explicit_bonus(entry_explicit, title, expected_title, expected_explicit):
+    """Issue #8: the version Spotify has, not a censored one. Spotify says whether its track
+    is explicit; without that (YouTube sources, manual retries) the original, uncensored
+    version is preferred. A "Clean"/"Radio Edit" title that the wanted song doesn't have
+    counts as censored even where YouTube gives no explicit flag."""
+    if _CENSORED_WORDS.search(title or "") and not _CENSORED_WORDS.search(expected_title or ""):
+        return 0.0 if expected_explicit is False else -0.3
+    if entry_explicit is None:
+        return 0.0
+    want = expected_explicit is not False
+    return 0.3 if entry_explicit == want else 0.0
+
+def _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec, expected_explicit=None):
     title = entry.get("title") or ""
     artists = [a.get("name", "") for a in (entry.get("artists") or [])]
     duration_sec = entry.get("duration_seconds") or 0
@@ -1558,9 +1577,9 @@ def _score_ytmusic_entry(entry, expected_title, expected_artist, expected_durati
     score = difflib.SequenceMatcher(None, _normalize_title(title), _normalize_title(expected_title)).ratio()
     if entry.get("videoType") in YTMUSIC_OFFICIAL_VIDEO_TYPES:
         score += 0.15
-    return score
+    return score + _explicit_bonus(entry.get("isExplicit"), title, expected_title, expected_explicit)
 
-def _score_generic_entry(entry, expected_title, expected_artist, expected_duration_sec):
+def _score_generic_entry(entry, expected_title, expected_artist, expected_duration_sec, expected_explicit=None):
     title = entry.get("title") or ""
     channel = entry.get("channel") or entry.get("uploader") or ""
     duration_sec = entry.get("duration") or 0
@@ -1572,10 +1591,11 @@ def _score_generic_entry(entry, expected_title, expected_artist, expected_durati
         return None
     if not _duration_close(duration_sec, expected_duration_sec):
         return None
-    return difflib.SequenceMatcher(None, _normalize_title(title), _normalize_title(expected_title)).ratio()
+    return (difflib.SequenceMatcher(None, _normalize_title(title), _normalize_title(expected_title)).ratio()
+            + _explicit_bonus(None, title, expected_title, expected_explicit))
 
 def _search_ytmusic(query, filter_type, expected_title, expected_artist, expected_duration_sec,
-                     limit=8, timeout=15):
+                     limit=8, timeout=15, expected_explicit=None):
     ytm = _get_ytmusic()
     if not ytm:
         return None
@@ -1591,12 +1611,12 @@ def _search_ytmusic(query, filter_type, expected_title, expected_artist, expecte
 
     best, best_score = None, 0.0
     for entry in results or []:
-        score = _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec)
+        score = _score_ytmusic_entry(entry, expected_title, expected_artist, expected_duration_sec, expected_explicit)
         if score is not None and score > best_score:
             best, best_score = entry, score
     return best
 
-def _search_yt_dlp(search_term, expected_title, expected_artist, expected_duration_sec, timeout=20):
+def _search_yt_dlp(search_term, expected_title, expected_artist, expected_duration_sec, timeout=20, expected_explicit=None):
     pot_args = YTDLP_POT_ARGS if search_term.startswith("ytsearch") else []
     cmd = ["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist"] + pot_args + [search_term]
     try:
@@ -1614,7 +1634,7 @@ def _search_yt_dlp(search_term, expected_title, expected_artist, expected_durati
             entry = json.loads(line)
         except Exception:
             continue
-        score = _score_generic_entry(entry, expected_title, expected_artist, expected_duration_sec)
+        score = _score_generic_entry(entry, expected_title, expected_artist, expected_duration_sec, expected_explicit)
         if score is not None and score > best_score:
             url = entry.get("webpage_url") or entry.get("url")
             best, best_score = {"url": url, "title": entry.get("title")}, score
@@ -1632,22 +1652,24 @@ def iter_track_candidates(track):
     expected_title = track.get("name") or ""
     expected_artist = track.get("artist") or ""
     expected_duration_sec = (track.get("duration_ms") or 0) / 1000
+    # Spotify's own flag (None when the track didn't come from Spotify): see _explicit_bonus.
+    explicit = track.get("explicit")
     artist_for_query = primary_artist(expected_artist)
     query = f"{artist_for_query} {expected_title}".strip()
 
-    best = _search_ytmusic(query, "songs", expected_title, expected_artist, expected_duration_sec)
+    best = _search_ytmusic(query, "songs", expected_title, expected_artist, expected_duration_sec, expected_explicit=explicit)
     if best:
         yield f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music"
 
-    best = _search_ytmusic(query, "videos", expected_title, expected_artist, expected_duration_sec)
+    best = _search_ytmusic(query, "videos", expected_title, expected_artist, expected_duration_sec, expected_explicit=explicit)
     if best:
         yield f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music (video)"
 
-    best = _search_yt_dlp(f"ytsearch8:{query} audio", expected_title, expected_artist, expected_duration_sec)
+    best = _search_yt_dlp(f"ytsearch8:{query} audio", expected_title, expected_artist, expected_duration_sec, expected_explicit=explicit)
     if best:
         yield best["url"], best["title"], "YouTube"
 
-    best = _search_yt_dlp(f"scsearch8:{query}", expected_title, expected_artist, expected_duration_sec)
+    best = _search_yt_dlp(f"scsearch8:{query}", expected_title, expected_artist, expected_duration_sec, expected_explicit=explicit)
     if best:
         yield best["url"], best["title"], "SoundCloud"
 
@@ -6488,6 +6510,66 @@ def _spotify_search_cover(sp, album, album_artist):
     return None
 
 
+_ytm_cover_cache = {}
+
+def _ytm_album_cover(album, album_artist):
+    """YouTube Music's own artwork for the album with exactly this name (and an overlapping
+    artist, unless it's Various Artists) - square, official, and needs no Spotify login.
+    Asked at 1200 px (the search hands out 544 px links; the size is part of the URL)."""
+    key = (_tn_norm(album), (album_artist or "").strip().lower())
+    if key in _ytm_cover_cache:
+        return _ytm_cover_cache[key]
+    va = (album_artist or "").strip().lower() in ("", "various artists")
+    query = album if va else f"{primary_artist(album_artist)} {album}"
+    results = _ytm_call("search", query, filter="albums", limit=10)
+    if results is None:
+        return None   # YouTube Music unreachable: not remembered, may work next time
+    def artist_ok(a):
+        return va or bool(_artist_names(album_artist) & {(x.get("name") or "").lower() for x in a.get("artists") or []})
+    # The exact name first; else the same album in another edition ("The Eminem Show
+    # (Expanded Edition)" for "The Eminem Show") - same artwork.
+    plain = _tn_norm(edition_base(album))
+    match = (next((a for a in results if _tn_norm(a.get("title") or "") == key[0] and artist_ok(a)), None)
+             or next((a for a in results if plain and _tn_norm(edition_base(a.get("title") or "")) == plain and artist_ok(a)), None))
+    thumbs = (match or {}).get("thumbnails") or []
+    url = re.sub(r"=w\d+-h\d+", "=w1200-h1200", max(thumbs, key=lambda t: t.get("width") or 0)["url"]) if thumbs else None
+    _ytm_cover_cache[key] = url
+    return url
+
+
+
+_official_cover_cache = {}
+
+def _official_cover_url(album, album_artist, spotify_album_id=None):
+    """An album's official cover: Spotify's by album ID, else a Spotify album search, else
+    YouTube Music's album artwork. None when none of them has this album (the caller then
+    trims the YouTube thumbnail). Cached per album, so an album's tracks search once."""
+    if spotify_album_id:
+        sp, _url = get_sp(no_retry=True)
+        try:
+            url = _spotify_cover_urls(sp, [spotify_album_id]).get(spotify_album_id) if sp else None
+        except Exception:
+            url = None
+        if url:
+            return url
+    if not album or album.strip().lower() in BAD_ALBUM_VALUES:
+        return None
+    key = (_tn_norm(album), (album_artist or "").strip().lower())
+    if key in _official_cover_cache:
+        return _official_cover_cache[key]
+    url = None
+    sp, _url = get_sp(no_retry=True)
+    if sp:
+        try:
+            url = _spotify_search_cover(sp, album, album_artist or "")
+        except Exception as e:
+            print(f"[album-art] Spotify search failed for {album}: {e}", file=sys.stderr)
+    if not url:
+        url = _ytm_album_cover(album, album_artist)
+    _official_cover_cache[key] = url
+    return url
+
+
 def _download_cover(url):
     resp = http.get(url, timeout=15)
     resp.raise_for_status()
@@ -6524,7 +6606,7 @@ def album_art_worker(job_id, only_albums=None):
             jobs[job_id]["total"] = len(todo)
         sp, _url = get_sp(no_retry=True)
         if not sp:
-            log("⚠ Spotify isn't connected - only trimming thumbnails")
+            log("⚠ Spotify isn't connected - using YouTube Music covers and trimmed thumbnails")
 
         # 1) Covers by the albums' own Spotify IDs (the ID most of an album's tracks carry).
         main_sid = {}
@@ -6542,7 +6624,7 @@ def album_art_worker(job_id, only_albums=None):
         BATCH = 40
         backup = f".cache/spotidrome/art-backup/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         pending = {"covers": {}, "files": {}}
-        stats = {"spotify": 0, "search": 0, "trimmed": 0, "files": 0}
+        stats = {"spotify": 0, "search": 0, "ytmusic": 0, "trimmed": 0, "files": 0}
         unfixed = []
 
         def flush():
@@ -6574,10 +6656,12 @@ def album_art_worker(job_id, only_albums=None):
                     url, how = _spotify_search_cover(sp, album, tracks[0]["albumartist"]), "search"
                 except Exception as e:
                     if getattr(e, "http_status", None) == 429:
-                        log("⚠ Spotify rate limit - continuing by trimming thumbnails only"); sp = None
+                        log("⚠ Spotify rate limit - continuing with YouTube Music covers and trimmed thumbnails"); sp = None
                     else:
                         sp, _url = get_sp(no_retry=True)   # access tokens expire after about an hour
                 time.sleep(0.1)
+            if not url:
+                url, how = _ytm_album_cover(album, tracks[0]["albumartist"]), "ytmusic"
             if url:
                 try:
                     mime, data = _download_cover(url)
@@ -6623,6 +6707,7 @@ def album_art_worker(job_id, only_albums=None):
             flush()
 
         log(f"✅ Done: {stats['spotify']} album(s) got their Spotify cover, {stats['search']} found by a Spotify search, "
+            f"{stats['ytmusic']} got YouTube Music's album cover, "
             f"{stats['trimmed']} had the bars trimmed off their thumbnail - {stats['files']} track(s) updated")
         if unfixed:
             log(f"⚠ {len(unfixed)} album(s) without an official cover, and their thumbnail isn't one either "

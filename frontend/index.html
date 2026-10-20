@@ -539,6 +539,10 @@ header{
           <button class="btn btn-nd" id="btn-fix-album-art" onclick="fixAlbumArt()" style="flex-shrink:0">🖼 Fix</button>
         </div>
         <div class="settings-row">
+          <div><div class="settings-label">Split Combined Artists</div><div class="settings-sub">Songs by several artists ("Jeff Williams, Casey Lee Williams") show up in Navidrome as one combined artist — this tags each artist separately so every one of them gets the song and album. Only adds tags; the artist text stays as it is. New downloads get this automatically</div></div>
+          <button class="btn btn-nd" id="btn-split-artists" onclick="splitArtists()" style="flex-shrink:0">👥 Split</button>
+        </div>
+        <div class="settings-row">
           <div><div class="settings-label">Normalize Volume</div><div class="settings-sub">Even out loudness across the whole library to the same target new downloads use</div></div>
           <button class="btn btn-nd" id="btn-normalize-volume" onclick="normalizeVolume()" style="flex-shrink:0">🔊 Normalize</button>
         </div>
@@ -1297,6 +1301,18 @@ async function fillTrackNumbers(){
   btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
   try{
     const r=await fetch(`${API}/library/fill-track-numbers`,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
+    renderJobs();
+  }catch(e){alert('Failed: '+e.message);}
+  finally{btn.disabled=false;btn.innerHTML=orig;}
+}
+async function splitArtists(){
+  if(!confirm('Tag every song by several artists with each artist separately, so Navidrome lists them as separate artists? Only adds tags. Progress shows up in Download Jobs.'))return;
+  const btn=document.getElementById('btn-split-artists');
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span> Starting…';
+  try{
+    const r=await fetch(`${API}/library/split-artists`,{method:'POST'});
     const d=await r.json();
     if(!r.ok){alert('Error: '+(d.error||'Could not start'));return;}
     renderJobs();

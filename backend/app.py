@@ -1044,6 +1044,30 @@ def primary_artist(artist):
     """First name in a comma-joined multi-artist string, for search queries."""
     return artist.split(",")[0].strip()
 
+# Artist names with ", " in them, which split_artists() keeps whole. Also inlined in
+# _SPLIT_ARTISTS_SCRIPT (it runs on the Navidrome host) - keep both in step.
+COMMA_ARTISTS = ["Tyler, The Creator", "Earth, Wind & Fire", "Crosby, Stills, Nash & Young",
+                 "Crosby, Stills & Nash", "Emerson, Lake & Palmer", "Blood, Sweat & Tears",
+                 "Peter, Paul and Mary", "Now, Now", "Me, Myself and I", "Love, Death & Robots",
+                 "Fear, and Loathing in Las Vegas"]
+
+def split_artists(artist, extra_whole=()):
+    """'Jeff Williams, Casey Lee Williams' -> ['Jeff Williams', 'Casey Lee Williams']: the
+    separate artists of a comma-joined credit (how Spotify's artist lists are stored here).
+    Navidrome doesn't split on commas (it would break "Tyler, The Creator"), so without
+    this a duet becomes one combined artist; written as the multi-valued ARTISTS tag, the
+    readable "A, B" artist tag stays as it is. Known comma names stay whole."""
+    parts = [p.strip() for p in (artist or "").split(", ") if p.strip()]
+    whole = {n.lower() for n in COMMA_ARTISTS} | {n.lower() for n in extra_whole}
+    out, i = [], 0
+    while i < len(parts):
+        for j in range(len(parts), i + 1, -1):   # longest known name first
+            if ", ".join(parts[i:j]).lower() in whole:
+                out.append(", ".join(parts[i:j])); i = j; break
+        else:
+            out.append(parts[i]); i += 1
+    return list(dict.fromkeys(out))
+
 _genre_cache = {}
 _genre_cache_lock = threading.Lock()
 
@@ -1184,6 +1208,13 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags["artist"] = [artist]
             tags["album"] = [album]
             tags["albumartist"] = [album_artist]
+            # Each artist separately for Navidrome (see split_artists); single ones need none.
+            for key, value in (("artists", artist), ("albumartists", album_artist)):
+                names = split_artists(value)
+                if len(names) > 1:
+                    tags[key] = names
+                elif key in tags:
+                    del tags[key]
             if track_number:
                 tags["tracknumber"] = [str(track_number)]
             if disc_number:
@@ -1212,6 +1243,12 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags["TPE1"] = TPE1(encoding=3, text=artist)
             tags["TALB"] = TALB(encoding=3, text=album)
             tags["TPE2"] = TPE2(encoding=3, text=album_artist)
+            for desc, value in (("ARTISTS", artist), ("ALBUMARTISTS", album_artist)):
+                names = split_artists(value)
+                if len(names) > 1:
+                    tags[f"TXXX:{desc}"] = TXXX(encoding=3, desc=desc, text=names)
+                else:
+                    tags.delall(f"TXXX:{desc}")
             if track_number:
                 tags["TRCK"] = TRCK(encoding=3, text=str(track_number))
             if disc_number:
@@ -6728,6 +6765,110 @@ def album_art_worker(job_id, only_albums=None):
             jobs[job_id]["status"] = "done"
             jobs[job_id]["current_track"] = None
         save_jobs()
+
+
+_SPLIT_ARTISTS_SCRIPT = r"""
+import os, json, sys, time
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TXXX
+COMMA_ARTISTS = %s
+whole = {n.lower() for n in COMMA_ARTISTS}
+def split(a):
+    parts = [p.strip() for p in (a or '').split(', ') if p.strip()]
+    out, i = [], 0
+    while i < len(parts):
+        for j in range(len(parts), i + 1, -1):
+            if ', '.join(parts[i:j]).lower() in whole:
+                out.append(', '.join(parts[i:j])); i = j; break
+        else:
+            out.append(parts[i]); i += 1
+    return list(dict.fromkeys(out))
+root = sys.argv[1]; backup = sys.argv[2]
+done, failed, undo = [], [], {}
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        ext = f.lower().rsplit('.', 1)[-1]
+        if ext not in ('flac', 'mp3'): continue
+        p = os.path.join(dp, f); rel = os.path.relpath(p, root)
+        try:
+            if ext == 'flac':
+                t = FLAC(p); changed = {}
+                for src, key in (('artist', 'artists'), ('albumartist', 'albumartists')):
+                    names = split((t.get(src) or [''])[0])
+                    if len(names) > 1 and t.get(key) != names:
+                        changed[key] = t.get(key); t[key] = names
+                if changed: t.save()
+            else:
+                t = ID3(p); changed = {}
+                for src, desc in (('TPE1', 'ARTISTS'), ('TPE2', 'ALBUMARTISTS')):
+                    names = split(str(t.get(src) or ''))
+                    cur = t.get('TXXX:' + desc)
+                    if len(names) > 1 and (list(cur.text) if cur else None) != names:
+                        changed[desc] = list(cur.text) if cur else None
+                        t['TXXX:' + desc] = TXXX(encoding=3, desc=desc, text=names)
+                if changed: t.save(p)
+            if changed:
+                done.append(rel); undo[rel] = changed
+        except Exception as e:
+            failed.append([rel, str(e)[:200]])
+if undo:
+    os.makedirs(os.path.dirname(backup), exist_ok=True)
+    with open(backup, 'w') as fh: json.dump(undo, fh)
+json.dump({'updated': len(done), 'failed': failed, 'examples': done[:15]}, sys.stdout)
+""" % json.dumps(COMMA_ARTISTS)
+
+
+def split_artists_worker(job_id):
+    def log(msg):
+        with job_lock:
+            jobs[job_id]["log"].append(msg)
+    with job_lock:
+        jobs[job_id]["status"] = "running"
+    try:
+        ssh_cfg = load_ssh_config()
+        py = _remote_python(ssh_cfg)
+        backup = f".cache/spotidrome/artists-backup/{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        log("ℹ Reading every track's artist tags on the Navidrome host…")
+        r = _run_remote_scan(_ssh_cmd(ssh_cfg, f"{py} -c {shlex.quote(_SPLIT_ARTISTS_SCRIPT)} "
+                                               f"{shlex.quote(ssh_cfg['music_path'])} {shlex.quote(backup)}"),
+                             timeout=REMOTE_SCAN_TIMEOUT)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr[-300:] or "the script failed")
+        res = json.loads(r.stdout or "{}")
+        for rel, err in res.get("failed", [])[:50]:
+            log(f"✗ {rel}: {err}")
+        log(f"✅ Done: {res.get('updated', 0)} track(s) now list each of their artists separately "
+            f"({len(res.get('failed', []))} failed).")
+        for rel in res.get("examples", []):
+            log(f"   • {rel}")
+        if res.get("updated"):
+            log(f"ℹ The previous values are saved on the Navidrome host in ~/{backup}")
+            nd_cfg = load_nd_config()
+            if nd_cfg:
+                ok, _msg = nd_trigger_scan(nd_cfg, full=True)
+                if ok:
+                    log("🔄 Library scan triggered (subsonic)")
+    except Exception as e:
+        log(f"✗ {e}")
+    finally:
+        with job_lock:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["current_track"] = None
+
+
+@app.route("/library/split-artists", methods=["POST"])
+def library_split_artists():
+    """Adds the multi-valued ARTISTS / ALBUMARTISTS tags (see split_artists) to every track
+    whose artist is a comma-joined credit, so Navidrome lists each artist separately.
+    Only adds tags; the readable artist / album artist tags stay as they are."""
+    if not load_ssh_config():
+        return jsonify({"error": "SSH not configured"}), 400
+    job_id = f"split_artists_{int(time.time()*1000)}"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": "[Split Artists] Library", "status": "pending",
+                        "total": 0, "current": 0, "downloaded": 0, "failed": 0, "log": [], "current_track": None}
+    threading.Thread(target=split_artists_worker, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/library/fix-album-art", methods=["POST"])

@@ -880,7 +880,16 @@ async function selectPlaylist(id,name){
   document.getElementById('tracks-list').innerHTML='<div class="empty"><div class="spin"></div></div>';
   document.getElementById('tracks-filter-input').value='';
   document.getElementById('btn-download').disabled=true;
-  const r=await fetch(`${API}/playlist/${id}/tracks`);allTracks=await r.json();
+  const r=await fetch(`${API}/playlist/${id}/tracks`);const data=await r.json().catch(()=>({}));
+  if(!r.ok||!Array.isArray(data)){
+    // e.g. a playlist someone else made, on a Spotify app from after Feb 2026 (see the backend)
+    document.getElementById('selected-meta').textContent="Can't read this playlist";
+    const box=document.createElement('div');box.className='empty';
+    box.textContent=data.error||`Spotify didn't return the songs (HTTP ${r.status})`;
+    const list=document.getElementById('tracks-list');list.innerHTML='';list.appendChild(box);
+    return;
+  }
+  allTracks=data;
   document.getElementById('selected-meta').textContent=`${allTracks.length} tracks`;
   document.getElementById('btn-download').disabled=false;
   renderTracks();

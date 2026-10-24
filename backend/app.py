@@ -844,13 +844,44 @@ def get_sp(no_retry=False):
         return spotipy.Spotify(auth=token["access_token"], retries=0, status_retries=0), None
     return spotipy.Spotify(auth=token["access_token"]), None
 
+# Spotify's February 2026 Web API changes for apps in Development mode: /playlists/{id}/tracks
+# became /playlists/{id}/items, a playlist's "tracks" field became "items" and each entry's
+# "track" became "item". Apps made since 11 Feb 2026 only have the new forms; older apps
+# (still) answer both - so the new form is asked for first, the old one as the fallback.
+# New apps can also only read the songs of playlists the user owns or collaborates on.
+
+class PlaylistNotReadable(Exception):
+    pass
+
+
+def _playlist_items_page(sp, playlist_id, offset, limit=100):
+    errors = []
+    for path in ("items", "tracks"):
+        try:
+            return sp._get(f"playlists/{playlist_id}/{path}", limit=limit, offset=offset, additional_types="track")
+        except spotipy.SpotifyException as e:
+            if e.http_status == 429:
+                raise
+            errors.append(e)
+    if any(e.http_status in (401, 403, 404) for e in errors):
+        raise PlaylistNotReadable(
+            "Spotify didn't share this playlist's songs. Spotify apps in Development mode made after "
+            "11 Feb 2026 can only read playlists you own or collaborate on - save a copy of it in "
+            "Spotify (… → Add to other playlist → New playlist) and sync that one.")
+    raise errors[-1]
+
+
+def playlist_track_count(p):
+    return ((p.get("items") or p.get("tracks") or {}).get("total")) or 0
+
+
 def fetch_playlist_tracks(sp, playlist_id):
     tracks, offset = [], 0
     while True:
-        batch = sp.playlist_tracks(playlist_id, offset=offset, limit=100)
+        batch = _playlist_items_page(sp, playlist_id, offset)
         for item in batch["items"]:
-            t = item.get("track")
-            if not t or t.get("is_local"): continue
+            t = item.get("item") or item.get("track")
+            if not t or t.get("is_local") or t.get("type", "track") != "track": continue
             tracks.append({"id": t["id"], "name": t["name"],
                            "artist": ", ".join(a["name"] for a in t["artists"] if a.get("name")),
                            "album": t["album"]["name"],
@@ -2549,6 +2580,15 @@ def auto_sync_worker():
                         tracks = fetch_playlist_tracks(sp, playlist_id)
                     except Exception as e:
                         print(f"[auto-sync] Failed to fetch tracks for {playlist_name}: {e}")
+                        if isinstance(e, PlaylistNotReadable):
+                            # Shown in the jobs list, or it would just silently never sync.
+                            with job_lock:
+                                jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
+                                                "status": "done", "total": 0, "current": 0,
+                                                "downloaded": 0, "failed": 0, "nd_synced": None,
+                                                "nd_missing": None, "current_track": None,
+                                                "log": [f"✗ {e}"]}
+                                save_jobs()
                         continue
                     with job_lock:
                         jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
@@ -4120,7 +4160,7 @@ def playlists():
         if not batch["next"]: break
         offset += 50
     tracked = load_tracked()
-    return jsonify([{"id": p["id"], "name": p["name"], "tracks": p["tracks"]["total"],
+    return jsonify([{"id": p["id"], "name": p["name"], "tracks": playlist_track_count(p),
                      "image": p["images"][0]["url"] if p.get("images") else None,
                      "owner": p["owner"]["display_name"],
                      "tracked": p["id"] in tracked} for p in results])
@@ -4130,7 +4170,10 @@ def playlist_tracks(playlist_id):
     sp, url = get_sp()
     if not sp:
         return jsonify({"error": "Not authenticated"}), 401
-    return jsonify(fetch_playlist_tracks(sp, playlist_id))
+    try:
+        return jsonify(fetch_playlist_tracks(sp, playlist_id))
+    except PlaylistNotReadable as e:
+        return jsonify({"error": str(e)}), 403
 
 @app.route("/tracked")
 def get_tracked():
@@ -6521,13 +6564,25 @@ def _trim_thumbnail_to_cover(data):
 
 _spotify_cover_cache = {}   # Spotify album ID -> cover URL (or None)
 
-def _spotify_cover_urls(sp, album_ids):
-    """Cover URLs for Spotify album IDs (20 per request), cached."""
+def _spotify_cover_urls(sp, album_ids, log=None):
+    """Cover URLs for Spotify album IDs, cached. One album per request: the batch endpoint
+    (GET /albums?ids=) is gone for Development-mode apps since Feb 2026. A short pause
+    between requests; on a rate limit (429) the rest is left out, so the caller falls back
+    to an album search / YouTube Music for those instead of waiting."""
     todo = [a for a in dict.fromkeys(album_ids) if a and a not in _spotify_cover_cache]
-    for i in range(0, len(todo), 20):
-        for a, alb in zip(todo[i:i + 20], sp.albums(todo[i:i + 20])["albums"]):
-            imgs = (alb or {}).get("images") or []
-            _spotify_cover_cache[a] = max(imgs, key=lambda x: x.get("width") or 0)["url"] if imgs else None
+    for n, a in enumerate(todo):
+        if n:
+            time.sleep(0.15)
+        try:
+            alb = sp.album(a)
+        except spotipy.SpotifyException as e:
+            if e.http_status == 429:
+                if log:
+                    log(f"⚠ Spotify rate limit after {n} of {len(todo)} album lookups - the rest use the fallbacks")
+                break
+            alb = None
+        imgs = (alb or {}).get("images") or []
+        _spotify_cover_cache[a] = max(imgs, key=lambda x: x.get("width") or 0)["url"] if imgs else None
     return {a: _spotify_cover_cache.get(a) for a in album_ids}
 
 
@@ -6654,7 +6709,7 @@ def album_art_worker(job_id, only_albums=None):
         urls = {}
         if sp and main_sid:
             try:
-                urls = _spotify_cover_urls(sp, list(main_sid.values()))
+                urls = _spotify_cover_urls(sp, list(main_sid.values()), log=log)
             except Exception as e:
                 log(f"⚠ Spotify album lookup failed: {e}")
 

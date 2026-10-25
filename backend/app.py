@@ -1328,7 +1328,10 @@ def lookup_genre_from_youtube(artist):
                 return normalized.title()
     return None
 
-def lookup_genre(artist):
+def _artist_name_key(name):
+    return re.sub(r"[^\w]", "", (name or "").lower())
+
+def lookup_genre(artist, youtube=True):
     """Look up a real, specific genre (e.g. 'Metal', 'Nu Metal', 'Synthwave')
     for an artist — Spotify's catalog first, falling back to YouTube's tags
     when Spotify has nothing — since yt-dlp's embedded YouTube metadata on
@@ -1344,15 +1347,20 @@ def lookup_genre(artist):
     otherwise start silently 401ing partway through — miscounting artists
     Spotify genuinely does have data for as "no genre match". get_sp() is
     cheap when the cached token isn't expired (just a local file read), so
-    calling it per-lookup costs nothing in the common case."""
+    calling it per-lookup costs nothing in the common case.
+
+    Only an artist with the same name counts: Spotify's search returns the
+    closest thing it has ("Korn" -> "Artist Ko Ensemble"), whose genres would
+    be wrong. youtube=False skips the (noisy) YouTube fallback."""
     if not artist:
         return None
     key = primary_artist(artist).lower()
     if not key:
         return None
+    cache_key = (key, youtube)
     with _genre_cache_lock:
-        if key in _genre_cache:
-            return _genre_cache[key]
+        if cache_key in _genre_cache:
+            return _genre_cache[cache_key]
     genre = None
     try:
         sp, _ = get_sp()
@@ -1360,21 +1368,22 @@ def lookup_genre(artist):
         sp = None
     if sp:
         try:
-            result = sp.search(q=f"artist:{key}", type="artist", limit=1)
+            result = sp.search(q=f"artist:{key}", type="artist", limit=5)
             items = result.get("artists", {}).get("items", [])
-            if items:
-                genres = items[0].get("genres") or []
+            match = next((a for a in items if _artist_name_key(a.get("name")) == _artist_name_key(key)), None)
+            if match:
+                genres = match.get("genres") or []
                 if genres:
                     genre = genres[0].title()
         except Exception as e:
             print(f"[genre] Spotify lookup failed for {artist!r}: {e}", file=sys.stderr)
-    if not genre:
+    if not genre and youtube:
         try:
             genre = lookup_genre_from_youtube(artist)
         except Exception as e:
             print(f"[genre] YouTube fallback lookup failed for {artist!r}: {e}", file=sys.stderr)
     with _genre_cache_lock:
-        _genre_cache[key] = genre
+        _genre_cache[cache_key] = genre
     return genre
 
 def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None, genre=None,
@@ -2231,7 +2240,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                     continue
                 source_url = extract_resolved_url(stdout)
                 track["source_url"] = source_url
-                genre = lookup_genre(track['artist'])
+                genre = track.get("genre") or lookup_genre(track['artist'])
                 if source_album and source_album != track['album']:
                     with job_lock:
                         jobs[job_id]["log"].append(
@@ -7599,7 +7608,7 @@ def discover_pick(nd_cfg, main_id, mix, size, user_cfg, history, log):
     library_artists = {f.split(" - ", 1)[0].lower() for f in library_files if " - " in f}
 
     cands = {}
-    def add(artist, title, album, seconds, video_id, score):
+    def add(artist, title, album, seconds, video_id, score, seed_genre=None):
         if not artist or not title or not (90 <= seconds <= 600 or (not seconds and not video_id)):
             return
         key = _discover_history_key(artist, title)
@@ -7611,6 +7620,8 @@ def discover_pick(nd_cfg, main_id, mix, size, user_cfg, history, log):
         c = cands.setdefault(key, {"artist": artist, "name": title, "album": album or title,
                                    "duration_ms": seconds * 1000, "video_id": video_id, "score": 0.0})
         c["score"] += score
+        if seed_genre:
+            c.setdefault("seed_genres", []).append(seed_genre)
 
     for seed in seeds:
         for pos, t in enumerate(_ytmusic_radio(seed)):
@@ -7618,7 +7629,7 @@ def discover_pick(nd_cfg, main_id, mix, size, user_cfg, history, log):
                 continue
             artist = ", ".join(a["name"] for a in t.get("artists") or [] if a.get("name"))
             add(artist, t.get("title"), (t.get("album") or {}).get("name"),
-                _parse_length(t.get("length")), t.get("videoId"), 1.0 + 0.5 * (1 - pos / 50))
+                _parse_length(t.get("length")), t.get("videoId"), 1.0 + 0.5 * (1 - pos / 50), seed.get("genre"))
     if user_cfg.get("listenbrainz_user"):
         lb = _listenbrainz_exploration(user_cfg["listenbrainz_user"])
         log(f"🧠 ListenBrainz Weekly Exploration: {len(lb)} track(s)")
@@ -7638,8 +7649,19 @@ def discover_pick(nd_cfg, main_id, mix, size, user_cfg, history, log):
         picks.append(c)
         if len(picks) >= size:
             break
+    for p in picks:
+        p["genre"] = _discover_genre(p)
     log(f"🎯 {len(cands)} new song(s) found, picked {len(picks)}")
     return picks
+
+def _discover_genre(pick):
+    """Spotify's genre for the artist; else the most common genre of the library
+    songs whose radio found it (a song that sounds like your Metal is Metal
+    enough); else YouTube's tags."""
+    seeds = pick.get("seed_genres") or []
+    return lookup_genre(pick["artist"], youtube=False) \
+        or (max(set(seeds), key=seeds.count) if seeds else None) \
+        or lookup_genre(pick["artist"])
 
 # ── Judging the previous picks ──
 

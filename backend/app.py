@@ -2,7 +2,7 @@ import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, di
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import requests as http
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, g
 from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -51,12 +51,26 @@ LONG_TRACK_THRESHOLD_SEC  = 15 * 60  # 15 minutes
 
 # ─── Access control (web login sessions + API keys) ────────────────────────
 # SpotiDrome is reachable from the internet, so every route is deny-by-default:
-# a request needs either a web session (cookie, from logging in with a
-# Navidrome *admin* account) or an API key (for apps like LunaDrome). Only
-# the login endpoint and the "who am I" check are public. Keys and session
-# tokens are stored as SHA-256 hashes, never in the clear.
+# a request needs either a web session (cookie, from logging in with an
+# account on the destination Navidrome) or an API key (for apps like
+# LunaDrome). Only the login endpoint and the "who am I" check are public.
+# Keys and session tokens are stored as SHA-256 hashes, never in the clear.
+#
+# Several people can use one SpotiDrome (GitHub #10): every Navidrome user
+# logs in with their own account, connects their own Spotify account (all
+# through the one Spotify app) and gets their synced playlists in their own
+# Navidrome account. Navidrome admins can do everything; other users only
+# what USER_ROUTES allows - their own Spotify playlists, YouTube Music
+# playlists and their own jobs. The account SpotiDrome itself is configured
+# with (navidrome_config.json) keeps the original Spotify login and the
+# tracked playlists that have no owner.
 SESSIONS_FILE    = "/root/.ssh/web_sessions.json"
 API_KEYS_FILE    = "/root/.ssh/api_keys.json"
+# Per user: a Subsonic token (md5(password + salt)) + salt - enough to update
+# their playlists later (auto-sync) without keeping the password itself.
+USER_CREDENTIALS_FILE = "/root/.ssh/user_credentials.json"
+SPOTIFY_TOKENS_DIR    = "/root/.ssh/spotify_tokens"
+DEFAULT_SPOTIFY_CACHE = "/root/.ssh/.spotify_cache"
 SESSION_COOKIE   = "sd_session"
 SESSION_TTL_SEC  = 30 * 24 * 3600
 LAST_SEEN_WRITE_SEC = 300   # don't rewrite the store on every single request
@@ -81,6 +95,23 @@ API_KEY_SCOPES = {
     "full": None,  # None = every route
 }
 PUBLIC_ROUTES = {("POST", "/session/login"), ("GET", "/session"), ("POST", "/session/logout")}
+# What a Navidrome user who isn't an admin may call (see the top of this section).
+USER_ROUTES = {
+    ("GET", "/auth/status"),
+    ("GET", "/auth/callback"),
+    ("POST", "/auth/disconnect"),
+    ("GET", "/playlists"),
+    ("GET", "/playlist/<playlist_id>/tracks"),
+    ("GET", "/tracked"),
+    ("DELETE", "/tracked/<playlist_id>"),
+    ("POST", "/download"),
+    ("POST", "/ytmusic/info"),
+    ("POST", "/ytmusic/download"),
+    ("GET", "/jobs"),
+    ("GET", "/jobs/<job_id>"),
+    ("POST", "/jobs/<job_id>/skip"),
+    ("POST", "/jobs/<job_id>/cancel"),
+}
 SESSION_ONLY_ROUTES = {("GET", "/api-keys"), ("POST", "/api-keys"), ("DELETE", "/api-keys/<key_id>")}
 
 # Password guessing is limited globally (not per client, so it can't be
@@ -161,11 +192,30 @@ def _identify():
     """Who is making this request: a dict describing the session or key, or None."""
     _h, s = _session_from_request()
     if s:
-        return {"via": "session", "user": s["user"], "scope": "full"}
+        # Sessions from before multi-user logins were all admins.
+        return {"via": "session", "user": s["user"], "scope": "full", "admin": s.get("admin", True)}
     k = _api_key_from_request()
     if k:
-        return {"via": "api_key", "key_id": k["id"], "key_name": k["name"], "scope": k["scope"]}
+        return {"via": "api_key", "key_id": k["id"], "key_name": k["name"], "scope": k["scope"], "admin": True}
     return None
+
+
+def current_user():
+    """The Navidrome user of this request's web login; None for an API key (which
+    acts as SpotiDrome's own account) or outside a request (auto-sync)."""
+    try:
+        who = g.get("who")
+    except RuntimeError:   # not in a request
+        return None
+    return who["user"] if who and who["via"] == "session" else None
+
+
+def is_admin():
+    try:
+        who = g.get("who")
+    except RuntimeError:
+        return True
+    return bool(who and who.get("admin"))
 
 
 @app.before_request
@@ -181,6 +231,9 @@ def _require_auth():
     who = _identify()
     if not who:
         return jsonify({"error": "Login required", "login_required": True}), 401
+    g.who = who
+    if not who["admin"] and route not in USER_ROUTES:
+        return jsonify({"error": "Only Navidrome admins can do this"}), 403
     # A logged-in browser sends its cookie on any request to this site - also
     # ones another page (e.g. a sibling subdomain of the same domain, which SameSite
     # treats as the same site) makes it send. So a change made with the cookie
@@ -199,21 +252,21 @@ def _require_auth():
     return None
 
 
-def _navidrome_admin_login(username, password):
-    """Checks the credentials against the destination Navidrome's own login.
-    Returns (ok, error). Only Navidrome admins may log in to SpotiDrome."""
+def _navidrome_login(username, password):
+    """Checks the credentials against the destination Navidrome's own login - any
+    user of that Navidrome may log in. Returns (ok, error, info) with info =
+    {"user": the name as Navidrome spells it, "admin": bool}."""
     cfg = load_nd_config()
     if not cfg:
-        return False, "Navidrome isn't configured on the server"
+        return False, "Navidrome isn't configured on the server", None
     try:
         r = http.post(f"{cfg['url']}/auth/login", json={"username": username, "password": password}, timeout=15)
     except Exception:
-        return False, "Couldn't reach Navidrome to check the login"
+        return False, "Couldn't reach Navidrome to check the login", None
     if r.status_code != 200:
-        return False, "Wrong username or password"
-    if not r.json().get("isAdmin"):
-        return False, "Only Navidrome admins can use SpotiDrome"
-    return True, None
+        return False, "Wrong username or password", None
+    d = r.json()
+    return True, None, {"user": d.get("username") or username, "admin": bool(d.get("isAdmin"))}
 
 
 @app.route("/session", methods=["GET"])
@@ -221,7 +274,8 @@ def session_get():
     who = _identify()
     if not who:
         return jsonify({"logged_in": False})
-    return jsonify({"logged_in": True, **who})
+    return jsonify({"logged_in": True, **who,
+                    "own_spotify": who["via"] == "session" and not is_default_user(who["user"])})
 
 
 @app.route("/session/login", methods=["POST"])
@@ -235,7 +289,7 @@ def session_login():
     with _auth_lock:
         if time.time() < _login_locked_until:
             return jsonify({"error": "Too many failed logins - try again in a few minutes"}), 429
-    ok, err = _navidrome_admin_login(username, password)
+    ok, err, info = _navidrome_login(username, password)
     if not ok:
         now = time.time()
         with _auth_lock:
@@ -247,15 +301,17 @@ def session_login():
                       f"password login locked for {LOGIN_LOCKOUT_SEC}s", file=sys.stderr, flush=True)
         time.sleep(1)
         return jsonify({"error": err}), 403
+    username = info["user"]
+    save_user_credentials(username, password)
     token = secrets.token_urlsafe(32)
     now = time.time()
     with _auth_lock:
         sessions = _load_auth_store(SESSIONS_FILE)
         sessions = {h: s for h, s in sessions.items() if s.get("expires_at", 0) > now}
-        sessions[_hash_secret(token)] = {"user": username, "created_at": now, "last_seen_at": now,
-                                         "expires_at": now + SESSION_TTL_SEC}
+        sessions[_hash_secret(token)] = {"user": username, "admin": info["admin"], "created_at": now,
+                                         "last_seen_at": now, "expires_at": now + SESSION_TTL_SEC}
         _save_auth_store(SESSIONS_FILE, sessions)
-    resp = jsonify({"logged_in": True, "user": username})
+    resp = jsonify({"logged_in": True, "user": username, "admin": info["admin"]})
     resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SEC, httponly=True,
                     secure=_request_is_https(), samesite="Lax", path="/")
     return resp
@@ -478,14 +534,17 @@ def clear_failed_track(artist, name):
             del data[key]
             save_failed_tracks(data)
 
-def track_playlist(playlist_id, playlist_name, tracks):
+def track_playlist(playlist_id, playlist_name, tracks, owner=None):
     data = load_tracked()
-    data[playlist_id] = {
+    entry = {
         "id": playlist_id,
         "name": playlist_name,
         "tracks": tracks,
         "last_synced": datetime.utcnow().isoformat(),
     }
+    if not is_default_user(owner):
+        entry["owner"] = owner
+    data[tracked_key(playlist_id, owner)] = entry
     save_tracked(data)
 
 # ─── SSH config ───────────────────────────────────────────────────────────────
@@ -642,6 +701,64 @@ def save_nd_config(url, user, password):
     with open(NAVIDROME_CONFIG_FILE, "w") as f:
         json.dump({"url": url.rstrip("/"), "user": user, "password": password}, f)
 
+# ─── Users (several Navidrome users on one SpotiDrome, GitHub #10) ─────────────
+
+_user_creds_lock = threading.Lock()
+
+def is_default_user(user):
+    """No user, or the account SpotiDrome itself is configured with: that one keeps
+    the original Spotify login, Navidrome connection and unowned tracked playlists."""
+    if not user:
+        return True
+    cfg = load_nd_config()
+    return bool(cfg) and user.lower() == cfg["user"].lower()
+
+def save_user_credentials(user, password):
+    """At login: what's needed to update this user's own Navidrome playlists later."""
+    if is_default_user(user):
+        return
+    salt = secrets.token_hex(8)
+    rec = {"user": user, "token": hashlib.md5((password + salt).encode()).hexdigest(), "salt": salt}
+    with _user_creds_lock:
+        try:
+            with open(USER_CREDENTIALS_FILE) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data[user.lower()] = rec
+        fd = os.open(USER_CREDENTIALS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+
+def nd_user_config(user, cfg=None):
+    """Navidrome connection acting as `user` (for their own playlists). Raises when
+    SpotiDrome has no login for them - their playlist mustn't land in another account."""
+    cfg = cfg or load_nd_config()
+    if not cfg or is_default_user(user):
+        return cfg
+    try:
+        with open(USER_CREDENTIALS_FILE) as f:
+            rec = json.load(f).get(user.lower())
+    except Exception:
+        rec = None
+    if not rec:
+        raise ValueError(f"No Navidrome login stored for {user} - they have to log in to SpotiDrome once more")
+    return {"url": cfg["url"], "user": rec["user"], "token": rec["token"], "salt": rec["salt"]}
+
+def tracked_key(playlist_id, owner):
+    """Key in tracked_playlists.json: the playlist id for SpotiDrome's own account
+    (as it always was), "<user>:<id>" for anyone else - two people can track the same playlist."""
+    return playlist_id if is_default_user(owner) else f"{owner.lower()}:{playlist_id}"
+
+def tracked_owner(info):
+    return info.get("owner") or (load_nd_config() or {}).get("user")
+
+def owns(record_owner, user):
+    """Whether `user` (current_user()) may see a job / tracked playlist with this owner."""
+    if is_default_user(user):
+        return is_default_user(record_owner)
+    return bool(record_owner) and record_owner.lower() == user.lower()
+
 # ─── Source Navidrome (someone else's server, browsed/pulled from) ─────────
 # Distinct from NAVIDROME_CONFIG_FILE above, which is always *this* app's
 # own sync destination. This is a second, independent Subsonic connection —
@@ -666,7 +783,11 @@ def nd_subsonic(action, cfg=None, **params):
         cfg = load_nd_config()
     if not cfg:
         raise ValueError("Navidrome not configured")
-    defaults = {"u": cfg["user"], "p": cfg["password"], "v": "1.16.1", "c": "spotidrome", "f": "json"}
+    defaults = {"u": cfg["user"], "v": "1.16.1", "c": "spotidrome", "f": "json"}
+    if cfg.get("token"):   # a user's stored login (nd_user_config)
+        defaults.update(t=cfg["token"], s=cfg["salt"])
+    else:
+        defaults["p"] = cfg["password"]
     defaults.update(params)
     resp = http.get(f"{cfg['url']}/rest/{action}", params=defaults, timeout=30)
     resp.raise_for_status()
@@ -729,7 +850,10 @@ def nd_get_or_create_playlist(name, cfg):
             try:
                 data = nd_subsonic("getPlaylists", cfg=cfg)
                 for pl in data.get("playlists", {}).get("playlist", []):
-                    if pl["name"].lower() == name.lower():
+                    # getPlaylists also lists other users' public playlists, which
+                    # this account can't change: only its own count.
+                    if pl["name"].lower() == name.lower() and \
+                            (pl.get("owner") or cfg["user"]).lower() == cfg["user"].lower():
                         return pl["id"], False
                 last_err = None
                 break
@@ -746,6 +870,9 @@ def nd_sync_playlist(playlist_name, tracks, cfg, job_id=None):
         if job_id:
             with job_lock:
                 jobs[job_id]["log"].append(msg)
+    # The playlist goes into the Navidrome account of whoever started the job.
+    owner = jobs.get(job_id, {}).get("owner") if job_id else None
+    cfg = nd_user_config(owner, cfg)
     log("🔍 Matching tracks in Navidrome…")
     song_ids, not_found = [], []
     for t in tracks:
@@ -817,15 +944,29 @@ def batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, batch_tr
 
 # ─── Spotify ──────────────────────────────────────────────────────────────────
 
-def get_sp(no_retry=False):
-    """no_retry: raise on a 429 instead of sleeping. spotipy otherwise honours
-    Retry-After, which after heavy use can be hours - long jobs (Fill in Track
-    Numbers) then sat on one album all afternoon."""
-    auth = SpotifyOAuth(
+def spotify_oauth(user=None):
+    """The one Spotify app, with the token of `user`'s own Spotify account. SpotiDrome's
+    own account (and everything not about someone's playlists: covers, genres, track
+    numbers) uses the original login."""
+    if is_default_user(user):
+        cache = DEFAULT_SPOTIFY_CACHE
+    else:
+        os.makedirs(SPOTIFY_TOKENS_DIR, mode=0o700, exist_ok=True)
+        cache = os.path.join(SPOTIFY_TOKENS_DIR, hashlib.sha256(user.lower().encode()).hexdigest()[:24] + ".json")
+    return SpotifyOAuth(
         client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET,
         redirect_uri=SPOTIFY_REDIRECT_URI,
         scope="playlist-read-private playlist-read-collaborative user-library-read",
-        cache_path="/root/.ssh/.spotify_cache", open_browser=False)
+        cache_path=cache, open_browser=False,
+        # Otherwise Spotify silently reuses whoever is logged in to Spotify in that browser.
+        show_dialog=not is_default_user(user))
+
+def get_sp(no_retry=False, user=None):
+    """no_retry: raise on a 429 instead of sleeping. spotipy otherwise honours
+    Retry-After, which after heavy use can be hours - long jobs (Fill in Track
+    Numbers) then sat on one album all afternoon.
+    user: whose Spotify account (their playlists); None = SpotiDrome's own."""
+    auth = spotify_oauth(user)
     token = auth.get_cached_token()
     if not token:
         return None, auth.get_authorize_url()
@@ -2123,7 +2264,7 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 jobs[job_id]["failed"] += 1
 
     if playlist_id and all_synced_tracks:
-        track_playlist(playlist_id, playlist_name, tracks)
+        track_playlist(playlist_id, playlist_name, tracks, owner=jobs[job_id].get("owner"))
         print(f"[track] Saved Spotify playlist: {playlist_name} ({playlist_id})", file=sys.stderr)
     elif not playlist_id:
         print(f"[track] No playlist_id provided for {playlist_name}", file=sys.stderr)
@@ -2460,13 +2601,15 @@ def ytmusic_download_worker(job_id, url, playlist_name, is_playlist=False,
 
     if is_playlist and yt_track_list and track_for_sync:
         url_id = yt_playlist_id(url)
+        owner = jobs[job_id].get("owner")
         data = load_tracked()
-        data[url_id] = {
+        data[tracked_key(url_id, owner)] = {
             "id": url_id,
             "name": playlist_name,
             "url": url,
             "tracks": yt_track_list,
             "last_synced": datetime.utcnow().isoformat(),
+            **({} if is_default_user(owner) else {"owner": owner}),
         }
         save_tracked(data)
         with job_lock:
@@ -2533,13 +2676,21 @@ def auto_sync_worker():
     if not tracked:
         print("[auto-sync] No tracked playlists to sync.")
     else:
-        try:
-            sp, _ = get_sp()
-        except Exception as e:
-            print(f"[auto-sync] Spotify auth failed, skipping Spotify playlists this run: {e}")
-            sp = None
+        # Each user's Spotify playlists are read with their own Spotify login.
+        sp_by_owner = {}
+        def sp_for(owner):
+            key = (owner or "").lower()
+            if key not in sp_by_owner:
+                try:
+                    sp_by_owner[key], _ = get_sp(user=owner)
+                except Exception as e:
+                    print(f"[auto-sync] Spotify auth failed for {owner}, skipping their Spotify playlists: {e}")
+                    sp_by_owner[key] = None
+            return sp_by_owner[key]
 
-        for playlist_id, info in tracked.items():
+        for key, info in tracked.items():
+            playlist_id = info.get("id") or key
+            owner = info.get("owner")   # None = SpotiDrome's own account
             playlist_name = info["name"]
             print(f"[auto-sync] Syncing: {playlist_name}")
             job_id = f"auto_{int(time.time()*1000)}"
@@ -2569,12 +2720,14 @@ def auto_sync_worker():
                         jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
                                         "status": "pending", "total": 0, "current": 0,
                                         "downloaded": 0, "failed": 0, "nd_synced": None,
-                                        "nd_missing": None, "current_track": None, "log": []}
+                                        "nd_missing": None, "current_track": None, "log": [],
+                                        "owner": owner}
                     ytmusic_download_worker(job_id, url, playlist_name, is_playlist=True)
                 else:
                     # Spotify playlist
+                    sp = sp_for(owner)
                     if not sp:
-                        print("[auto-sync] Spotify not authenticated, skipping Spotify playlists.")
+                        print(f"[auto-sync] Spotify not connected for {owner or 'SpotiDrome'}, skipping {playlist_name}.")
                         continue
                     try:
                         tracks = fetch_playlist_tracks(sp, playlist_id)
@@ -2587,14 +2740,15 @@ def auto_sync_worker():
                                                 "status": "done", "total": 0, "current": 0,
                                                 "downloaded": 0, "failed": 0, "nd_synced": None,
                                                 "nd_missing": None, "current_track": None,
-                                                "log": [f"✗ {e}"]}
+                                                "log": [f"✗ {e}"], "owner": owner}
                                 save_jobs()
                         continue
                     with job_lock:
                         jobs[job_id] = {"id": job_id, "playlist": f"[Auto] {playlist_name}",
                                         "status": "pending", "total": len(tracks), "current": 0,
                                         "downloaded": 0, "failed": 0, "nd_synced": None,
-                                        "nd_missing": None, "current_track": None, "log": []}
+                                        "nd_missing": None, "current_track": None, "log": [],
+                                        "owner": owner}
                     download_worker(job_id, tracks, playlist_name, playlist_id=playlist_id, sync_navidrome=True)
             except Exception as e:
                 print(f"[auto-sync] {playlist_name} failed unexpectedly, moving on to the rest of tonight's playlists: {e}",
@@ -3876,22 +4030,41 @@ def callback():
     code = request.args.get("code")
     if not code:
         return jsonify({"error": "No code"}), 400
-    auth = SpotifyOAuth(
-        client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET,
-        redirect_uri=SPOTIFY_REDIRECT_URI,
-        scope="playlist-read-private playlist-read-collaborative user-library-read",
-        cache_path="/root/.ssh/.spotify_cache", open_browser=False)
-    auth.get_access_token(code)
+    # Stored for the SpotiDrome user who is logged in in this browser.
+    spotify_oauth(current_user()).get_access_token(code, check_cache=False)
     return jsonify({"status": "ok"})
 
 @app.route("/auth/status")
 def auth_status():
-    sp, url = get_sp()
+    user = current_user()
+    sp, url = get_sp(user=user)
     if sp:
-        me = sp.me()
+        try:
+            me = sp.me()
+        except spotipy.SpotifyException as e:
+            # Development-mode apps only work for accounts the app's owner added
+            # under User Management in the Spotify dashboard.
+            msg = str(e.msg or e)
+            if e.http_status == 403:
+                msg = ("Spotify refused this account. The SpotiDrome admin has to add your Spotify "
+                       "e-mail address to the Spotify app (Developer Dashboard > User Management) first.")
+            return jsonify({"authenticated": False, "error": msg,
+                            "auth_url": spotify_oauth(user).get_authorize_url()})
         return jsonify({"authenticated": True, "user": me["display_name"],
                         "image": me["images"][0]["url"] if me.get("images") else None})
     return jsonify({"authenticated": False, "auth_url": url})
+
+@app.route("/auth/disconnect", methods=["POST"])
+def auth_disconnect():
+    """Forget this user's Spotify login (to connect another account)."""
+    user = current_user()
+    if is_default_user(user):
+        return jsonify({"error": "SpotiDrome's own Spotify login can't be disconnected here"}), 400
+    try:
+        os.remove(spotify_oauth(user).cache_handler.cache_path)
+    except FileNotFoundError:
+        pass
+    return jsonify({"status": "ok"})
 
 @app.route("/navidrome/config", methods=["GET"])
 def nd_get_config():
@@ -4150,7 +4323,8 @@ def ssh_set_config():
 
 @app.route("/playlists")
 def playlists():
-    sp, url = get_sp()
+    user = current_user()
+    sp, url = get_sp(user=user)
     if not sp:
         return jsonify({"error": "Not authenticated", "auth_url": url}), 401
     results, offset = [], 0
@@ -4163,11 +4337,11 @@ def playlists():
     return jsonify([{"id": p["id"], "name": p["name"], "tracks": playlist_track_count(p),
                      "image": p["images"][0]["url"] if p.get("images") else None,
                      "owner": p["owner"]["display_name"],
-                     "tracked": p["id"] in tracked} for p in results])
+                     "tracked": tracked_key(p["id"], user) in tracked} for p in results])
 
 @app.route("/playlist/<playlist_id>/tracks")
 def playlist_tracks(playlist_id):
-    sp, url = get_sp()
+    sp, url = get_sp(user=current_user())
     if not sp:
         return jsonify({"error": "Not authenticated"}), 401
     try:
@@ -4177,11 +4351,17 @@ def playlist_tracks(playlist_id):
 
 @app.route("/tracked")
 def get_tracked():
-    return jsonify(load_tracked())
+    """Your own tracked playlists, keyed like tracked_playlists.json (that key is
+    what DELETE /tracked/<key> takes)."""
+    user = current_user()
+    return jsonify({k: {**v, "key": k} for k, v in load_tracked().items() if owns(tracked_owner(v), user)})
 
 @app.route("/tracked/<playlist_id>", methods=["DELETE"])
 def remove_tracked(playlist_id):
     data = load_tracked()
+    info = data.get(playlist_id)
+    if info is not None and not owns(tracked_owner(info), current_user()):
+        return jsonify({"error": "Not your playlist"}), 403
     data.pop(playlist_id, None)
     save_tracked(data)
     return jsonify({"status": "ok"})
@@ -4199,7 +4379,8 @@ def start_download():
     with job_lock:
         jobs[job_id] = {"id": job_id, "playlist": playlist_name, "status": "pending",
                         "total": len(tracks), "current": 0, "downloaded": 0, "failed": 0,
-                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": [],
+                        "owner": current_user()}
     threading.Thread(target=download_worker,
                      args=(job_id, tracks, playlist_name, playlist_id, sync), daemon=True).start()
     return jsonify({"job_id": job_id})
@@ -4212,24 +4393,31 @@ def list_jobs():
     threads need too — pinned the CPU and starved running downloads. The UI
     only shows the last 25 log lines, so send those plus the total count;
     /jobs/<id> still returns a whole job."""
+    # Admins see every job (the library ones too); other users their own.
+    admin, user = is_admin(), current_user()
     with job_lock:
         summary = [{**job, "log": job.get("log", [])[-25:],
                     "log_count": len(job.get("log", []))}
-                   for job in jobs.values()]
+                   for job in jobs.values() if admin or owns(job.get("owner"), user)]
     return jsonify(summary)
+
+def _visible_job(job_id):
+    with job_lock:
+        job = jobs.get(job_id)
+    if job and not is_admin() and not owns(job.get("owner"), current_user()):
+        return None
+    return job
 
 @app.route("/jobs/<job_id>")
 def get_job(job_id):
-    with job_lock:
-        job = jobs.get(job_id)
+    job = _visible_job(job_id)
     if not job:
         return jsonify({"error": "Not found"}), 404
     return jsonify(job)
 
 @app.route("/jobs/<job_id>/skip", methods=["POST"])
 def skip_track(job_id):
-    with job_lock:
-        job = jobs.get(job_id)
+    job = _visible_job(job_id)
     if not job:
         return jsonify({"error": "Not found"}), 404
     with job_lock:
@@ -4238,6 +4426,8 @@ def skip_track(job_id):
 
 @app.route("/jobs/<job_id>/cancel", methods=["POST"])
 def cancel_job(job_id):
+    if not _visible_job(job_id):
+        return jsonify({"error": "Not found"}), 404
     with job_lock:
         job = jobs.get(job_id)
         if not job:
@@ -4320,7 +4510,8 @@ def ytmusic_download():
     with job_lock:
         jobs[job_id] = {"id": job_id, "playlist": label, "status": "pending",
                         "total": 0, "current": 0, "downloaded": 0, "failed": 0,
-                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": []}
+                        "nd_synced": None, "nd_missing": None, "current_track": None, "log": [],
+                        "owner": current_user()}
     threading.Thread(target=ytmusic_download_worker,
                      args=(job_id, url, playlist_name, is_playlist),
                      kwargs={"sync_playlist": sync_playlist, "track_for_sync": track_for_sync,
@@ -6182,10 +6373,10 @@ def health_summary():
 
     playlists = []
     for playlist_id, info in tracked.items():
-        health = sync_health.get(playlist_id, {})
+        health = sync_health.get(info.get("id") or playlist_id, {})
         playlists.append({
             "id": playlist_id,
-            "name": info.get("name"),
+            "name": info.get("name") + (f" ({info['owner']})" if info.get("owner") else ""),
             "last_synced": info.get("last_synced"),
             "last_status": health.get("last_status", "unknown"),
             "downloaded": health.get("downloaded"),

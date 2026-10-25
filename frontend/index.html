@@ -321,6 +321,8 @@ header{
 .empty-icon{font-size:24px;margin-bottom:8px;opacity:.5}
 
 /* Callback */
+.not-admin .admin-only{display:none!important}
+.auth-err{display:none;max-width:420px;font-size:13px;line-height:1.5;color:#fca5a5;background:rgba(127,29,29,.25);border:1px solid rgba(248,113,113,.3);border-radius:var(--r);padding:10px 14px}
 #cb-ov{display:none;position:fixed;inset:0;background:rgba(13,13,18,.95);z-index:300;align-items:center;justify-content:center;flex-direction:column;gap:14px}
 #cb-ov.show{display:flex}
 #cb-ov .cb-title{font-family:var(--font2);font-size:22px;font-weight:600}
@@ -454,9 +456,14 @@ header{
       <div class="settings-sec">
         <div class="settings-sec-title">Access</div>
         <div class="settings-row">
-          <div><div class="settings-label">Logged in as <span id="session-user">…</span></div><div class="settings-sub">Navidrome admin login · stays logged in for 30 days on this browser</div></div>
+          <div><div class="settings-label">Logged in as <span id="session-user">…</span></div><div class="settings-sub"><span id="session-role">Navidrome login</span> · stays logged in for 30 days on this browser</div></div>
           <button class="btn btn-ghost" onclick="sdLogout()" style="flex-shrink:0">Log out</button>
         </div>
+        <div class="settings-row" id="spotify-switch-row" style="display:none">
+          <div><div class="settings-label">Spotify</div><div class="settings-sub">Connect a different Spotify account</div></div>
+          <button class="btn btn-ghost" onclick="disconnectSpotify()" style="flex-shrink:0">Switch account</button>
+        </div>
+        <div class="admin-only">
         <div class="settings-label" style="margin:10px 0 6px">API keys</div>
         <div class="settings-sub" style="margin-bottom:8px">For apps like LunaDrome. Send the key as <code>Authorization: Bearer &lt;key&gt;</code>. A <b>LunaDrome</b> key can only search, download from YT Music and follow its jobs; <b>Full access</b> can do everything except manage keys.</div>
         <div id="api-keys-list" class="settings-sub" style="margin-bottom:8px">…</div>
@@ -475,7 +482,9 @@ header{
           </select>
           <button class="btn btn-primary" onclick="createApiKey()" style="flex-shrink:0">+ Create key</button>
         </div>
+        </div>
       </div>
+      <div class="admin-only">
       <div style="height:1px;background:var(--border);margin:4px 0"></div>
       <div class="settings-sec" style="margin-top:12px">
         <div class="settings-sec-title">SpotiDrome</div>
@@ -563,6 +572,7 @@ header{
           <a class="btn btn-nd" href="/long-tracks.html" style="flex-shrink:0;text-decoration:none">⏱ Review</a>
         </div>
       </div>
+      </div>
     </div>
   </div>
 </div>
@@ -574,15 +584,15 @@ header{
     </div>
     <div class="header-right">
       <div class="pill settings-pill" onclick="openSettingsModal()">⚙ Settings</div>
-      <div class="pill" onclick="openScheduleModal()" id="schedule-pill">
+      <div class="pill admin-only" onclick="openScheduleModal()" id="schedule-pill">
         <div class="dot" id="schedule-dot"></div>
         <span id="schedule-pill-label">Auto-sync</span>
       </div>
-      <div class="pill nd-pill" onclick="openNdModal()" id="nd-pill">
+      <div class="pill nd-pill admin-only" onclick="openNdModal()" id="nd-pill">
         <div class="dot" id="nd-dot"></div>
         <span id="nd-pill-label">Navidrome</span>
       </div>
-      <div class="pill nd-pill" onclick="openSourceNdModal()" id="source-nd-pill">
+      <div class="pill nd-pill admin-only" onclick="openSourceNdModal()" id="source-nd-pill">
         <div class="dot" id="source-nd-dot"></div>
         <span id="source-nd-pill-label">🔗 Source Navidrome</span>
       </div>
@@ -596,6 +606,7 @@ header{
     </div>
     <div class="auth-title">Connect Spotify</div>
     <div class="auth-sub">Link your Spotify account to browse playlists and download them to Navidrome.</div>
+    <div class="auth-err" id="auth-err"></div>
     <a id="auth-link" href="#" class="btn-spotify">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
       Login with Spotify
@@ -639,7 +650,7 @@ header{
           <div id="playlists-list" class="source-body"><div class="empty"><div class="spin"></div></div></div>
         </div>
 
-        <div class="panel source-panel" style="margin-top:12px">
+        <div class="panel source-panel admin-only" style="margin-top:12px">
           <div class="panel-hd source-hd" onclick="toggleSource('navidrome')">
             <span class="panel-title"><span class="source-chevron" id="navidrome-chevron">▾</span> Navidrome</span>
             <span class="badge" id="source-nd-count">—</span>
@@ -662,7 +673,7 @@ header{
         </div>
 
         <!-- Sync health -->
-        <div class="panel" id="health-panel" style="margin-top:12px">
+        <div class="panel admin-only" id="health-panel" style="margin-top:12px">
           <div class="panel-hd">
             <span class="panel-title">Sync Health</span>
             <span class="badge" id="health-unknown-badge" title="Tracks tagged &quot;Unknown Album&quot; in Navidrome">—</span>
@@ -693,7 +704,7 @@ header{
             <label class="toggle"><input type="checkbox" id="toggle-sync" checked><span class="toggle-sl"></span></label>
             <span class="sync-label">Sync to Navidrome</span>
             <span class="sync-desc">— scan & create playlist after download</span>
-            <button class="btn btn-nd" style="margin-left:auto;padding:6px 10px;font-size:11px" onclick="openNdModal()">⚙ Configure</button>
+            <button class="btn btn-nd admin-only" style="margin-left:auto;padding:6px 10px;font-size:11px" onclick="openNdModal()">⚙ Configure</button>
           </div>
         </div>
 
@@ -721,11 +732,30 @@ if(code){
   fetch(`${API}/auth/callback?code=${code}`).then(r=>r.json()).then(()=>{window.history.replaceState({},'','/');document.getElementById('cb-ov').classList.remove('show');init();}).catch(()=>{document.getElementById('cb-ov').classList.remove('show');init();});
 }else{init();}
 
+// Admins get the whole app; other Navidrome users only their own Spotify/YouTube
+// playlists and jobs (the backend refuses the rest, the page hides it: .admin-only).
+let IS_ADMIN=true;
 async function init(){
-  await Promise.all([checkNd(),checkSchedule(),checkFailed(),checkSourceNd()]);
+  const session=await window.SD_READY;
+  IS_ADMIN=session.admin!==false;
+  // Everyone but SpotiDrome's own account has a Spotify login of their own to switch.
+  document.getElementById('spotify-switch-row').style.display=session.own_spotify?'':'none';
+  document.getElementById('session-role').textContent=IS_ADMIN?'Navidrome admin':'Navidrome user';
+  if(IS_ADMIN)await Promise.all([checkNd(),checkSchedule(),checkFailed(),checkSourceNd()]);
   const res=await fetch(`${API}/auth/status`),d=await res.json();
-  if(d.authenticated){showMain(d);loadPlaylists();loadYtTracked();loadHealth();setInterval(renderJobs,2500);setInterval(loadYtTracked,10000);setInterval(loadHealth,30000);setInterval(checkFailed,30000);renderJobs();}
-  else{document.getElementById('auth-link').href=d.auth_url;document.getElementById('auth-screen').style.display='flex';}
+  if(d.authenticated){showMain(d);loadPlaylists();loadYtTracked();setInterval(renderJobs,2500);setInterval(loadYtTracked,10000);renderJobs();
+    if(IS_ADMIN){loadHealth();setInterval(loadHealth,30000);setInterval(checkFailed,30000);}}
+  else{
+    document.getElementById('auth-link').href=d.auth_url;
+    const err=document.getElementById('auth-err');
+    err.textContent=d.error||'';err.style.display=d.error?'block':'none';
+    document.getElementById('auth-screen').style.display='flex';
+  }
+}
+async function disconnectSpotify(){
+  if(!confirm('Disconnect your Spotify account? You can then log in with another one.'))return;
+  await fetch(`${API}/auth/disconnect`,{method:'POST'});
+  location.href='/';
 }
 
 function toggleSource(name){
@@ -910,7 +940,7 @@ function renderTracks(){
   // *your* library via the Spotify/YouTube pipeline — a source-Navidrome
   // album is just a preview of someone else's library pre-pull, nothing
   // to replace yet.
-  const showFlag=currentSource==='spotify';
+  const showFlag=currentSource==='spotify'&&IS_ADMIN;
   list.innerHTML=shown.map(([t,i])=>`<div class="track-item">
     <div class="track-num">${i+1}</div>
     <div class="track-art">${t.image?`<img src="${t.image.startsWith('/')?API+t.image:t.image}" loading="lazy">`:''}</div>
@@ -1110,7 +1140,7 @@ async function loadYtTracked(){
     list.innerHTML=yt.map(p=>`<div class="yt-item" onclick="syncYtPlaylist('${escA(p.id)}','${escA(p.name)}','${escA(p.url||'')}')">
       <div class="yt-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="var(--yt)"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg></div>
       <div class="pl-info"><div class="pl-name">${esc(p.name)}</div><div class="pl-meta">${p.tracks?p.tracks.length:0} tracks · ${p.last_synced?new Date(p.last_synced+'Z').toLocaleDateString():'never'}</div></div>
-      <button onclick="event.stopPropagation();removeYtTracked('${p.id}')" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:4px 6px" title="Remove">✕</button>
+      <button onclick="event.stopPropagation();removeYtTracked('${escA(p.key||p.id)}')" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:4px 6px" title="Remove">✕</button>
     </div>`).join('');
   }catch(e){}
 }
@@ -1119,7 +1149,7 @@ async function syncYtPlaylist(id,name,url){if(!url){alert('No URL stored.');retu
   await fetch(`${API}/ytmusic/download`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,playlist_name:name,is_playlist:true})});
   renderJobs();
 }
-async function removeYtTracked(id){await fetch(`${API}/tracked/${id}`,{method:'DELETE'});loadYtTracked();}
+async function removeYtTracked(id){await fetch(`${API}/tracked/${encodeURIComponent(id)}`,{method:'DELETE'});loadYtTracked();}
 
 async function loadHealth(){
   try{
@@ -1194,7 +1224,7 @@ async function saveSchedule(){
 async function runSyncNow(){await fetch(`${API}/schedule/run`,{method:'POST'});closeScheduleModal();setTimeout(renderJobs,1000);}
 
 // Settings modal
-function openSettingsModal(){checkAppUpdate(false);loadYtdlpVersion();loadCookieStatus();loadApiKeys();loadMaintenanceSchedule();document.getElementById('settings-modal').classList.add('show');}
+function openSettingsModal(){if(IS_ADMIN){checkAppUpdate(false);loadYtdlpVersion();loadCookieStatus();loadApiKeys();loadMaintenanceSchedule();}document.getElementById('settings-modal').classList.add('show');}
 
 // ─── Access: API keys ───────────────────────────────────────────────────
 document.addEventListener('sd-session',e=>{document.getElementById('session-user').textContent=e.detail.user||'?';});

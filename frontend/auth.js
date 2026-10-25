@@ -39,6 +39,9 @@
     (document.body || document.documentElement).appendChild(bar);
   }
   document.documentElement.style.visibility = 'hidden';
+  // Pages that need the session (is this an admin?) wait for this.
+  let ready;
+  window.SD_READY = new Promise(res => { ready = res; });
   _fetch('/api/session').then(async r => {
     const d = await r.json().catch(() => null);
     if(!d){
@@ -48,6 +51,10 @@
     }
     if(!d.logged_in){ toLogin(); return; }
     window.SD_SESSION = d;
+    // Navidrome users who aren't admins only get their own playlists and jobs:
+    // everything marked .admin-only is hidden for them.
+    document.documentElement.classList.toggle('not-admin', d.admin === false);
+    ready(d);
     document.documentElement.style.visibility = '';
     document.dispatchEvent(new CustomEvent('sd-session', {detail: d}));
   }).catch(() => showApiError("Can't reach the SpotiDrome API (network error)."));

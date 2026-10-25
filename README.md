@@ -45,7 +45,7 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
    docker compose pull && docker compose up -d
    ```
    (or build them yourself from this checkout: `docker compose up -d --build`)
-4. Open `http://<host>:8080`, log in with a Navidrome **admin** account, authenticate with Spotify, and start tracking playlists.
+4. Open `http://<host>:8080`, log in with your Navidrome account, authenticate with Spotify, and start tracking playlists.
 
 ## Updating
 
@@ -71,10 +71,13 @@ The images contain no configuration or secrets: `.env`, the SSH key and all runt
 
 SpotiDrome can be exposed to the internet: every API route is deny-by-default in `backend/app.py` (`_require_auth`).
 
-- **Web UI:** log in with a Navidrome account that is an **admin** on the destination Navidrome (`NAVIDROME_URL`); the credentials are checked by Navidrome's own `/auth/login`. You get an `HttpOnly`, `SameSite=Lax` session cookie (`Secure` behind https) valid for 30 days. Changes made with that cookie (anything but GET) must also carry `X-SD-Web: 1`, which the pages' shared `auth.js` adds - so another site (even a sibling subdomain, which counts as the same site for cookies) can't make your browser act for you. Log out from Settings → Access. 10 failed logins within 10 minutes lock password login for everyone for 10 minutes; existing sessions and API keys keep working.
+- **Web UI:** log in with an account on the destination Navidrome (`NAVIDROME_URL`); the credentials are checked by Navidrome's own `/auth/login`. You get an `HttpOnly`, `SameSite=Lax` session cookie (`Secure` behind https) valid for 30 days. Changes made with that cookie (anything but GET) must also carry `X-SD-Web: 1`, which the pages' shared `auth.js` adds - so another site (even a sibling subdomain, which counts as the same site for cookies) can't make your browser act for you. Log out from Settings → Access. 10 failed logins within 10 minutes lock password login for everyone for 10 minutes; existing sessions and API keys keep working.
 - **API keys (apps like LunaDrome):** create one in Settings → Access → API keys. The key (`sdk_…`) is shown **once**; only its SHA-256 hash is stored (`~/.ssh/api_keys.json`). Send it as `Authorization: Bearer <key>` (or `X-API-Key: <key>`). Revoke it there at any time. Each key has a scope:
   - **LunaDrome:** `GET /session`, `GET /search`, `GET /search/album/<browseId>`, `POST /ytmusic/info`, `POST /ytmusic/download`, `GET /jobs`, `GET /jobs/<id>`, `POST /jobs/<id>/skip|cancel`, `GET /ytdlp/version`. Anything else is `403`.
   - **Full access:** everything the web UI can do, except managing API keys (that always needs a web login).
+- **Several users:** every Navidrome user can log in. Each connects their **own Spotify account** (through the one Spotify app) and gets their synced playlists in **their own Navidrome account**; auto-sync reads each tracked playlist with its owner's Spotify login. Navidrome **admins** can do everything; other users only see their own Spotify/YouTube Music playlists, tracked playlists and jobs (`USER_ROUTES` in `backend/app.py`). The account in `NAVIDROME_USER` / the Navidrome settings keeps the original Spotify login and tracked playlists.
+  - At login SpotiDrome keeps a Subsonic token (`md5(password + salt)` + salt, not the password) per user in `~/.ssh/user_credentials.json` (mode 600), so auto-sync can update their playlists later. Spotify logins are in `~/.ssh/spotify_tokens/`; a user can switch account in Settings → Access.
+  - A Spotify app in **Development mode** only works for accounts its owner adds under **User Management** in the Spotify Developer Dashboard - add each user's Spotify e-mail there. Others get a clear message after connecting.
 - `GET /session` tells a client who it is (`logged_in`, `via: session|api_key`, `scope`) - handy as a connection test for an API key.
 - The backend port (`5000`) is bound to `127.0.0.1` only; everything goes through the frontend's `/api/` proxy. Put a TLS reverse proxy in front of port `8080` for internet access (it should send `X-Forwarded-Proto: https`):
   - Proxy **everything** (one `location /`) to `http://<host>:8080`, and keep the path unchanged: no separate `location /api/` pointing at `:5000` (not reachable from the LAN), and no `proxy_pass http://<host>:8080/;` with a trailing slash inside `location /api/` (that strips `/api`, so API calls get the web page back).

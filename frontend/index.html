@@ -278,6 +278,22 @@ header{
 }
 .field input:focus,.field select:focus,.field textarea:focus{border-color:rgba(139,92,246,.5)}
 .field textarea{resize:vertical;min-height:80px;font-family:monospace}
+.sd-input{
+  background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  color:var(--text);font-family:var(--font);font-size:13px;height:34px;padding:0 10px;outline:none;
+  transition:border-color .15s;
+}
+.sd-input:hover{border-color:var(--border2)}
+.sd-input:focus{border-color:rgba(139,92,246,.5)}
+.sd-input::placeholder{color:var(--text3)}
+select.sd-input,.field select{
+  appearance:none;-webkit-appearance:none;cursor:pointer;padding-right:28px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239090b0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 10px center;
+}
+select.sd-input option,.field select option{background:var(--bg3);color:var(--text)}
+input.sd-input[type=number]{text-align:center;padding:0 6px;-moz-appearance:textfield}
+input.sd-input[type=number]::-webkit-inner-spin-button,input.sd-input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .field-hint{font-size:11px;color:var(--text3);line-height:1.5}
 .conn-ok{background:rgba(30,215,96,.1);border:1px solid rgba(30,215,96,.2);color:#4ade80;font-size:12px;padding:6px 12px;border-radius:6px}
 .conn-err{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:#f87171;font-size:12px;padding:6px 12px;border-radius:6px}
@@ -475,8 +491,8 @@ header{
           </div>
         </div>
         <div class="field" style="flex-direction:row;gap:6px;flex-wrap:wrap">
-          <input id="api-key-name" placeholder="Key name, e.g. LunaDrome on my PC" style="flex:1;min-width:160px" maxlength="60">
-          <select id="api-key-scope" style="flex-shrink:0">
+          <input id="api-key-name" class="sd-input" placeholder="Key name, e.g. LunaDrome on my PC" style="flex:1;min-width:160px" maxlength="60">
+          <select id="api-key-scope" class="sd-input" style="flex-shrink:0">
             <option value="lunadrome">LunaDrome</option>
             <option value="full">Full access</option>
           </select>
@@ -491,7 +507,7 @@ header{
         <div class="settings-row" id="dsc-row-weekly">
           <div><div class="settings-label">Discover Weekly</div><div class="settings-sub dsc-status">…</div></div>
           <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
-            <input type="number" class="dsc-size" min="5" max="60" style="width:56px" title="Songs per week">
+            <input type="number" class="sd-input dsc-size" min="5" max="60" style="width:48px" title="Songs per week">
             <label class="toggle"><input type="checkbox" class="dsc-on"><span class="toggle-sl"></span></label>
             <button class="btn btn-ghost dsc-run" onclick="runDiscover('weekly',this)">Make now</button>
           </div>
@@ -499,7 +515,7 @@ header{
         <div class="settings-row" id="dsc-row-daily">
           <div><div class="settings-label">Daily Discovery</div><div class="settings-sub dsc-status">…</div></div>
           <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
-            <input type="number" class="dsc-size" min="3" max="30" style="width:56px" title="Songs per day">
+            <input type="number" class="sd-input dsc-size" min="3" max="30" style="width:48px" title="Songs per day">
             <label class="toggle"><input type="checkbox" class="dsc-on"><span class="toggle-sl"></span></label>
             <button class="btn btn-ghost dsc-run" onclick="runDiscover('daily',this)">Make now</button>
           </div>
@@ -507,13 +523,13 @@ header{
         <div class="settings-row">
           <div><div class="settings-label">When</div><div class="settings-sub">Weekly on this day, daily every day, at this hour</div></div>
           <div style="display:flex;gap:6px;flex-shrink:0">
-            <select id="dsc-weekday"><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option><option value="5">Sat</option><option value="6">Sun</option></select>
-            <select id="dsc-hour"></select>
+            <select id="dsc-weekday" class="sd-input"><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option><option value="5">Sat</option><option value="6">Sun</option></select>
+            <select id="dsc-hour" class="sd-input"></select>
           </div>
         </div>
         <div class="settings-row">
           <div><div class="settings-label">ListenBrainz</div><div class="settings-sub">Optional: your ListenBrainz username, to add its Weekly Exploration picks</div></div>
-          <input id="dsc-lb" placeholder="username" maxlength="64" style="width:130px;flex-shrink:0">
+          <input id="dsc-lb" class="sd-input" placeholder="username" maxlength="64" style="width:140px;flex-shrink:0">
         </div>
         <div style="display:flex;justify-content:flex-end;gap:8px;align-items:center">
           <span class="settings-sub" id="dsc-msg"></span>

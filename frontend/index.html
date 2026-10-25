@@ -294,6 +294,40 @@ select.sd-input,.field select{
 select.sd-input option,.field select option{background:var(--bg3);color:var(--text)}
 input.sd-input[type=number]{text-align:center;padding:0 6px;-moz-appearance:textfield}
 input.sd-input[type=number]::-webkit-inner-spin-button,input.sd-input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.dsc-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r2);padding:12px 14px;margin-bottom:8px;transition:border-color .15s}
+.dsc-card.on{border-color:rgba(139,92,246,.35)}
+.dsc-card-top{display:flex;align-items:center;gap:12px}
+.dsc-icon{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0;background:var(--bg4)}
+.dsc-card.on .dsc-icon{background:linear-gradient(135deg,var(--nd),var(--nd2))}
+.dsc-card-bottom{display:flex;align-items:center;gap:10px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}
+.dsc-card:not(.on) .dsc-card-bottom{opacity:.55}
+.stepper{display:inline-flex;align-items:center;height:30px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.stepper button{width:28px;height:100%;background:none;border:0;color:var(--text2);font-size:15px;cursor:pointer;font-family:var(--font)}
+.stepper button:hover{background:var(--bg4);color:var(--text)}
+.stepper input{width:32px;height:100%;background:none;border:0;color:var(--text);text-align:center;font:600 13px var(--font);outline:none;-moz-appearance:textfield}
+.stepper input::-webkit-inner-spin-button,.stepper input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.btn-sm{padding:6px 12px;font-size:12px}
+.dsc-line{display:flex;align-items:center;gap:10px;margin:12px 0 8px}
+.dsc-line>.settings-label{width:92px;flex-shrink:0}
+.dsc-days{display:flex;gap:3px;flex:1;min-width:0}
+.dsc-days button{flex:1;min-width:0;height:30px;padding:0;background:var(--bg3);border:1px solid var(--border);border-radius:8px;color:var(--text2);font:500 11px var(--font);cursor:pointer;transition:.15s}
+.dsc-days button:hover{border-color:var(--border2);color:var(--text)}
+.dsc-days button.sel{background:rgba(139,92,246,.18);border-color:rgba(139,92,246,.55);color:var(--text)}
+#dsc-hour{height:30px;flex-shrink:0}
+.dsc-card-bottom .settings-sub{white-space:nowrap}
+@media(max-width:480px){
+  .dsc-line{flex-wrap:wrap}
+  .dsc-days{order:3;flex-basis:100%}
+  #dsc-hour{margin-left:auto}
+  .dsc-line>.settings-label{width:auto}
+}
+.dsc-how{margin-top:6px;font-size:12px;color:var(--text2)}
+.dsc-how summary{cursor:pointer;color:var(--text2);font-size:12px;list-style:none;display:inline-flex;align-items:center;gap:6px}
+.dsc-how summary::before{content:'›';display:inline-block;transition:transform .15s;font-size:14px}
+.dsc-how[open] summary::before{transform:rotate(90deg)}
+.dsc-how summary::-webkit-details-marker{display:none}
+.dsc-how ul{margin:8px 0 0 18px;line-height:1.6;color:var(--text3)}
+.dsc-how b{color:var(--text2);font-weight:500}
 .field-hint{font-size:11px;color:var(--text3);line-height:1.5}
 .conn-ok{background:rgba(30,215,96,.1);border:1px solid rgba(30,215,96,.2);color:#4ade80;font-size:12px;padding:6px 12px;border-radius:6px}
 .conn-err{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:#f87171;font-size:12px;padding:6px 12px;border-radius:6px}
@@ -503,41 +537,62 @@ input.sd-input[type=number]::-webkit-inner-spin-button,input.sd-input[type=numbe
       <div style="height:1px;background:var(--border);margin:4px 0"></div>
       <div class="settings-sec" style="margin-top:12px">
         <div class="settings-sec-title">Discover</div>
-        <div class="settings-sub" style="margin-bottom:8px">Playlists of songs that aren't in your library yet, picked from what you play most. They go into a separate <b>Discover</b> library in Navidrome. When a mix is made again, the songs from last time that you starred, rated 4-5 stars or played <span id="dsc-keep-plays">2</span>+ times move into your library; the rest are deleted. "Not for me" (or 1 star) deletes a song right away. Both mixes are off until you switch them on.</div>
-        <div class="settings-row" id="dsc-row-weekly">
-          <div><div class="settings-label">Discover Weekly</div><div class="settings-sub dsc-status">…</div></div>
-          <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
-            <input type="number" class="sd-input dsc-size" min="5" max="60" style="width:48px" title="Songs per week">
-            <label class="toggle"><input type="checkbox" class="dsc-on"><span class="toggle-sl"></span></label>
-            <button class="btn btn-ghost dsc-run" onclick="runDiscover('weekly',this)">Make now</button>
+        <div class="settings-sub" style="margin-bottom:10px">Playlists of songs you don't have yet, picked from what you play most. They live in a separate <b>Discover</b> library in Navidrome until you decide to keep them.</div>
+        <div class="dsc-card" id="dsc-row-weekly">
+          <div class="dsc-card-top">
+            <div class="dsc-icon">🔭</div>
+            <div style="flex:1;min-width:0"><div class="settings-label">Discover Weekly</div><div class="settings-sub dsc-status">…</div></div>
+            <label class="toggle" title="On/off"><input type="checkbox" class="dsc-on" onchange="dscChanged()"><span class="toggle-sl"></span></label>
+          </div>
+          <div class="dsc-card-bottom">
+            <div class="stepper" title="Songs per week">
+              <button type="button" onclick="dscStep(this,-1)" aria-label="Fewer">−</button>
+              <input type="number" class="dsc-size" min="5" max="60" onchange="dscStep(this,0)">
+              <button type="button" onclick="dscStep(this,1)" aria-label="More">+</button>
+            </div>
+            <span class="settings-sub" style="margin:0">songs per week</span>
+            <button class="btn btn-ghost btn-sm dsc-run" style="margin-left:auto" onclick="runDiscover('weekly',this)">↻ Make now</button>
           </div>
         </div>
-        <div class="settings-row" id="dsc-row-daily">
-          <div><div class="settings-label">Daily Discovery</div><div class="settings-sub dsc-status">…</div></div>
-          <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
-            <input type="number" class="sd-input dsc-size" min="3" max="30" style="width:48px" title="Songs per day">
-            <label class="toggle"><input type="checkbox" class="dsc-on"><span class="toggle-sl"></span></label>
-            <button class="btn btn-ghost dsc-run" onclick="runDiscover('daily',this)">Make now</button>
+        <div class="dsc-card" id="dsc-row-daily">
+          <div class="dsc-card-top">
+            <div class="dsc-icon">☀️</div>
+            <div style="flex:1;min-width:0"><div class="settings-label">Daily Discovery</div><div class="settings-sub dsc-status">…</div></div>
+            <label class="toggle" title="On/off"><input type="checkbox" class="dsc-on" onchange="dscChanged()"><span class="toggle-sl"></span></label>
+          </div>
+          <div class="dsc-card-bottom">
+            <div class="stepper" title="Songs per day">
+              <button type="button" onclick="dscStep(this,-1)" aria-label="Fewer">−</button>
+              <input type="number" class="dsc-size" min="3" max="30" onchange="dscStep(this,0)">
+              <button type="button" onclick="dscStep(this,1)" aria-label="More">+</button>
+            </div>
+            <span class="settings-sub" style="margin:0">songs per day</span>
+            <button class="btn btn-ghost btn-sm dsc-run" style="margin-left:auto" onclick="runDiscover('daily',this)">↻ Make now</button>
           </div>
         </div>
-        <div class="settings-row">
-          <div><div class="settings-label">When</div><div class="settings-sub">Weekly on this day, daily every day, at this hour</div></div>
-          <div style="display:flex;gap:6px;flex-shrink:0">
-            <select id="dsc-weekday" class="sd-input"><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option><option value="5">Sat</option><option value="6">Sun</option></select>
-            <select id="dsc-hour" class="sd-input"></select>
-          </div>
+        <div class="dsc-line">
+          <span class="settings-label">When</span>
+          <div class="dsc-days" id="dsc-days"><button type="button" data-day="0" onclick="dscDay(0)">Mon</button><button type="button" data-day="1" onclick="dscDay(1)">Tue</button><button type="button" data-day="2" onclick="dscDay(2)">Wed</button><button type="button" data-day="3" onclick="dscDay(3)">Thu</button><button type="button" data-day="4" onclick="dscDay(4)">Fri</button><button type="button" data-day="5" onclick="dscDay(5)">Sat</button><button type="button" data-day="6" onclick="dscDay(6)">Sun</button></div>
+          <select id="dsc-hour" class="sd-input" onchange="dscChanged()" title="Time of day"></select>
         </div>
-        <div class="settings-row">
-          <div><div class="settings-label">ListenBrainz</div><div class="settings-sub">Optional: your ListenBrainz username, to add its Weekly Exploration picks</div></div>
-          <input id="dsc-lb" class="sd-input" placeholder="username" maxlength="64" style="width:140px;flex-shrink:0">
+        <div class="settings-sub" style="margin:-2px 0 10px">Weekly on the chosen day, daily every day, at that time.</div>
+        <div class="dsc-line">
+          <span class="settings-label">ListenBrainz</span>
+          <input id="dsc-lb" class="sd-input" placeholder="username (optional)" maxlength="64" style="flex:1;min-width:0" onchange="dscChanged()">
         </div>
-        <div style="display:flex;justify-content:flex-end;gap:8px;align-items:center">
-          <span class="settings-sub" id="dsc-msg"></span>
-          <button class="btn btn-primary" onclick="saveDiscover()">Save</button>
-        </div>
+        <details class="dsc-how">
+          <summary>What stays and what goes</summary>
+          <ul>
+            <li><b>Kept:</b> songs you star, rate 4-5 stars or play to the end <span id="dsc-keep-plays">2</span>+ times move into your library when the mix is made again (and into the playlist “Discover: kept”).</li>
+            <li><b>Deleted right away:</b> “Not for me” in LunaDrome, or a 1-star rating.</li>
+            <li><b>Deleted at the next mix:</b> everything else.</li>
+            <li>Nothing is ever suggested twice. Adding ListenBrainz mixes in its Weekly Exploration picks.</li>
+          </ul>
+        </details>
+        <input type="hidden" id="dsc-weekday" value="0">
+        <div class="settings-sub" id="dsc-msg" style="text-align:right;min-height:14px;margin-top:4px"></div>
       </div>
-      <div class="admin-only">
-      <div style="height:1px;background:var(--border);margin:4px 0"></div>
+
       <div class="settings-sec" style="margin-top:12px">
         <div class="settings-sec-title">SpotiDrome</div>
         <div class="settings-row">
@@ -1412,22 +1467,40 @@ async function loadDiscover(){
   let d;try{const r=await fetch(`${API}/discover`);if(!r.ok)return;d=await r.json();}catch(e){return;}
   const hour=document.getElementById('dsc-hour');
   if(!hour.options.length)for(let h=0;h<24;h++)hour.add(new Option(`${String(h).padStart(2,'0')}:00`,h));
-  hour.value=d.hour;document.getElementById('dsc-weekday').value=d.weekday;
-  document.getElementById('dsc-lb').value=d.listenbrainz_user||'';
+  hour.value=d.hour;dscDay(d.weekday,true);
+  const lb=document.getElementById('dsc-lb');if(document.activeElement!==lb)lb.value=d.listenbrainz_user||'';
   document.getElementById('dsc-keep-plays').textContent=d.keep_plays;
   let running=false;
   for(const [mix,m] of Object.entries(d.mixes)){
     const row=document.getElementById(`dsc-row-${mix}`);
-    row.querySelector('.dsc-on').checked=m.enabled;row.querySelector('.dsc-size').value=m.size;
+    row.querySelector('.dsc-on').checked=m.enabled;row.classList.toggle('on',m.enabled);
+    row.querySelector('.dsc-size').value=m.size;
     const st=row.querySelector('.dsc-status'),btn=row.querySelector('.dsc-run');
     btn.disabled=m.running;running=running||m.running;
-    st.textContent=m.running?'Being made right now - see the jobs list':
+    st.style.color=m.last_error&&!m.running?'#f87171':'';
+    st.textContent=m.running?'Being made right now…':
       m.last_error?`Last try failed: ${m.last_error}`:
-      m.generated_at?`${m.song_ids.length} song(s) in “${m.playlist}” · made ${fmtWhen(m.generated_at)}`:
+      m.generated_at?`${m.song_ids.length} songs · made ${dscWhen(m.generated_at)}`:
       m.enabled?'Not made yet':'Off';
   }
   clearTimeout(discoverPoll);
   if(running&&document.getElementById('settings-modal').classList.contains('show'))discoverPoll=setTimeout(loadDiscover,5000);
+}
+function dscWhen(ts){return new Date(ts*1000).toLocaleString(undefined,{weekday:'short',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});}
+function dscDay(day,quiet){
+  document.getElementById('dsc-weekday').value=day;
+  document.querySelectorAll('#dsc-days button').forEach(b=>b.classList.toggle('sel',+b.dataset.day===+day));
+  if(!quiet)dscChanged();
+}
+function dscStep(el,delta){
+  const input=el.closest('.stepper').querySelector('input');
+  const v=Math.max(+input.min,Math.min(+input.max,(parseInt(input.value)||+input.min)+delta));
+  input.value=v;dscChanged();
+}
+let dscSaveTimer=null;
+function dscChanged(){
+  document.querySelectorAll('.dsc-card').forEach(c=>c.classList.toggle('on',c.querySelector('.dsc-on').checked));
+  clearTimeout(dscSaveTimer);dscSaveTimer=setTimeout(saveDiscover,500);
 }
 function discoverBody(){
   const b={weekday:+document.getElementById('dsc-weekday').value,hour:+document.getElementById('dsc-hour').value,
@@ -1437,14 +1510,14 @@ function discoverBody(){
   return b;
 }
 async function saveDiscover(){
-  const msg=document.getElementById('dsc-msg');msg.textContent='Saving…';
+  const msg=document.getElementById('dsc-msg');
   try{const r=await fetch(`${API}/discover/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(discoverBody())});
-    msg.textContent=r.ok?'Saved':'Couldn\'t save';if(r.ok)loadDiscover();}catch(e){msg.textContent='Couldn\'t save';}
-  setTimeout(()=>{msg.textContent='';},3000);
+    msg.textContent=r.ok?'✓ Saved':'Couldn\'t save';if(r.ok)loadDiscover();}catch(e){msg.textContent='Couldn\'t save';}
+  clearTimeout(msg._t);msg._t=setTimeout(()=>{msg.textContent='';},2500);
 }
 async function runDiscover(mix,btn){
   btn.disabled=true;
-  // What's on screen counts (size, ListenBrainz) even when Save wasn't clicked.
+  clearTimeout(dscSaveTimer);   // what's on screen counts, even if the auto-save hasn't gone out yet
   await fetch(`${API}/discover/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(discoverBody())}).catch(()=>{});
   try{const r=await fetch(`${API}/discover/run`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mix})});
     const d=await r.json().catch(()=>({}));if(!r.ok){alert(d.error||'Couldn\'t start');btn.disabled=false;return;}}catch(e){btn.disabled=false;return;}

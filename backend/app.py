@@ -7300,9 +7300,11 @@ def maintenance_schedule_set():
 
 DISCOVER_CONFIG_FILE  = "/root/.ssh/discover_config.json"
 DISCOVER_STATE_FILE   = "/root/.ssh/discover_state.json"
-DISCOVER_MUSIC_PATH   = os.environ.get("DISCOVER_MUSIC_PATH", "/opt/navidrome/discover")
-# The same folder as Navidrome itself sees it - different when Navidrome runs in Docker
-DISCOVER_NAVIDROME_PATH = os.environ.get("DISCOVER_NAVIDROME_PATH") or DISCOVER_MUSIC_PATH
+# Where the Discover folder is, on the Navidrome host (over SSH) and as Navidrome
+# sees it. Normally worked out by discover_paths(); these two override that.
+DISCOVER_MUSIC_PATH   = os.environ.get("DISCOVER_MUSIC_PATH") or ""
+DISCOVER_NAVIDROME_PATH = os.environ.get("DISCOVER_NAVIDROME_PATH") or ""
+DISCOVER_DEFAULT_PATH = "/opt/navidrome/discover"
 DISCOVER_MIN_NAVIDROME = (0, 58)   # the first with more than one library
 DISCOVER_LIBRARY_NAME = "Discover"
 DISCOVER_KEEP_PLAYS   = 2      # whole plays (a skipped song isn't scrobbled, so it never counts)
@@ -7316,7 +7318,7 @@ DISCOVER_DEFAULTS = {"weekly": {"enabled": False, "size": 30}, "daily": {"enable
                      "weekday": 0, "hour": 6, "listenbrainz_user": ""}
 
 _discover_lock = threading.Lock()        # one run at a time: they share the Navidrome host
-_discover_state_lock = threading.Lock()
+_discover_state_lock = threading.RLock()  # discover_paths() may run inside it
 _discover_running = {}                   # user key -> mix being made right now
 
 
@@ -7357,7 +7359,7 @@ def _discover_history_key(artist, title):
     return f"{primary_artist(artist or '').lower()}|{_normalize_title(title)}"
 
 def _discover_user_dir(key):
-    return f"{DISCOVER_MUSIC_PATH}/{sanitize(key)}"
+    return f"{discover_paths()[0]}/{sanitize(key)}"
 
 def _nd_native(method, path, cfg, **kw):
     """Navidrome's own (non-Subsonic) API, as SpotiDrome's admin account."""
@@ -7368,6 +7370,91 @@ def _nd_native(method, path, cfg, **kw):
                         headers={"x-nd-authorization": f"Bearer {token}"}, **kw)
     resp.raise_for_status()
     return resp.json() if resp.content else None
+
+_discover_paths_cache = None
+
+def discover_paths():
+    """(folder on the Navidrome host, the same folder as Navidrome sees it).
+    Set in .env, or else worked out once and remembered in the state file, so
+    the folder never moves on its own:
+      - Navidrome's library is SSH_MUSIC_PATH itself -> Navidrome runs on the
+        host, and the folder is DISCOVER_DEFAULT_PATH
+      - otherwise Navidrome runs in a container (docker/podman on the SSH host):
+        the folder goes into its data folder (/data, always mounted read-write),
+        so it needs no mount of its own"""
+    global _discover_paths_cache
+    if DISCOVER_MUSIC_PATH or DISCOVER_NAVIDROME_PATH:
+        host = DISCOVER_MUSIC_PATH or DISCOVER_DEFAULT_PATH
+        return host, DISCOVER_NAVIDROME_PATH or host
+    if _discover_paths_cache:
+        return _discover_paths_cache
+    with _discover_state_lock:
+        saved = _discover_load(DISCOVER_STATE_FILE).get("_paths")
+        if not saved:
+            saved = _discover_detect_paths()
+            state = _discover_load(DISCOVER_STATE_FILE)
+            state["_paths"] = saved
+            _discover_save(DISCOVER_STATE_FILE, state)
+            print(f"[discover] Discover folder: {saved[0]} (Navidrome sees {saved[1]})", file=sys.stderr)
+    _discover_paths_cache = tuple(saved)
+    return _discover_paths_cache
+
+def _discover_navidrome_libraries(nd_cfg):
+    try:
+        return _nd_native("GET", "library", nd_cfg) or []
+    except http.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            raise ValueError(f"The Navidrome account in SpotiDrome's settings ({nd_cfg['user']}) has to be "
+                             "an admin to add the Discover library") from None
+        raise
+
+_DISCOVER_INSPECT = ("for d in docker podman; do command -v $d >/dev/null 2>&1 || continue; "
+                     "ids=$($d ps -q 2>/dev/null) || continue; [ -n \"$ids\" ] && $d inspect $ids && exit 0; done; exit 3")
+
+def _discover_detect_paths():
+    ssh_cfg, nd_cfg = load_ssh_config(), load_nd_config()
+    if not ssh_cfg or not nd_cfg:
+        raise ValueError("Navidrome and SSH have to be set up first")
+    music = ssh_cfg["music_path"].rstrip("/")
+    libs = sorted((l for l in _discover_navidrome_libraries(nd_cfg) if l.get("name") != DISCOVER_LIBRARY_NAME),
+                  key=lambda l: l["id"])
+    lib_paths = [l.get("path", "").rstrip("/") for l in libs]
+    if music in lib_paths:
+        return DISCOVER_DEFAULT_PATH, DISCOVER_DEFAULT_PATH
+    manual = ("Set DISCOVER_MUSIC_PATH (the folder on the Navidrome host) and DISCOVER_NAVIDROME_PATH "
+              "(the same folder as Navidrome sees it) in .env - see the README.")
+    r = subprocess.run(_ssh_cmd(ssh_cfg, _DISCOVER_INSPECT), capture_output=True, text=True, timeout=60)
+    try:
+        containers = json.loads(r.stdout) if r.returncode == 0 else []
+    except ValueError:
+        containers = []
+    if not containers:
+        raise ValueError(f"Navidrome's library ({', '.join(lib_paths) or '?'}) isn't {music}, and there's no "
+                         f"Navidrome container to be found on {ssh_cfg['host']}. " + manual)
+
+    def host_of(mounts, path):   # the host path of `path` inside a container
+        for m in sorted(mounts, key=lambda m: -len(m.get("Destination", ""))):
+            dst = m.get("Destination", "").rstrip("/")
+            if path == dst or path.startswith(dst + "/"):
+                return m.get("Source", "").rstrip("/") + path[len(dst):]
+        return None
+
+    for c in containers:
+        mounts = c.get("Mounts") or []
+        if not any(host_of(mounts, p) == music for p in lib_paths):
+            continue   # not the Navidrome that has SpotiDrome's music folder
+        env = dict(e.split("=", 1) for e in (c.get("Config", {}).get("Env") or []) if "=" in e)
+        data = (env.get("ND_DATAFOLDER") or "/data").rstrip("/")
+        mount = next((m for m in mounts if m.get("Destination", "").rstrip("/") == data), None)
+        if not mount or not mount.get("RW", True):
+            raise ValueError(f"Navidrome runs in container {c.get('Name', '?').lstrip('/')}, but its data folder "
+                             f"{data} isn't a read-write mount to put Discover in. " + manual)
+        nd_path = f"{data}/discover"
+        if any(nd_path == p or nd_path.startswith(p + "/") or p.startswith(nd_path + "/") for p in lib_paths):
+            raise ValueError(f"Navidrome's data folder is inside its music library, so Discover can't go there. " + manual)
+        return f"{mount['Source'].rstrip('/')}/discover", nd_path
+    raise ValueError(f"Navidrome's library ({', '.join(lib_paths) or '?'}) isn't {music}, and none of the containers "
+                     f"on {ssh_cfg['host']} has {music} as its music folder. " + manual)
 
 def ensure_discover_library(users=()):
     """The Discover folder and its own Navidrome library; `users` (non-admins)
@@ -7380,30 +7467,24 @@ def ensure_discover_library(users=()):
     if m and (int(m[1]), int(m[2])) < DISCOVER_MIN_NAVIDROME:
         raise ValueError(f"Discover needs Navidrome {'.'.join(map(str, DISCOVER_MIN_NAVIDROME))} or newer "
                          f"(yours is {version}): it keeps the new songs in a library of their own")
-    r = subprocess.run(_ssh_cmd(ssh_cfg, f"mkdir -p {shlex.quote(DISCOVER_MUSIC_PATH)}"),
+    host_path, nd_path = discover_paths()
+    r = subprocess.run(_ssh_cmd(ssh_cfg, f"mkdir -p {shlex.quote(host_path)}"),
                        capture_output=True, text=True, timeout=30)
     if r.returncode:
-        raise ValueError(f"Couldn't make the Discover folder {DISCOVER_MUSIC_PATH} on the Navidrome host: "
+        raise ValueError(f"Couldn't make the Discover folder {host_path} on the Navidrome host: "
                          f"{(r.stderr or r.stdout).strip()[:200]}")
-    try:
-        libs = _nd_native("GET", "library", nd_cfg) or []
-    except http.HTTPError as e:
-        if e.response is not None and e.response.status_code in (401, 403):
-            raise ValueError(f"The Navidrome account in SpotiDrome's settings ({nd_cfg['user']}) has to be "
-                             "an admin to add the Discover library") from None
-        raise
-    disc = next((l for l in libs if l.get("path", "").rstrip("/") == DISCOVER_NAVIDROME_PATH.rstrip("/")), None)
+    libs = _discover_navidrome_libraries(nd_cfg)
+    disc = next((l for l in libs if l.get("path", "").rstrip("/") == nd_path.rstrip("/")), None)
     if not disc:
         try:
             disc = _nd_native("POST", "library", nd_cfg, json={
-                "name": DISCOVER_LIBRARY_NAME, "path": DISCOVER_NAVIDROME_PATH, "defaultNewUsers": False})
+                "name": DISCOVER_LIBRARY_NAME, "path": nd_path, "defaultNewUsers": False})
         except http.HTTPError as e:
             detail = (e.response.text if e.response is not None else str(e)).strip()[:200]
-            raise ValueError(f"Navidrome couldn't add {DISCOVER_NAVIDROME_PATH} as the Discover library ({detail}). "
-                             "If Navidrome runs in Docker, mount the Discover folder into it and set "
-                             "DISCOVER_NAVIDROME_PATH to the path inside its container.") from None
+            raise ValueError(f"Navidrome couldn't add {nd_path} as the Discover library ({detail}). "
+                             "Set DISCOVER_MUSIC_PATH and DISCOVER_NAVIDROME_PATH in .env - see the README.") from None
         libs.append(disc)
-        print(f"[discover] created Navidrome library {DISCOVER_LIBRARY_NAME} ({DISCOVER_NAVIDROME_PATH})", file=sys.stderr)
+        print(f"[discover] created Navidrome library {DISCOVER_LIBRARY_NAME} ({nd_path})", file=sys.stderr)
     main = next((l for l in libs if l.get("path", "").rstrip("/") == ssh_cfg["music_path"].rstrip("/")), None) \
         or next(l for l in libs if l["id"] != disc["id"])
     if users:
@@ -7513,7 +7594,7 @@ def discover_pick(nd_cfg, main_id, mix, size, user_cfg, history, log):
     seeds = _discover_seeds(nd_cfg, main_id, spec["seeds"], spec["recent"])
     log(f"🌱 {len(seeds)} seed song(s): " + ", ".join(f"{s['artist']} - {s['title']}" for s in seeds))
     ssh_cfg = load_ssh_config()
-    library_files = get_all_remote_files(ssh_cfg) | get_all_remote_files({**ssh_cfg, "music_path": DISCOVER_MUSIC_PATH})
+    library_files = get_all_remote_files(ssh_cfg) | get_all_remote_files({**ssh_cfg, "music_path": discover_paths()[0]})
     library_index = _index_remote_files_by_title(library_files)
     library_artists = {f.split(" - ", 1)[0].lower() for f in library_files if " - " in f}
 
@@ -7738,9 +7819,10 @@ def _discover_run_locked(key, user, mix, spec, size, user_cfg, job_id, log):
                           "video_id": p.get("video_id")})
         state["history"][_discover_history_key(p["artist"], p["name"])] = {"at": int(time.time()), "result": "picked"}
     if downloaded and not found:
-        raise ValueError(f"The songs were downloaded to {DISCOVER_MUSIC_PATH}, but Navidrome doesn't see them "
-                         f"in its Discover library ({DISCOVER_NAVIDROME_PATH}). If Navidrome runs in Docker, "
-                         "mount the Discover folder into it and set DISCOVER_NAVIDROME_PATH to the path inside its container.")
+        host_path, nd_path = discover_paths()
+        raise ValueError(f"The songs were downloaded to {host_path}, but Navidrome doesn't see them in its "
+                         f"Discover library ({nd_path}). Set DISCOVER_MUSIC_PATH and DISCOVER_NAVIDROME_PATH "
+                         "in .env - see the README.")
     pl_id = _discover_set_playlist(nd_cfg, spec["playlist"], [f["id"] for f in found])
     log(f"✅ {spec['playlist']}: {len(found)} new song(s) in the playlist")
 

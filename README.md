@@ -26,6 +26,7 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
 - **Permanent track ignore list** — mark a track (e.g. one that's region- or age-restricted and can't be fetched) to be skipped on all future syncs instead of showing up as a repeated failure.
 - **Sync health dashboard** — a panel showing last-sync status per tracked playlist, dead-link counts, and duplicate-sweep results.
 - **Library cleanup tools** — scan Navidrome for duplicate or overly long tracks and remove them.
+- **Discover Weekly / Daily Discovery** — playlists of songs that aren't in your library yet, made from what you play most (YouTube Music radio for those songs, plus optionally your ListenBrainz Weekly Exploration). They live in a separate Navidrome library, and only the songs you star or play stay. See [Discover](#discover).
 - **Several users** — everyone with an account on your Navidrome logs in with it, connects their own Spotify account and gets their synced playlists in their own Navidrome account. Non-admins only see their own playlists and jobs. See [Access & API keys](#access--api-keys).
 
 ## Architecture
@@ -67,6 +68,19 @@ docker compose pull && docker compose up -d
 **Settings → SpotiDrome → Check for updates** tells you whether a newer version is out (and what changed), and **Update now** installs it: it pulls the code (when the folder is a git checkout without changes of its own) and the newest images, restarts SpotiDrome and reloads the page. That's done by the small `updater` service in `docker-compose.yml`. It's the only container with the Docker socket and has no network port; the backend (which can be reachable from the internet) only asks it for an update through a file in `~/.ssh/` (see `updater/updater.sh`). Updates only start that way, from an admin's login. If you'd rather not give any container the Docker socket, remove the `updater` service; the button then shows the command above instead. Your settings and state are untouched: they live in `.env` and `~/.ssh/` on the host, not in the images. To update automatically, run that on a schedule (cron) or use [Watchtower](https://containrrr.dev/watchtower/); [Diun](https://crazymax.dev/diun/) only notifies.
 
 The images contain no configuration or secrets: `.env`, the SSH key and all runtime state are mounted at runtime (see `.dockerignore`).
+
+## Discover
+
+Spotify doesn't give apps its Discover Weekly, Daily Mixes or recommendations anymore, so SpotiDrome makes its own (Settings → Discover, per user):
+
+- **Picking:** seed songs are drawn from what you play most in Navidrome (recently played ones count extra for the daily mix). YouTube Music's radio for each seed gives related songs; songs found from several seeds score higher, artists you don't have yet get a small bonus, and there are at most 2 songs per artist (1 in the daily mix). Anything already in the library, on the ignore list or picked before is skipped. Fill in your ListenBrainz username to also get its *Weekly Exploration* picks.
+- **Where they go:** a separate folder on the Navidrome host, `DISCOVER_MUSIC_PATH` (default `/opt/navidrome/discover`, one subfolder per user), which SpotiDrome adds to Navidrome as its own **Discover** library. The songs are in the playlists *Discover Weekly* and *Daily Discovery*. Pick the main library in your Navidrome client to keep them out of your albums and artists (LunaDrome does that by itself).
+- **What stays:** when a mix is made again, the songs from last time are judged:
+  - starred, rated 4-5 stars or played 2+ times all the way through → moved into the library (stars and ratings carry over) and added to the playlist *Discover: kept*
+  - rated 1 star, or **Not for me** in LunaDrome → deleted right away (checked every 5 minutes)
+  - everything else → deleted
+- **When:** weekly on the chosen day, daily every day, at the chosen hour; *Make now* makes one straight away. SpotiDrome's own account has both mixes on; other users switch them on in Settings.
+- **API:** `GET /discover`, `POST /discover/config`, `POST /discover/run` (`{"mix": "weekly"|"daily"}`), `POST /discover/feedback` (`{"song_id", "action": "keep"|"unkeep"|"reject"}`). LunaDrome keys may call all but `/discover/config`.
 
 ## Access & API keys
 

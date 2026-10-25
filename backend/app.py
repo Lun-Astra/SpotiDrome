@@ -1,5 +1,5 @@
-import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib, uuid, base64, hashlib, secrets
-from datetime import datetime
+import os, json, threading, time, re, subprocess, shutil, signal, sys, shlex, difflib, uuid, base64, hashlib, secrets, random
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 import requests as http
 from flask import Flask, jsonify, request, Response, g
@@ -91,6 +91,9 @@ API_KEY_SCOPES = {
         ("POST", "/jobs/<job_id>/skip"),
         ("POST", "/jobs/<job_id>/cancel"),
         ("GET", "/ytdlp/version"),
+        ("GET", "/discover"),
+        ("POST", "/discover/run"),
+        ("POST", "/discover/feedback"),
     },
     "full": None,  # None = every route
 }
@@ -111,6 +114,10 @@ USER_ROUTES = {
     ("GET", "/jobs/<job_id>"),
     ("POST", "/jobs/<job_id>/skip"),
     ("POST", "/jobs/<job_id>/cancel"),
+    ("GET", "/discover"),
+    ("POST", "/discover/config"),
+    ("POST", "/discover/run"),
+    ("POST", "/discover/feedback"),
 }
 SESSION_ONLY_ROUTES = {("GET", "/api-keys"), ("POST", "/api-keys"), ("DELETE", "/api-keys/<key_id>")}
 
@@ -1866,6 +1873,10 @@ def iter_track_candidates(track):
     artist_for_query = primary_artist(expected_artist)
     query = f"{artist_for_query} {expected_title}".strip()
 
+    # A track picked straight from YouTube Music (Discover) already knows its song.
+    if track.get("video_id"):
+        yield f"https://music.youtube.com/watch?v={track['video_id']}", expected_title, "YouTube Music"
+
     best = _search_ytmusic(query, "songs", expected_title, expected_artist, expected_duration_sec, expected_explicit=explicit)
     if best:
         yield f"https://music.youtube.com/watch?v={best['videoId']}", best.get("title"), "YouTube Music"
@@ -2074,11 +2085,18 @@ def _download_via_yt_dlp(video_url, out_template, job_id, label, use_cookies, pl
 
 # ─── Spotify download worker ──────────────────────────────────────────────────
 
-def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidrome=True):
+def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidrome=True,
+                    music_path=None, record_failures=True):
+    """music_path: upload somewhere other than the library (Discover's own folder);
+    the library still counts for "already on Navidrome". record_failures=False
+    keeps the tracks that couldn't be found off the Failed Downloads page."""
     with job_lock:
         jobs[job_id]["status"] = "running"
 
     ssh_cfg = load_ssh_config()
+    library_cfg = ssh_cfg
+    if ssh_cfg and music_path:
+        ssh_cfg = {**ssh_cfg, "music_path": music_path}
     nd_cfg = load_nd_config()
     local_dir = os.path.join(DOWNLOAD_DIR, sanitize(playlist_name))
     os.makedirs(local_dir, exist_ok=True)
@@ -2090,6 +2108,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
     remote_dir = f"{ssh_cfg['music_path']}/{sanitize(playlist_name)}" if ssh_cfg else ""
     remote_files = get_remote_files(remote_dir, ssh_cfg) if ssh_cfg else set()
     remote_files_flat = get_all_remote_files(ssh_cfg) if ssh_cfg else set()
+    if music_path and library_cfg:
+        remote_files_flat |= get_all_remote_files(library_cfg)
     remote_title_index = _index_remote_files_by_title(remote_files_flat)
     naming = load_album_naming(ssh_cfg)
 
@@ -2253,7 +2273,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 reason = "no confident match found on any provider (tried YouTube Music, YouTube, SoundCloud)"
             else:
                 reason = f"failed after {len(attempts_tried)} source(s) tried [{', '.join(attempts_tried)}] — {last_reason}"
-            record_failed_track(track, playlist_id, playlist_name, reason)
+            if record_failures:
+                record_failed_track(track, playlist_id, playlist_name, reason)
             with job_lock:
                 if not attempts_tried:
                     jobs[job_id]["log"].append(f"✗ No confident match found (tried YouTube Music, YouTube, SoundCloud): {label}")
@@ -7260,6 +7281,644 @@ def maintenance_schedule_set():
     cfg[task]["enabled"] = bool(data.get("enabled"))
     save_maintenance_schedule(cfg)
     return jsonify({"ok": True, "task": task, "enabled": cfg[task]["enabled"]})
+
+
+
+# ─── Discover: weekly / daily mixes of songs that aren't in the library yet ────
+# Spotify no longer gives apps its Discover Weekly / Daily Mixes (or its
+# recommendations), so SpotiDrome makes its own: seeds from what you play most
+# in Navidrome, YouTube Music's radio for those songs (plus, optionally, your
+# ListenBrainz "Weekly Exploration"), minus everything already in the library
+# or picked before. The picks go into a separate Navidrome library ("Discover",
+# DISCOVER_MUSIC_PATH, a folder per user) so they never mix with the real one.
+# When a mix comes round again, its previous picks are judged on what you did
+# with them:
+#   starred, rated 4-5 or played DISCOVER_KEEP_PLAYS+ times -> moved into the library
+#   rated 1 / "Not for me"                                 -> deleted right away
+#   anything else (never played, skipped)                  -> deleted
+# Nothing that was picked once is picked again.
+
+DISCOVER_CONFIG_FILE  = "/root/.ssh/discover_config.json"
+DISCOVER_STATE_FILE   = "/root/.ssh/discover_state.json"
+DISCOVER_MUSIC_PATH   = os.environ.get("DISCOVER_MUSIC_PATH", "/opt/navidrome/discover")
+DISCOVER_LIBRARY_NAME = "Discover"
+DISCOVER_KEEP_PLAYS   = 2      # whole plays (a skipped song isn't scrobbled, so it never counts)
+DISCOVER_KEPT_PLAYLIST = "Discover: kept"
+DISCOVER_MIXES = {
+    "weekly": {"playlist": "Discover Weekly", "every": "week", "seeds": 12, "per_artist": 2, "recent": False},
+    "daily":  {"playlist": "Daily Discovery", "every": "day",  "seeds": 5,  "per_artist": 1, "recent": True},
+}
+DISCOVER_SIZE_LIMITS = {"weekly": (5, 60), "daily": (3, 30)}
+DISCOVER_DEFAULTS = {"weekly": {"enabled": True, "size": 30}, "daily": {"enabled": True, "size": 10},
+                     "weekday": 0, "hour": 6, "listenbrainz_user": ""}
+
+_discover_lock = threading.Lock()        # one run at a time: they share the Navidrome host
+_discover_state_lock = threading.Lock()
+_discover_running = {}                   # user key -> mix being made right now
+
+
+def _discover_user_key(user):
+    if is_default_user(user):
+        cfg = load_nd_config()
+        return (cfg["user"] if cfg else "default").lower()
+    return user.lower()
+
+def _discover_load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _discover_save(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+def discover_user_config(user):
+    """The user's Discover settings. SpotiDrome's own account has both mixes on by
+    default; other users switch them on in Settings."""
+    key = _discover_user_key(user)
+    saved = _discover_load(DISCOVER_CONFIG_FILE).get(key, {})
+    cfg = json.loads(json.dumps(DISCOVER_DEFAULTS))
+    if not is_default_user(user):
+        cfg["weekly"]["enabled"] = cfg["daily"]["enabled"] = False
+    for mix in DISCOVER_MIXES:
+        cfg[mix].update(saved.get(mix, {}))
+    for k in ("weekday", "hour", "listenbrainz_user"):
+        if k in saved:
+            cfg[k] = saved[k]
+    cfg["user"] = saved.get("user") or (None if is_default_user(user) else user)
+    return cfg
+
+def _discover_history_key(artist, title):
+    return f"{primary_artist(artist or '').lower()}|{_normalize_title(title)}"
+
+def _discover_user_dir(key):
+    return f"{DISCOVER_MUSIC_PATH}/{sanitize(key)}"
+
+def _nd_native(method, path, cfg, **kw):
+    """Navidrome's own (non-Subsonic) API, as SpotiDrome's admin account."""
+    token = nd_get_token(cfg)
+    if not token:
+        raise ValueError("Couldn't log in to Navidrome's API")
+    resp = http.request(method, f"{cfg['url']}/api/{path}", timeout=30,
+                        headers={"x-nd-authorization": f"Bearer {token}"}, **kw)
+    resp.raise_for_status()
+    return resp.json() if resp.content else None
+
+def ensure_discover_library(users=()):
+    """The Discover folder and its own Navidrome library; `users` (non-admins)
+    get access to it. Returns (library id of the real library, of Discover)."""
+    ssh_cfg, nd_cfg = load_ssh_config(), load_nd_config()
+    if not ssh_cfg or not nd_cfg:
+        raise ValueError("Navidrome and SSH have to be set up first")
+    subprocess.run(_ssh_cmd(ssh_cfg, f"mkdir -p {shlex.quote(DISCOVER_MUSIC_PATH)}"),
+                   capture_output=True, timeout=30, check=True)
+    libs = _nd_native("GET", "library", nd_cfg) or []
+    disc = next((l for l in libs if l.get("path", "").rstrip("/") == DISCOVER_MUSIC_PATH.rstrip("/")), None)
+    if not disc:
+        disc = _nd_native("POST", "library", nd_cfg, json={
+            "name": DISCOVER_LIBRARY_NAME, "path": DISCOVER_MUSIC_PATH, "defaultNewUsers": False})
+        libs.append(disc)
+        print(f"[discover] created Navidrome library {DISCOVER_LIBRARY_NAME} ({DISCOVER_MUSIC_PATH})", file=sys.stderr)
+    main = next((l for l in libs if l.get("path", "").rstrip("/") == ssh_cfg["music_path"].rstrip("/")), None) \
+        or next(l for l in libs if l["id"] != disc["id"])
+    if users:
+        try:
+            for u in _nd_native("GET", "user", nd_cfg) or []:
+                if u.get("isAdmin") or u.get("userName", "").lower() not in {x.lower() for x in users}:
+                    continue
+                have = [l["id"] for l in (_nd_native("GET", f"user/{u['id']}/library", nd_cfg) or [])]
+                if disc["id"] not in have:
+                    _nd_native("PUT", f"user/{u['id']}/library", nd_cfg, json={"libraryIds": have + [disc["id"]]})
+        except Exception as e:
+            print(f"[discover] couldn't give {users} access to the Discover library: {e}", file=sys.stderr)
+    return main["id"], disc["id"]
+
+# ── Picking ──
+
+def _discover_seeds(nd_cfg, main_id, count, recent):
+    """`count` songs to start from, weighted by how often they were played
+    (recently played ones count extra for the daily mix)."""
+    albums, seen = [], set()
+    for kind, size in (("frequent", 40), ("recent", 25)):
+        try:
+            data = nd_subsonic("getAlbumList2", cfg=nd_cfg, type=kind, size=size, musicFolderId=main_id)
+        except Exception:
+            continue
+        for a in data.get("albumList2", {}).get("album", []):
+            if a["id"] not in seen:
+                seen.add(a["id"])
+                albums.append((a["id"], kind))
+    weighted = []
+    for album_id, kind in albums[:50]:
+        try:
+            songs = nd_subsonic("getAlbum", cfg=nd_cfg, id=album_id).get("album", {}).get("song", [])
+        except Exception:
+            continue
+        for s in songs:
+            plays = s.get("playCount") or 0
+            weight = plays + (3 if s.get("starred") else 0) + (4 if recent and kind == "recent" and plays else 0)
+            if weight > 0:
+                weighted.append((weight, s))
+    if not weighted:   # nothing played yet: random songs from the library
+        try:
+            songs = nd_subsonic("getRandomSongs", cfg=nd_cfg, size=count, musicFolderId=main_id) \
+                .get("randomSongs", {}).get("song", [])
+            weighted = [(1, s) for s in songs]
+        except Exception:
+            pass
+    seeds, artists = [], set()
+    pool = list(weighted)
+    while pool and len(seeds) < count:
+        pick = random.choices(range(len(pool)), weights=[w for w, _s in pool])[0]
+        _w, s = pool.pop(pick)
+        artist = (s.get("artist") or "").lower()
+        if artist in artists and len(artists) < count:
+            continue   # spread the seeds over different artists
+        artists.add(artist)
+        seeds.append({"artist": s.get("artist") or "", "title": s.get("title") or ""})
+    return seeds
+
+def _ytmusic_radio(seed):
+    ytm = _get_ytmusic()
+    if not ytm:
+        return []
+    try:
+        results = ytm.search(f"{primary_artist(seed['artist'])} {seed['title']}", filter="songs", limit=5)
+    except Exception:
+        return []
+    song = next((r for r in results if r.get("videoId") and _title_ok(r.get("title"), seed["title"])
+                 and _artist_ok([a.get("name") for a in r.get("artists") or []], seed["artist"])), None)
+    if not song:
+        return []
+    try:
+        return ytm.get_watch_playlist(videoId=song["videoId"], radio=True, limit=50).get("tracks", [])[1:]
+    except Exception:
+        return []
+
+def _listenbrainz_exploration(lb_user):
+    """Tracks of the newest "Weekly Exploration" ListenBrainz made for lb_user."""
+    try:
+        r = http.get(f"https://api.listenbrainz.org/1/user/{lb_user}/playlists/createdfor",
+                     params={"count": 25}, timeout=20)
+        r.raise_for_status()
+        pls = [p["playlist"] for p in r.json().get("playlists", [])
+               if "exploration" in p["playlist"].get("title", "").lower()]
+        if not pls:
+            return []
+        mbid = pls[0]["identifier"].rstrip("/").rsplit("/", 1)[-1]
+        r = http.get(f"https://api.listenbrainz.org/1/playlist/{mbid}", timeout=20)
+        r.raise_for_status()
+        return r.json().get("playlist", {}).get("track", [])
+    except Exception as e:
+        print(f"[discover] ListenBrainz for {lb_user}: {e}", file=sys.stderr)
+        return []
+
+def _parse_length(text):
+    try:
+        parts = [int(p) for p in (text or "").split(":")]
+    except ValueError:
+        return 0
+    sec = 0
+    for p in parts:
+        sec = sec * 60 + p
+    return sec
+
+def discover_pick(nd_cfg, main_id, mix, size, user_cfg, history, log):
+    spec = DISCOVER_MIXES[mix]
+    seeds = _discover_seeds(nd_cfg, main_id, spec["seeds"], spec["recent"])
+    log(f"🌱 {len(seeds)} seed song(s): " + ", ".join(f"{s['artist']} - {s['title']}" for s in seeds))
+    ssh_cfg = load_ssh_config()
+    library_files = get_all_remote_files(ssh_cfg) | get_all_remote_files({**ssh_cfg, "music_path": DISCOVER_MUSIC_PATH})
+    library_index = _index_remote_files_by_title(library_files)
+    library_artists = {f.split(" - ", 1)[0].lower() for f in library_files if " - " in f}
+
+    cands = {}
+    def add(artist, title, album, seconds, video_id, score):
+        if not artist or not title or not (90 <= seconds <= 600 or (not seconds and not video_id)):
+            return
+        key = _discover_history_key(artist, title)
+        if key in history or is_track_ignored(artist, title):
+            return
+        track = {"artist": artist, "name": title}
+        if _remote_duplicate_exists(track, library_index):
+            return
+        c = cands.setdefault(key, {"artist": artist, "name": title, "album": album or title,
+                                   "duration_ms": seconds * 1000, "video_id": video_id, "score": 0.0})
+        c["score"] += score
+
+    for seed in seeds:
+        for pos, t in enumerate(_ytmusic_radio(seed)):
+            if t.get("videoType") not in YTMUSIC_OFFICIAL_VIDEO_TYPES:
+                continue
+            artist = ", ".join(a["name"] for a in t.get("artists") or [] if a.get("name"))
+            add(artist, t.get("title"), (t.get("album") or {}).get("name"),
+                _parse_length(t.get("length")), t.get("videoId"), 1.0 + 0.5 * (1 - pos / 50))
+    if user_cfg.get("listenbrainz_user"):
+        lb = _listenbrainz_exploration(user_cfg["listenbrainz_user"])
+        log(f"🧠 ListenBrainz Weekly Exploration: {len(lb)} track(s)")
+        for t in lb:
+            add(t.get("creator"), t.get("title"), t.get("album"), int((t.get("duration") or 0) / 1000), None, 2.0)
+
+    for c in cands.values():
+        if primary_artist(c["artist"]).lower() not in library_artists:
+            c["score"] += 0.3            # someone you don't have yet
+        c["score"] += random.random() * 0.6  # so two runs from the same seeds still differ
+    picks, per_artist = [], {}
+    for c in sorted(cands.values(), key=lambda c: -c["score"]):
+        a = primary_artist(c["artist"]).lower()
+        if per_artist.get(a, 0) >= spec["per_artist"]:
+            continue
+        per_artist[a] = per_artist.get(a, 0) + 1
+        picks.append(c)
+        if len(picks) >= size:
+            break
+    log(f"🎯 {len(cands)} new song(s) found, picked {len(picks)}")
+    return picks
+
+# ── Judging the previous picks ──
+
+def _discover_remote_path(track, user_dir):
+    """The file of a picked song on the Navidrome host (recorded when it was
+    uploaded: Subsonic only reports made-up paths) - only ever inside user_dir."""
+    full = track.get("path") or ""
+    if ".." in full.split("/") or not full.startswith(user_dir + "/"):
+        return None
+    return full
+
+def _discover_remote_files(user_dir):
+    """{file name: full path} of everything in a user's Discover folder."""
+    r = subprocess.run(_ssh_cmd(load_ssh_config(), f"find {shlex.quote(user_dir)} -type f -printf '%P\\n'"),
+                       capture_output=True, text=True, timeout=120)
+    return {os.path.basename(rel): f"{user_dir}/{rel}" for rel in r.stdout.splitlines() if rel}
+
+def _discover_verdict(song):
+    if song is None:
+        return "drop"
+    rating = song.get("userRating") or 0
+    if rating == 1:
+        return "reject"
+    if song.get("starred") or rating >= 4 or (song.get("playCount") or 0) >= DISCOVER_KEEP_PLAYS:
+        return "keep"
+    return "drop"
+
+def _discover_apply(ssh_cfg, user_dir, moves, removals):
+    """moves: [(discover path, library path)], removals: [discover path]. One SSH call."""
+    cmds = []
+    for src, dst in moves:
+        q, qd = shlex.quote(src), shlex.quote(dst)
+        cmds.append(f"mkdir -p {shlex.quote(os.path.dirname(dst))} && "
+                    f"if [ -e {qd} ]; then rm -f {q}; else mv {q} {qd}; fi")
+    for path in removals:
+        cmds.append(f"rm -f {shlex.quote(path)}")
+    if not cmds:
+        return True
+    cmds.append(f"find {shlex.quote(user_dir)} -mindepth 1 -type d -empty -delete")
+    r = subprocess.run(_ssh_cmd(ssh_cfg, " ; ".join(cmds)), capture_output=True, text=True, timeout=300)
+    return r.returncode == 0
+
+def discover_review(key, user, mix, state, log):
+    """Judge the mix's previous picks. Returns what was kept, for after the scan."""
+    batch = state.get(mix) or {}
+    tracks = batch.get("tracks") or []
+    if not tracks:
+        return []
+    nd_cfg = nd_user_config(user)
+    ssh_cfg = load_ssh_config()
+    user_dir = _discover_user_dir(key)
+    moves, removals, kept = [], [], []
+    counts = {"keep": 0, "reject": 0, "drop": 0}
+    for t in tracks:
+        try:
+            song = nd_subsonic("getSong", cfg=nd_cfg, id=t["id"]).get("song")
+        except Exception:
+            song = None
+        verdict = _discover_verdict(song)
+        counts[verdict] += 1
+        state["history"][_discover_history_key(t["artist"], t["title"])] = {"at": int(time.time()), "result": verdict}
+        path = _discover_remote_path(t, user_dir)
+        if not path:
+            continue
+        if verdict == "keep":
+            moves.append((path, f"{ssh_cfg['music_path']}/{path[len(user_dir) + 1:]}"))
+            kept.append({**t, "starred": bool(song and song.get("starred")),
+                         "rating": (song or {}).get("userRating") or 0})
+        else:
+            removals.append(path)
+    ok = _discover_apply(ssh_cfg, user_dir, moves, removals)
+    log(f"⚖ Last {DISCOVER_MIXES[mix]['playlist']}: {counts['keep']} kept (moved into the library), "
+        f"{counts['reject']} not for you, {counts['drop']} not listened to - removed"
+        + ("" if ok else " (⚠ some files couldn't be moved/removed)"))
+    state[mix] = {**batch, "tracks": []}
+    return kept
+
+def _discover_find_song(nd_cfg, artist, title, folder_id):
+    try:
+        songs = nd_subsonic("search3", cfg=nd_cfg, query=f"{primary_artist(artist)} {title}",
+                            songCount=10, albumCount=0, artistCount=0, musicFolderId=folder_id) \
+            .get("searchResult3", {}).get("song", [])
+    except Exception:
+        return None
+    for s in songs:
+        if _title_ok(s.get("title"), title) and _artist_ok([s.get("artist") or ""], artist):
+            return s
+    return None
+
+def _discover_set_playlist(nd_cfg, name, song_ids):
+    pl_id, _created = nd_get_or_create_playlist(name, nd_cfg)
+    entries = nd_subsonic("getPlaylist", cfg=nd_cfg, id=pl_id).get("playlist", {}).get("entry", [])
+    if entries:
+        nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=pl_id, songIndexToRemove=list(range(len(entries))))
+    for i in range(0, len(song_ids), 50):
+        nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=pl_id, songIdToAdd=song_ids[i:i + 50])
+    nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=pl_id,
+                comment="Made by SpotiDrome Discover: songs that aren't in your library yet. "
+                        "Star the ones you like - those stay.")
+    return pl_id
+
+# ── A run ──
+
+def discover_run(user, mix, reason="schedule"):
+    key = _discover_user_key(user)
+    spec = DISCOVER_MIXES[mix]
+    user_cfg = discover_user_config(user)
+    size = int(user_cfg[mix].get("size") or 10)
+    job_id = f"job_{int(time.time()*1000)}"
+    playlist_label = spec["playlist"] if is_default_user(user) else f"{spec['playlist']} ({user})"
+    with job_lock:
+        jobs[job_id] = {"id": job_id, "playlist": playlist_label, "status": "pending",
+                        "total": size, "current": 0, "downloaded": 0, "failed": 0,
+                        "nd_synced": None, "nd_missing": None, "current_track": "Picking songs…",
+                        "log": [f"🔭 {spec['playlist']} ({reason})"], "owner": user, "kind": "discover"}
+    def log(msg):
+        with job_lock:
+            jobs[job_id]["log"].append(msg)
+    with _discover_lock:
+        _discover_running[key] = mix
+        try:
+            _discover_run_locked(key, user, mix, spec, size, user_cfg, job_id, log)
+        except Exception as e:
+            log(f"✗ Discover failed: {e}")
+            with job_lock:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["current_track"] = None
+            with _discover_state_lock:
+                state = _discover_load(DISCOVER_STATE_FILE)
+                st = state.setdefault(key, {})
+                st.setdefault(mix, {})["last_error"] = str(e)
+                st[mix]["last_run"] = int(time.time())
+                _discover_save(DISCOVER_STATE_FILE, state)
+        finally:
+            _discover_running.pop(key, None)
+            with job_lock:
+                save_jobs()
+
+def _discover_run_locked(key, user, mix, spec, size, user_cfg, job_id, log):
+    nd_cfg = nd_user_config(user)
+    admin_cfg = load_nd_config()
+    main_id, disc_id = ensure_discover_library(() if is_default_user(user) else (user,))
+    with _discover_state_lock:
+        state = _discover_load(DISCOVER_STATE_FILE).get(key, {})
+    state.setdefault("history", {})
+    state["user"] = user
+
+    kept = discover_review(key, user, mix, state, log)
+    with _discover_state_lock:   # the review's moves/deletes are done: remember them now
+        all_state = _discover_load(DISCOVER_STATE_FILE)
+        all_state[key] = {**all_state.get(key, {}), **state}
+        _discover_save(DISCOVER_STATE_FILE, all_state)
+
+    picks = discover_pick(nd_cfg, main_id, mix, size, user_cfg, state["history"], log)
+    with job_lock:
+        jobs[job_id]["total"] = len(picks)
+    if picks:
+        download_worker(job_id, [dict(p) for p in picks], jobs[job_id]["playlist"], None,
+                        sync_navidrome=False, music_path=_discover_user_dir(key), record_failures=False)
+    with job_lock:
+        jobs[job_id]["status"] = "scanning"
+        jobs[job_id]["current_track"] = "Waiting for Navidrome's scan…"
+    ok, msg = nd_trigger_scan(admin_cfg)
+    log(f"🔄 {msg}")
+    if ok:
+        time.sleep(5)
+        nd_wait_for_scan(admin_cfg, timeout=600)
+
+    files = _discover_remote_files(_discover_user_dir(key))
+    found = []
+    for p in picks:
+        path = files.get(sanitize(f"{p['artist']} - {p['name']}") + ".flac")
+        s = _discover_find_song(nd_cfg, p["artist"], p["name"], disc_id) if path else None
+        if s:
+            found.append({"id": s["id"], "artist": p["artist"], "title": p["name"], "path": path,
+                          "video_id": p.get("video_id")})
+        state["history"][_discover_history_key(p["artist"], p["name"])] = {"at": int(time.time()), "result": "picked"}
+    pl_id = _discover_set_playlist(nd_cfg, spec["playlist"], [f["id"] for f in found])
+    log(f"✅ {spec['playlist']}: {len(found)} new song(s) in the playlist")
+
+    if kept:   # they're in the real library now: carry the star/rating over, list them
+        kept_ids = []
+        for k in kept:
+            s = _discover_find_song(nd_cfg, k["artist"], k["title"], main_id)
+            if not s:
+                continue
+            kept_ids.append(s["id"])
+            try:
+                if k["starred"]:
+                    nd_subsonic("star", cfg=nd_cfg, id=s["id"])
+                if k["rating"]:
+                    nd_subsonic("setRating", cfg=nd_cfg, id=s["id"], rating=k["rating"])
+            except Exception:
+                pass
+        if kept_ids:
+            kpl, _c = nd_get_or_create_playlist(DISCOVER_KEPT_PLAYLIST, nd_cfg)
+            nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=kpl, songIdToAdd=kept_ids)
+            log(f"⭐ {len(kept_ids)} kept song(s) added to '{DISCOVER_KEPT_PLAYLIST}'")
+
+    with _discover_state_lock:
+        all_state = _discover_load(DISCOVER_STATE_FILE)
+        state[mix] = {"tracks": found, "playlist_id": pl_id, "generated_at": int(time.time()),
+                      "last_run": int(time.time()), "last_error": None, "job_id": job_id}
+        all_state[key] = {**all_state.get(key, {}), **state}
+        _discover_save(DISCOVER_STATE_FILE, all_state)
+    with job_lock:
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["current_track"] = None
+
+def discover_reject(key, user, song_ids):
+    """"Not for me": delete these Discover songs now and take them off the playlists."""
+    with _discover_state_lock:
+        all_state = _discover_load(DISCOVER_STATE_FILE)
+        state = all_state.get(key, {})
+        nd_cfg = nd_user_config(user)
+        user_dir = _discover_user_dir(key)
+        removals, removed = [], 0
+        for mix, spec in DISCOVER_MIXES.items():
+            batch = state.get(mix) or {}
+            gone = [t for t in batch.get("tracks", []) if t["id"] in song_ids]
+            if not gone:
+                continue
+            for t in gone:
+                state.setdefault("history", {})[_discover_history_key(t["artist"], t["title"])] = \
+                    {"at": int(time.time()), "result": "reject"}
+                path = _discover_remote_path(t, user_dir)
+                if path:
+                    removals.append(path)
+            batch["tracks"] = [t for t in batch["tracks"] if t["id"] not in song_ids]
+            removed += len(gone)
+            try:
+                entries = nd_subsonic("getPlaylist", cfg=nd_cfg, id=batch["playlist_id"]) \
+                    .get("playlist", {}).get("entry", [])
+                idx = [i for i, e in enumerate(entries) if e["id"] in song_ids]
+                if idx:
+                    nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=batch["playlist_id"], songIndexToRemove=idx)
+            except Exception as e:
+                print(f"[discover] couldn't update {spec['playlist']}: {e}", file=sys.stderr)
+        if removals:
+            _discover_apply(load_ssh_config(), user_dir, [], removals)
+        all_state[key] = state
+        _discover_save(DISCOVER_STATE_FILE, all_state)
+    return removed
+
+def _discover_check_ratings(key, user, state):
+    """Songs someone rated 1 star in any Navidrome client count as "Not for me"."""
+    nd_cfg = nd_user_config(user)
+    bad = []
+    for mix in DISCOVER_MIXES:
+        batch = state.get(mix) or {}
+        if not batch.get("tracks") or not batch.get("playlist_id"):
+            continue
+        try:
+            entries = nd_subsonic("getPlaylist", cfg=nd_cfg, id=batch["playlist_id"]).get("playlist", {}).get("entry", [])
+        except Exception:
+            continue
+        bad += [e["id"] for e in entries if e.get("userRating") == 1]
+    if bad:
+        n = discover_reject(key, user, set(bad))
+        print(f"[discover] {key}: removed {n} song(s) rated 1 star", file=sys.stderr)
+
+def _discover_due(mix, user_cfg, last_run, now):
+    hour = int(user_cfg.get("hour", 6))
+    slot = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if now < slot:
+        slot -= timedelta(days=1)
+    if DISCOVER_MIXES[mix]["every"] == "week":
+        while slot.weekday() != int(user_cfg.get("weekday", 0)):
+            slot -= timedelta(days=1)
+    return (last_run or 0) < slot.timestamp()
+
+def discover_users():
+    users = [None]
+    for key, cfg in _discover_load(DISCOVER_CONFIG_FILE).items():
+        if cfg.get("user") and not is_default_user(cfg["user"]):
+            users.append(cfg["user"])
+    return users
+
+def discover_scheduler_loop():
+    time.sleep(120)
+    while True:
+        try:
+            for user in discover_users():
+                key = _discover_user_key(user)
+                user_cfg = discover_user_config(user)
+                state = _discover_load(DISCOVER_STATE_FILE).get(key, {})
+                try:
+                    _discover_check_ratings(key, user, state)
+                except Exception as e:
+                    print(f"[discover] rating check for {key}: {e}", file=sys.stderr)
+                for mix in DISCOVER_MIXES:
+                    if user_cfg[mix].get("enabled") and \
+                            _discover_due(mix, user_cfg, (state.get(mix) or {}).get("last_run"), datetime.now()):
+                        discover_run(user, mix)
+                        state = _discover_load(DISCOVER_STATE_FILE).get(key, {})
+        except Exception as e:
+            print(f"[discover] scheduler error: {e}", file=sys.stderr, flush=True)
+        time.sleep(300)
+
+threading.Thread(target=discover_scheduler_loop, daemon=True).start()
+
+
+@app.route("/discover", methods=["GET"])
+def discover_get():
+    user = current_user()
+    key = _discover_user_key(user)
+    cfg = discover_user_config(user)
+    state = _discover_load(DISCOVER_STATE_FILE).get(key, {})
+    now = datetime.now()
+    mixes = {}
+    for mix, spec in DISCOVER_MIXES.items():
+        b = state.get(mix) or {}
+        mixes[mix] = {"playlist": spec["playlist"], "playlist_id": b.get("playlist_id"),
+                      "enabled": bool(cfg[mix].get("enabled")), "size": cfg[mix].get("size"),
+                      "song_ids": [t["id"] for t in b.get("tracks", [])],
+                      "generated_at": b.get("generated_at"), "last_run": b.get("last_run"),
+                      "last_error": b.get("last_error"), "job_id": b.get("job_id"),
+                      "running": _discover_running.get(key) == mix,
+                      "due": cfg[mix].get("enabled") and _discover_due(mix, cfg, b.get("last_run"), now)}
+    hist = state.get("history", {})
+    return jsonify({"mixes": mixes, "weekday": cfg["weekday"], "hour": cfg["hour"],
+                    "listenbrainz_user": cfg["listenbrainz_user"], "keep_plays": DISCOVER_KEEP_PLAYS,
+                    "kept_playlist": DISCOVER_KEPT_PLAYLIST,
+                    "kept_total": sum(1 for h in hist.values() if h.get("result") == "keep"),
+                    "picked_total": len(hist)})
+
+@app.route("/discover/config", methods=["POST"])
+def discover_set_config():
+    user = current_user()
+    key = _discover_user_key(user)
+    data = request.json or {}
+    with _discover_state_lock:
+        all_cfg = _discover_load(DISCOVER_CONFIG_FILE)
+        cfg = all_cfg.get(key, {})
+        for mix, (lo, hi) in DISCOVER_SIZE_LIMITS.items():
+            if isinstance(data.get(mix), dict):
+                m = cfg.setdefault(mix, {})
+                if "enabled" in data[mix]:
+                    m["enabled"] = bool(data[mix]["enabled"])
+                if "size" in data[mix]:
+                    m["size"] = max(lo, min(hi, int(data[mix]["size"])))
+        if "weekday" in data:
+            cfg["weekday"] = max(0, min(6, int(data["weekday"])))
+        if "hour" in data:
+            cfg["hour"] = max(0, min(23, int(data["hour"])))
+        if "listenbrainz_user" in data:
+            cfg["listenbrainz_user"] = re.sub(r"[^\w.\-]", "", str(data["listenbrainz_user"]))[:64]
+        if not is_default_user(user):
+            cfg["user"] = user
+        all_cfg[key] = cfg
+        _discover_save(DISCOVER_CONFIG_FILE, all_cfg)
+    return discover_get()
+
+@app.route("/discover/run", methods=["POST"])
+def discover_run_now():
+    user = current_user()
+    mix = (request.json or {}).get("mix", "weekly")
+    if mix not in DISCOVER_MIXES:
+        return jsonify({"error": "Unknown mix"}), 400
+    if _discover_running.get(_discover_user_key(user)):
+        return jsonify({"error": "A Discover mix is being made right now"}), 409
+    threading.Thread(target=discover_run, args=(user, mix, "made now"), daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/discover/feedback", methods=["POST"])
+def discover_feedback():
+    """keep = star it (it moves into the library at the next run); reject = "Not
+    for me": deleted now, never picked again; unkeep = take the star off."""
+    user = current_user()
+    data = request.json or {}
+    song_id, action = data.get("song_id"), data.get("action")
+    if not song_id or action not in ("keep", "unkeep", "reject"):
+        return jsonify({"error": "song_id and action (keep, unkeep, reject) needed"}), 400
+    key = _discover_user_key(user)
+    state = _discover_load(DISCOVER_STATE_FILE).get(key, {})
+    if not any(t["id"] == song_id for m in DISCOVER_MIXES for t in (state.get(m) or {}).get("tracks", [])):
+        return jsonify({"error": "That song isn't in your Discover mixes"}), 404
+    if action == "reject":
+        return jsonify({"ok": True, "removed": discover_reject(key, user, {song_id})})
+    nd_subsonic("star" if action == "keep" else "unstar", cfg=nd_user_config(user), id=song_id)
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":

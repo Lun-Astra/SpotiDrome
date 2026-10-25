@@ -493,8 +493,11 @@ header{
           <span class="ver-badge" id="app-version">…</span>
         </div>
         <div class="settings-row">
-          <div><div class="settings-label">Updates</div><div class="settings-sub">Updating is one command on the server</div></div>
-          <button class="btn btn-ghost" id="btn-check-app" onclick="checkAppUpdate(true)">↻ Check for updates</button>
+          <div><div class="settings-label">Updates</div><div class="settings-sub" id="app-upd-how">Downloads and installs the newest version</div></div>
+          <div style="display:flex;gap:6px;flex-shrink:0">
+            <button class="btn btn-ghost" id="btn-check-app" onclick="checkAppUpdate(true)">↻ Check for updates</button>
+            <button class="btn btn-primary" id="btn-run-update" onclick="runAppUpdate()" style="display:none">⬆ Update now</button>
+          </div>
         </div>
         <div class="upd-out" id="app-upd-out"></div>
       </div>
@@ -1275,7 +1278,10 @@ async function checkAppUpdate(force){
   try{
     const r=await fetch(`${API}/update/check${force?'?force=1':''}`),d=await r.json();
     badge.textContent=d.current?d.current:'unknown';
-    const cmd=`\n\nTo update, run this where SpotiDrome's docker-compose.yml is:\n  ${d.command}`;
+    // With the updater service running, Update now does it; otherwise it's one command.
+    const cmd=d.updater?'':`\n\nTo update, run this where SpotiDrome's docker-compose.yml is:\n  ${d.command}`;
+    document.getElementById('app-upd-how').textContent=d.updater?'Downloads and installs the newest version':'Updating is one command on the server';
+    document.getElementById('btn-run-update').style.display=d.updater&&(d.status==='update_available'||d.status==='unknown')&&!_updating?'':'none';
     if(d.status==='up_to_date'){sub.textContent='Up to date';out.style.display=force?'block':'none';out.textContent='✓ You have the newest version.';}
     else if(d.status==='update_available'){
       sub.textContent=`${d.behind_by} update${d.behind_by===1?'':'s'} available`;
@@ -1288,6 +1294,35 @@ async function checkAppUpdate(force){
     else{sub.textContent='Update check failed';out.style.display=force?'block':'none';out.textContent=d.error||'Update check failed';}
   }catch(e){if(force){out.style.display='block';out.textContent='Error: '+e.message;}}
   finally{btn.disabled=false;btn.innerHTML='↻ Check for updates';}
+}
+// Update now: the updater service pulls the new version and restarts SpotiDrome. The
+// backend is gone for a moment while it restarts, so this keeps asking until a
+// different version answers (or the updater reports a failure), then reloads.
+let _updating=false;
+async function runAppUpdate(){
+  if(!confirm('Update SpotiDrome now? It restarts, so running downloads stop and the page reloads when it\'s back.'))return;
+  const btn=document.getElementById('btn-run-update'),out=document.getElementById('app-upd-out'),sub=document.getElementById('app-upd-sub');
+  const before=document.getElementById('app-version').textContent;
+  let r,d;
+  try{r=await fetch(`${API}/update/run`,{method:'POST'});d=await r.json();}catch(e){d={error:e.message};}
+  if(!r||!r.ok){out.style.display='block';out.textContent='✗ '+(d.error||'Could not start the update');return;}
+  _updating=true;btn.style.display='none';
+  out.style.display='block';sub.textContent='Updating…';
+  const started=Date.now();
+  const poll=async()=>{
+    let st=null;
+    try{const x=await fetch(`${API}/update/status`);if(x.ok)st=await x.json();}catch(e){}
+    if(!st){out.textContent='Restarting SpotiDrome…';}
+    else{
+      out.textContent=(st.message||'Updating…')+'\n\n'+(st.log||[]).join('\n');out.scrollTop=out.scrollHeight;
+      if(st.state==='failed'){sub.textContent='Update failed';_updating=false;return;}
+      if(st.current&&st.current!==before&&st.state!=='running'){sub.textContent='Updated - reloading…';setTimeout(()=>location.reload(),1500);return;}
+      if(st.state==='done'){sub.textContent='Up to date';out.textContent='✓ Updated (no newer version was needed)\n\n'+(st.log||[]).join('\n');_updating=false;return;}
+    }
+    if(Date.now()-started>15*60*1000){sub.textContent='Update is taking long - check the server';_updating=false;return;}
+    setTimeout(poll,2000);
+  };
+  setTimeout(poll,1500);
 }
 async function updateYtdlp(){
   const btn=document.getElementById('btn-upd-ytdlp'),out=document.getElementById('ytdlp-upd-out');

@@ -63,7 +63,7 @@ To update, from the folder with `docker-compose.yml`:
 ```bash
 docker compose pull && docker compose up -d
 ```
-**Settings → SpotiDrome → Check for updates** tells you whether a newer version is out (and what changed); updating is still this command. Your settings and state are untouched: they live in `.env` and `~/.ssh/` on the host, not in the images. To update automatically, run that on a schedule (cron) or use [Watchtower](https://containrrr.dev/watchtower/); [Diun](https://crazymax.dev/diun/) only notifies.
+**Settings → SpotiDrome → Check for updates** tells you whether a newer version is out (and what changed), and **Update now** installs it: it pulls the code (when the folder is a git checkout without changes of its own) and the newest images, restarts SpotiDrome and reloads the page. That's done by the small `updater` service in `docker-compose.yml`. It's the only container with the Docker socket and has no network port; the backend (which can be reachable from the internet) only asks it for an update through a file in `~/.ssh/` (see `updater/updater.sh`). Updates only start that way, from an admin's login. If you'd rather not give any container the Docker socket, remove the `updater` service; the button then shows the command above instead. Your settings and state are untouched: they live in `.env` and `~/.ssh/` on the host, not in the images. To update automatically, run that on a schedule (cron) or use [Watchtower](https://containrrr.dev/watchtower/); [Diun](https://crazymax.dev/diun/) only notifies.
 
 The images contain no configuration or secrets: `.env`, the SSH key and all runtime state are mounted at runtime (see `.dockerignore`).
 

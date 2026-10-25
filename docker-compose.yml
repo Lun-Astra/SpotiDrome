@@ -49,3 +49,17 @@ services:
       - ~/.ssh:/root/.ssh
       - /tmp/spotidrome:/downloads
     restart: unless-stopped
+
+  # Settings > Update now: the only container with the Docker socket, and it
+  # has no network port. The backend asks it for an update through a file in
+  # the shared state folder; see updater/updater.sh.
+  updater:
+    image: docker:cli
+    entrypoint: ["sh", "/updater/updater.sh"]
+    environment:
+      - HOST_HOME=${HOME}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./updater:/updater:ro
+      - ~/.ssh:/state
+    restart: unless-stopped

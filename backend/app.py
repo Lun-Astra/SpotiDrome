@@ -6033,6 +6033,18 @@ def library_mismatched_tracks_remove():
 APP_COMMIT = os.environ.get("APP_COMMIT", "").strip()
 UPDATE_REPO = os.environ.get("UPDATE_REPO", "Lun-Astra/SpotiDrome").strip()
 UPDATE_COMMAND = "docker compose pull && docker compose up -d"
+# Update now (Settings): the updater service does it - see updater/updater.sh.
+UPDATE_REQUEST_FILE   = "/root/.ssh/update_request.json"
+UPDATE_STATUS_FILE    = "/root/.ssh/update_status.json"
+UPDATE_LOG_FILE       = "/root/.ssh/update.log"
+UPDATER_HEARTBEAT_FILE = "/root/.ssh/updater_heartbeat"
+
+def updater_running():
+    try:
+        with open(UPDATER_HEARTBEAT_FILE) as f:
+            return time.time() - int(f.read().strip()) < 30
+    except Exception:
+        return False
 _update_cache = {"at": 0.0, "data": None}
 
 
@@ -6049,7 +6061,8 @@ def update_check():
     # GitHub allows 60 anonymous API calls an hour; the button needn't hit it every click.
     if _update_cache["data"] and now - _update_cache["at"] < 300 and request.args.get("force") != "1":
         return jsonify(_update_cache["data"])
-    data = {"current": APP_COMMIT[:7] or None, "repo": UPDATE_REPO, "command": UPDATE_COMMAND}
+    data = {"current": APP_COMMIT[:7] or None, "repo": UPDATE_REPO, "command": UPDATE_COMMAND,
+            "updater": updater_running()}
     try:
         head = _github_json("/commits/main")
         data["latest"] = head["sha"][:7]
@@ -6080,6 +6093,39 @@ def update_check():
         data["error"] = f"Couldn't reach GitHub: {e}"
     _update_cache.update(at=now, data=data)
     return jsonify(data)
+
+
+@app.route("/update/run", methods=["POST"])
+def update_run():
+    if not updater_running():
+        return jsonify({"error": "The updater isn't running. Start it once on the server with: "
+                                 "docker compose pull && docker compose up -d"}), 503
+    st = _read_update_status()
+    if st.get("state") == "running" and time.time() - st.get("at", 0) < 1800:
+        return jsonify({"status": "already running"})
+    with open(UPDATE_REQUEST_FILE, "w") as f:
+        json.dump({"at": time.time(), "by": (g.who or {}).get("user") or (g.who or {}).get("key_name")}, f)
+    with open(UPDATE_STATUS_FILE, "w") as f:
+        json.dump({"state": "requested", "at": int(time.time()), "message": "Waiting for the updater…"}, f)
+    _update_cache.update(at=0, data=None)
+    return jsonify({"status": "started"})
+
+def _read_update_status():
+    try:
+        with open(UPDATE_STATUS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+@app.route("/update/status")
+def update_status():
+    try:
+        with open(UPDATE_LOG_FILE) as f:
+            log = f.read().splitlines()[-40:]
+    except Exception:
+        log = []
+    return jsonify({**_read_update_status(), "log": log, "current": APP_COMMIT[:7] or None,
+                    "updater": updater_running()})
 
 
 # ─── yt-dlp management ───────────────────────────────────────────────────────

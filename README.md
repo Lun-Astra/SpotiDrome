@@ -71,15 +71,36 @@ The images contain no configuration or secrets: `.env`, the SSH key and all runt
 
 ## Discover
 
-Spotify doesn't give apps its Discover Weekly, Daily Mixes or recommendations anymore, so SpotiDrome makes its own (Settings → Discover, per user):
+Spotify doesn't give apps its Discover Weekly, Daily Mixes or recommendations anymore, so SpotiDrome makes its own (Settings → Discover, per user). It's **off until you switch it on**, because it downloads songs and adds a library to your Navidrome.
+
+**Before you switch it on:**
+
+1. **Navidrome 0.58 or newer** - the first version with more than one library.
+2. **An admin account** in SpotiDrome's Navidrome settings (`NAVIDROME_USER`), so it can add the Discover library.
+3. **Only if Navidrome runs in Docker:** make a folder on the host for Discover, mount it into the Navidrome container read-write (it's not inside your music folder, so it needs its own mount), and tell SpotiDrome both paths in `.env`:
+   ```yaml
+   # Navidrome's docker-compose.yml
+   volumes:
+     - /srv/music:/music:ro
+     - /srv/music-discover:/discover      # new
+   ```
+   ```sh
+   # SpotiDrome's .env
+   DISCOVER_MUSIC_PATH=/srv/music-discover    # on the host (over SSH)
+   DISCOVER_NAVIDROME_PATH=/discover          # inside the Navidrome container
+   ```
+   Restart Navidrome, then `docker compose up -d` for SpotiDrome. When Navidrome runs directly on the host, the default `/opt/navidrome/discover` works as it is (or set `DISCOVER_MUSIC_PATH` to a folder you prefer).
+
+Your existing library is left alone: Discover never picks songs you already have, only ever deletes files inside its own folder, and the only thing it adds to your library is songs you chose to keep. If something's wrong (old Navidrome, no admin, a folder Navidrome can't see), Settings → Discover says what.
+
 
 - **Picking:** seed songs are drawn from what you play most in Navidrome (recently played ones count extra for the daily mix). YouTube Music's radio for each seed gives related songs; songs found from several seeds score higher, artists you don't have yet get a small bonus, and there are at most 2 songs per artist (1 in the daily mix). Anything already in the library, on the ignore list or picked before is skipped. Fill in your ListenBrainz username to also get its *Weekly Exploration* picks.
-- **Where they go:** a separate folder on the Navidrome host, `DISCOVER_MUSIC_PATH` (default `/opt/navidrome/discover`, one subfolder per user), which SpotiDrome adds to Navidrome as its own **Discover** library. The songs are in the playlists *Discover Weekly* and *Daily Discovery*. Pick the main library in your Navidrome client to keep them out of your albums and artists (LunaDrome does that by itself).
+- **Where they go:** a separate folder on the Navidrome host, `DISCOVER_MUSIC_PATH` (default `/opt/navidrome/discover`, one subfolder per user), which SpotiDrome adds to Navidrome as its own **Discover** library. The songs are in the playlists *Discover Weekly* and *Daily Discovery*. Admins see every library, so in other Navidrome clients (Symfonium, Feishin, …) pick the main library to keep these songs out of your albums and artists; LunaDrome does that by itself.
 - **What stays:** when a mix is made again, the songs from last time are judged:
   - starred, rated 4-5 stars or played 2+ times all the way through → moved into the library (stars and ratings carry over) and added to the playlist *Discover: kept*
   - rated 1 star, or **Not for me** in LunaDrome → deleted right away (checked every 5 minutes)
   - everything else → deleted
-- **When:** weekly on the chosen day, daily every day, at the chosen hour; *Make now* makes one straight away. SpotiDrome's own account has both mixes on; other users switch them on in Settings.
+- **When:** weekly on the chosen day, daily every day, at the chosen hour; *Make now* makes one straight away. Every user switches their own mixes on in Settings.
 - **API:** `GET /discover`, `POST /discover/config`, `POST /discover/run` (`{"mix": "weekly"|"daily"}`), `POST /discover/feedback` (`{"song_id", "action": "keep"|"unkeep"|"reject"}`). LunaDrome keys may call all but `/discover/config`.
 
 ## Access & API keys

@@ -26,6 +26,7 @@ A self-hosted bridge between Spotify / YouTube Music playlists and a [Navidrome]
 - **Permanent track ignore list** — mark a track (e.g. one that's region- or age-restricted and can't be fetched) to be skipped on all future syncs instead of showing up as a repeated failure.
 - **Sync health dashboard** — a panel showing last-sync status per tracked playlist, dead-link counts, and duplicate-sweep results.
 - **Library cleanup tools** — scan Navidrome for duplicate or overly long tracks and remove them.
+- **Several users** — everyone with an account on your Navidrome logs in with it, connects their own Spotify account and gets their synced playlists in their own Navidrome account. Non-admins only see their own playlists and jobs. See [Access & API keys](#access--api-keys).
 
 ## Architecture
 
@@ -77,6 +78,8 @@ SpotiDrome can be exposed to the internet: every API route is deny-by-default in
   - **Full access:** everything the web UI can do, except managing API keys (that always needs a web login).
 - **Several users:** every Navidrome user can log in. Each connects their **own Spotify account** (through the one Spotify app) and gets their synced playlists in **their own Navidrome account**; auto-sync reads each tracked playlist with its owner's Spotify login. Navidrome **admins** can do everything; other users only see their own Spotify/YouTube Music playlists, tracked playlists and jobs (`USER_ROUTES` in `backend/app.py`). The account in `NAVIDROME_USER` / the Navidrome settings keeps the original Spotify login and tracked playlists.
   - At login SpotiDrome keeps a Subsonic token (`md5(password + salt)` + salt, not the password) per user in `~/.ssh/user_credentials.json` (mode 600), so auto-sync can update their playlists later. Spotify logins are in `~/.ssh/spotify_tokens/`; a user can switch account in Settings → Access.
+  - **Switching user:** Settings → Access → **Log out**, then log in with the other Navidrome account. The login is per browser, so two people can use SpotiDrome at the same time (or one person in a second browser/private window).
+  - **All users are active at once:** auto-sync keeps every user's tracked playlists in sync whether or not they're logged in. Downloads from all users share one job queue and run one after another; admins see every job, other users only their own.
   - A Spotify app in **Development mode** only works for accounts its owner adds under **User Management** in the Spotify Developer Dashboard - add each user's Spotify e-mail there. Others get a clear message after connecting.
 - `GET /session` tells a client who it is (`logged_in`, `via: session|api_key`, `scope`) - handy as a connection test for an API key.
 - The backend port (`5000`) is bound to `127.0.0.1` only; everything goes through the frontend's `/api/` proxy. Put a TLS reverse proxy in front of port `8080` for internet access (it should send `X-Forwarded-Proto: https`):

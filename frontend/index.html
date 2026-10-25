@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SpotiDrome</title>
-<script src="/auth.js"></script>
+<script src="/auth.js?v=2"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -739,7 +739,8 @@ if(code){
 // playlists and jobs (the backend refuses the rest, the page hides it: .admin-only).
 let IS_ADMIN=true;
 async function init(){
-  const session=await window.SD_READY;
+  // An auth.js from before SD_READY existed (still in the browser cache) has none.
+  const session=await (window.SD_READY||fetch('/api/session').then(r=>r.json()).catch(()=>({})));
   IS_ADMIN=session.admin!==false;
   // Everyone but SpotiDrome's own account has a Spotify login of their own to switch.
   document.getElementById('spotify-switch-row').style.display=session.own_spotify?'':'none';

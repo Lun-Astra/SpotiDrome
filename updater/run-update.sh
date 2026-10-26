@@ -48,6 +48,9 @@ if ! run $COMPOSE up -d --remove-orphans; then
     status failed "Restarting SpotiDrome failed - see the log"
     exit 1
 fi
+# The frontend's nginx may still have the old backend's address (before the
+# resolver in nginx.conf, every frontend did): restarting it is cheap.
+run $COMPOSE restart frontend
 run docker image prune -f
 log "Done"
 status done "Updated"

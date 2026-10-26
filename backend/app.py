@@ -2121,6 +2121,10 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
         remote_files_flat |= get_all_remote_files(library_cfg)
     remote_title_index = _index_remote_files_by_title(remote_files_flat)
     naming = load_album_naming(ssh_cfg)
+    # Downloads wait in DOWNLOAD_DIR until a batch goes up, and that can be RAM (a tmpfs
+    # /tmp). Discover uploads every few songs and scans once at the end of its run.
+    upload_every = 5 if music_path else 50
+    batch_nd_cfg = None if music_path else nd_cfg
 
     for i, track in enumerate(tracks):
         with job_lock:
@@ -2163,8 +2167,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 jobs[job_id]["log"].append(f"⏭ Already local: {track['artist']} - {track['name']}")
             newly_downloaded.append(track)
             all_synced_tracks.append(track)
-            if len(newly_downloaded) % 50 == 0 and ssh_cfg:
-                batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(all_synced_tracks), job_id)
+            if len(newly_downloaded) % upload_every == 0 and ssh_cfg:
+                batch_upload_and_cleanup(local_dir, ssh_cfg, batch_nd_cfg, playlist_name, list(all_synced_tracks), job_id)
                 newly_downloaded.clear()
             continue
 
@@ -2264,8 +2268,8 @@ def download_worker(job_id, tracks, playlist_name, playlist_id=None, sync_navidr
                 with job_lock:
                     jobs[job_id]["log"].append(f"✓ Downloaded via {provider}{quality_note}: {label}")
                     jobs[job_id]["downloaded"] += 1
-                if len(newly_downloaded) % 50 == 0 and ssh_cfg:
-                    batch_upload_and_cleanup(local_dir, ssh_cfg, nd_cfg, playlist_name, list(all_synced_tracks), job_id)
+                if len(newly_downloaded) % upload_every == 0 and ssh_cfg:
+                    batch_upload_and_cleanup(local_dir, ssh_cfg, batch_nd_cfg, playlist_name, list(all_synced_tracks), job_id)
                     newly_downloaded.clear()
                 outcome = "success"
                 break
@@ -7809,7 +7813,9 @@ def _discover_run_locked(key, user, mix, spec, size, user_cfg, job_id, log):
     state.setdefault("history", {})
     state["user"] = user
 
-    kept = discover_review(key, user, mix, state, log)
+    # Kept songs get their star/rating and the kept playlist after the scan below. Saved
+    # first, so a run that dies halfway still does that next time.
+    state["pending_kept"] = (state.get("pending_kept") or []) + discover_review(key, user, mix, state, log)
     with _discover_state_lock:   # the review's moves/deletes are done: remember them now
         all_state = _discover_load(DISCOVER_STATE_FILE)
         all_state[key] = {**all_state.get(key, {}), **state}
@@ -7848,6 +7854,7 @@ def _discover_run_locked(key, user, mix, spec, size, user_cfg, job_id, log):
     pl_id = _discover_set_playlist(nd_cfg, spec["playlist"], [f["id"] for f in found])
     log(f"✅ {spec['playlist']}: {len(found)} new song(s) in the playlist")
 
+    kept, state["pending_kept"] = state.get("pending_kept") or [], []
     if kept:   # they're in the real library now: carry the star/rating over, list them
         kept_ids = []
         for k in kept:

@@ -7755,13 +7755,14 @@ def _discover_find_song(nd_cfg, artist, title, folder_id):
             return s
     return None
 
+def _discover_replace_songs(nd_cfg, pl_id, song_ids):
+    """Replace the playlist's whole song list. Not by index: getPlaylist leaves out songs
+    whose file is gone (last mix's, moved or deleted), so its indexes don't match."""
+    nd_subsonic("createPlaylist", cfg=nd_cfg, playlistId=pl_id, songId=list(song_ids))
+
 def _discover_set_playlist(nd_cfg, name, song_ids):
     pl_id, _created = nd_get_or_create_playlist(name, nd_cfg)
-    entries = nd_subsonic("getPlaylist", cfg=nd_cfg, id=pl_id).get("playlist", {}).get("entry", [])
-    if entries:
-        nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=pl_id, songIndexToRemove=list(range(len(entries))))
-    for i in range(0, len(song_ids), 50):
-        nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=pl_id, songIdToAdd=song_ids[i:i + 50])
+    _discover_replace_songs(nd_cfg, pl_id, song_ids)
     nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=pl_id,
                 comment="Made by SpotiDrome Discover: songs that aren't in your library yet. "
                         "Star the ones you like - those stay.")
@@ -7906,11 +7907,7 @@ def discover_reject(key, user, song_ids):
             batch["tracks"] = [t for t in batch["tracks"] if t["id"] not in song_ids]
             removed += len(gone)
             try:
-                entries = nd_subsonic("getPlaylist", cfg=nd_cfg, id=batch["playlist_id"]) \
-                    .get("playlist", {}).get("entry", [])
-                idx = [i for i, e in enumerate(entries) if e["id"] in song_ids]
-                if idx:
-                    nd_subsonic("updatePlaylist", cfg=nd_cfg, playlistId=batch["playlist_id"], songIndexToRemove=idx)
+                _discover_replace_songs(nd_cfg, batch["playlist_id"], [t["id"] for t in batch["tracks"]])
             except Exception as e:
                 print(f"[discover] couldn't update {spec['playlist']}: {e}", file=sys.stderr)
         if removals:

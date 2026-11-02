@@ -3439,28 +3439,64 @@ for line in sys.stdin:
         print(id_)
 '''
 
+def _nd_real_paths(ssh_cfg, ids=None):
+    """{media_file id: the file's full path on the SSH host}. Since Navidrome 0.58
+    a path is relative to its own library's folder, and SpotiDrome's Discover
+    library isn't under SSH_MUSIC_PATH: reading every path as relative to
+    SSH_MUSIC_PATH made the orphan prune (Fix Broken Entries, and the start of
+    Consolidate Editions) delete every Discover song from Navidrome's database,
+    which emptied Discover Weekly (#11). The main library keeps SSH_MUSIC_PATH,
+    also when Navidrome runs in a container and sees it under another name."""
+    where = f" WHERE id IN ({','.join(_sql_quote(i) for i in ids)})" if ids is not None else ""
+    db = "sqlite3 -readonly /var/lib/navidrome/navidrome.db"
+    result = subprocess.run(_ssh_cmd(ssh_cfg,
+        f"{db} \"SELECT 'L' || char(1) || id || char(1) || name || char(1) || path FROM library;"
+        f" SELECT 'F' || char(1) || id || char(1) || library_id || char(1) || path FROM media_file{where};\""),
+        capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:   # before 0.58: one library, no library table
+        result = subprocess.run(_ssh_cmd(ssh_cfg,
+            f"{db} \"SELECT 'F' || char(1) || id || char(1) || '' || char(1) || path FROM media_file{where};\""),
+            capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-300:] or "sqlite3 select failed")
+    roots, files = {}, []
+    for line in result.stdout.splitlines():
+        parts = line.split("\x01")
+        if parts[0] == "L" and len(parts) == 4:
+            roots[parts[1]] = (parts[2], parts[3].rstrip("/"))
+        elif parts[0] == "F" and len(parts) == 4:
+            files.append(parts[1:])
+    host_roots = {}
+    for lib_id, (name, nd_path) in roots.items():
+        if name == DISCOVER_LIBRARY_NAME:
+            host, discover_nd = discover_paths()
+            if nd_path == discover_nd.rstrip("/"):
+                host_roots[lib_id] = host.rstrip("/")
+    music = ssh_cfg["music_path"].rstrip("/")
+    return {id_: path if path.startswith("/") else f"{host_roots.get(lib_id, music)}/{path}"
+            for id_, lib_id, path in files}
+
+def _nd_main_library(nd_cfg):
+    """search3 arguments that keep a whole-library listing to the main library
+    once SpotiDrome's Discover library exists (its songs aren't the user's yet)."""
+    try:
+        folders = nd_subsonic("getMusicFolders", cfg=nd_cfg).get("musicFolders", {}).get("musicFolder", [])
+    except Exception:
+        return {}
+    if not any(f.get("name") == DISCOVER_LIBRARY_NAME for f in folders):
+        return {}
+    main = next((f for f in folders if f.get("name") != DISCOVER_LIBRARY_NAME), None)
+    return {"musicFolderId": main["id"]} if main else {}
+
 def find_orphaned_navidrome_entries(ssh_cfg):
     """Returns [{'id':..., 'path':...}] for every media_file row whose file
     no longer exists on disk. Read-only — deletes nothing."""
-    # SQLite's own char(1) inserts the delimiter directly in the query
-    # output, rather than relying on a shell-quoted -separator flag that
-    # would depend on the remote's login shell supporting ANSI-C quoting.
-    select_cmd = _ssh_cmd(ssh_cfg,
-        "sqlite3 /var/lib/navidrome/navidrome.db "
-        "\"SELECT id || char(1) || path FROM media_file;\"")
-    result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=60)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-300:] or "sqlite3 select failed")
-    rows = {}
-    for line in result.stdout.splitlines():
-        if "\x01" not in line:
-            continue
-        id_, path = line.split("\x01", 1)
-        rows[id_] = path
-
+    rows = _nd_real_paths(ssh_cfg)
+    # Full paths, so the remote script's SSH_MUSIC_PATH fallback isn't used.
+    listing = "".join(f"{id_}\x01{path}\n" for id_, path in rows.items())
     filter_cmd = _ssh_cmd(ssh_cfg,
         f"{_remote_python(ssh_cfg)} -c {shlex.quote(_ORPHAN_SCAN_REMOTE_SCRIPT)} {shlex.quote(ssh_cfg['music_path'])}")
-    result = subprocess.run(filter_cmd, input=result.stdout, capture_output=True, text=True, timeout=REMOTE_SCAN_TIMEOUT)
+    result = subprocess.run(filter_cmd, input=listing, capture_output=True, text=True, timeout=REMOTE_SCAN_TIMEOUT)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-300:] or "orphan filter failed")
     missing_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -5129,10 +5165,11 @@ def consolidate_editions_worker(job_id):
 
     with job_lock:
         jobs[job_id]["current_track"] = "Fetching the library from Navidrome…"
+    main_library = _nd_main_library(nd_cfg)   # Discover's songs aren't editions to complete
     all_songs, all_albums, offset = [], [], 0
     while True:
         data = nd_subsonic("search3", cfg=nd_cfg, query="", songCount=500, songOffset=offset,
-                            albumCount=500, albumOffset=offset, artistCount=0)
+                            albumCount=500, albumOffset=offset, artistCount=0, **main_library)
         result = data.get("searchResult3", {})
         songs, albums = result.get("song", []), result.get("album", [])
         if not songs and not albums:
@@ -5214,17 +5251,7 @@ def consolidate_editions_worker(job_id):
 
             if copies:
                 ids = [c["song"]["id"] for c in copies]
-                id_list = ",".join(f"'{i}'" for i in ids)
-                select_cmd = _ssh_cmd(ssh_cfg,
-                    f"sqlite3 /var/lib/navidrome/navidrome.db "
-                    f"\"SELECT id || char(1) || path FROM media_file WHERE id IN ({id_list});\"")
-                result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=30)
-                real_paths = {}
-                for line in result.stdout.splitlines():
-                    if "\x01" not in line:
-                        continue
-                    rid, path = line.split("\x01", 1)
-                    real_paths[rid] = path
+                real_paths = _nd_real_paths(ssh_cfg, ids)
 
                 new_dir = f"{ssh_cfg['music_path']}/{sanitize(canonical_name)}"
                 batch = []
@@ -5381,10 +5408,11 @@ def cleanup_scan():
         # Get all songs via subsonic - paginate
         all_songs = []
         offset = 0
+        main_library = _nd_main_library(cfg)   # not the Discover picks
         while True:
             data = nd_subsonic("search3", cfg=cfg,
                                query="", songCount=500, songOffset=offset,
-                               albumCount=0, artistCount=0)
+                               albumCount=0, artistCount=0, **main_library)
             songs = data.get("searchResult3", {}).get("song", [])
             if not songs:
                 break
@@ -5484,17 +5512,7 @@ def _delete_tracks_from_navidrome(track_ids, ssh_cfg, cfg, delete_files=True):
     failed = []
 
     if delete_files and ssh_cfg:
-        ids_str = ",".join(f"'{tid}'" for tid in track_ids)
-        select_cmd = _ssh_cmd(ssh_cfg,
-            "sqlite3 /var/lib/navidrome/navidrome.db "
-            f"\"SELECT id || char(1) || path FROM media_file WHERE id IN ({ids_str});\"")
-        result = subprocess.run(select_cmd, capture_output=True, text=True, timeout=30)
-        real_paths = {}
-        for line in result.stdout.splitlines():
-            if "\x01" not in line:
-                continue
-            tid, path = line.split("\x01", 1)
-            real_paths[tid] = path
+        real_paths = _nd_real_paths(ssh_cfg, track_ids)
         print(f"[cleanup] real paths from DB: {real_paths}", file=sys.stderr)
 
         for tid in track_ids:
@@ -5584,10 +5602,11 @@ def library_long_tracks():
     try:
         all_songs = []
         offset = 0
+        main_library = _nd_main_library(cfg)   # not the Discover picks
         while True:
             data = nd_subsonic("search3", cfg=cfg,
                                query="", songCount=500, songOffset=offset,
-                               albumCount=0, artistCount=0)
+                               albumCount=0, artistCount=0, **main_library)
             songs = data.get("searchResult3", {}).get("song", [])
             if not songs:
                 break

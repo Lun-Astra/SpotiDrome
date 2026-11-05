@@ -3502,19 +3502,51 @@ def find_orphaned_navidrome_entries(ssh_cfg):
     missing_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     return [{"id": i, "path": rows.get(i, "")} for i in missing_ids]
 
+def _nd_delete_missing(nd_cfg, ids=None, paths=None, scan=True):
+    """Removes the rows of files that are gone from disk through Navidrome's own
+    API (DELETE /api/missing, Navidrome 0.55+) instead of writing to
+    navidrome.db with the host's sqlite3 while Navidrome runs. Those direct
+    writes corrupted the database every night for a user whose Navidrome data
+    lives on a NAS (a second process writing the same SQLite file next to
+    Navidrome, with a different SQLite build), and they broke scans here before
+    (the album datetime index, see prune_orphaned_navidrome_entries).
+    A full scan first marks the vanished files missing; then only the given ids
+    (or files whose path ends with one of the given paths) are removed, or every
+    missing file when neither is given. Returns how many were removed."""
+    if scan:
+        ok, _msg = nd_trigger_scan(nd_cfg, full=True)
+        if ok:
+            nd_wait_for_scan(nd_cfg, timeout=300)
+    missing, start = [], 0
+    while True:
+        page = _nd_native("GET", "missing", nd_cfg, params={"_start": start, "_end": start + 500}) or []
+        missing += page
+        if len(page) < 500:
+            break
+        start += 500
+    wanted_ids = set(ids) if ids is not None else None
+    wanted_paths = [p.rstrip("/") for p in paths] if paths is not None else None
+    def wanted(m):
+        if wanted_ids is None and wanted_paths is None:
+            return True
+        if wanted_ids is not None and m.get("id") in wanted_ids:
+            return True
+        rel = (m.get("path") or "").lstrip("/")
+        return bool(wanted_paths and rel and any(p == rel or p.endswith("/" + rel) for p in wanted_paths))
+    gone = [m["id"] for m in missing if m.get("id") and wanted(m)]
+    for i in range(0, len(gone), 100):
+        _nd_native("DELETE", "missing", nd_cfg, params=[("id", g) for g in gone[i:i + 100]])
+    return len(gone)
+
 def prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg):
     orphans = find_orphaned_navidrome_entries(ssh_cfg)
     pruned_files = 0
     file_error = None
-    if orphans:
-        ids_str = ",".join(f"'{o['id']}'" for o in orphans)
-        del_cmd = _ssh_cmd(ssh_cfg,
-            f"sqlite3 /var/lib/navidrome/navidrome.db \"DELETE FROM media_file WHERE id IN ({ids_str});\"")
-        result = subprocess.run(del_cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            pruned_files = len(orphans)
-        else:
-            file_error = result.stderr[-300:]
+    if orphans and nd_cfg:
+        try:
+            pruned_files = _nd_delete_missing(nd_cfg, ids=[o["id"] for o in orphans])
+        except Exception as e:
+            file_error = f"Navidrome couldn't remove the missing files: {e}"
 
     # Navidrome's own `album` table can also be left with rows that have zero
     # media_file rows pointing at them (found while building edition
@@ -5539,18 +5571,14 @@ def _delete_tracks_from_navidrome(track_ids, ssh_cfg, cfg, delete_files=True):
 
     print(f"[cleanup] Deleting {len(track_ids)} tracks, delete_files={delete_files}", file=sys.stderr)
 
-    # Delete directly from Navidrome SQLite DB via SSH
-    if track_ids and ssh_cfg:
-        ids_str = ",".join(f"'{tid}'" for tid in track_ids)
-        sql = f"DELETE FROM media_file WHERE id IN ({ids_str});"
-        cmd = _ssh_cmd(ssh_cfg, f"sqlite3 /var/lib/navidrome/navidrome.db {shlex.quote(sql)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        print(f"[cleanup] DB delete rc={result.returncode} err={result.stderr.strip()}", file=sys.stderr)
-
-    # Also trigger a full scan to clean up
-    ok, msg = nd_trigger_scan(cfg, full=True)
-    if ok:
-        nd_wait_for_scan(cfg, timeout=300)
+    # A full scan marks the deleted files missing, then Navidrome removes those
+    # rows itself (never a direct write to navidrome.db, see _nd_delete_missing).
+    if track_ids:
+        try:
+            removed = _nd_delete_missing(cfg, ids=track_ids)
+            print(f"[cleanup] Navidrome removed {removed} missing row(s)", file=sys.stderr)
+        except Exception as e:
+            print(f"[cleanup] Navidrome missing-file delete failed: {e}", file=sys.stderr)
 
     return deleted, failed
 
@@ -5999,15 +6027,11 @@ def _delete_track_by_path(path, ssh_cfg, cfg):
         result = subprocess.run(rm_cmd, capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             return False, f"rm failed: {result.stderr.strip()}"
-    sql = f"DELETE FROM media_file WHERE path = {_sql_quote(path)};"
-    cmd = _ssh_cmd(ssh_cfg, f"sqlite3 /var/lib/navidrome/navidrome.db {shlex.quote(sql)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    if result.returncode != 0:
-        return False, f"DB delete failed: {result.stderr.strip()}"
     if cfg:
-        ok, _ = nd_trigger_scan(cfg, full=True)
-        if ok:
-            nd_wait_for_scan(cfg, timeout=300)
+        try:
+            _nd_delete_missing(cfg, paths=[path])
+        except Exception as e:
+            return False, f"Navidrome couldn't remove the missing file: {e}"
     return True, None
 
 @app.route("/library/verify-tracks", methods=["POST"])

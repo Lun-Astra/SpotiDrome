@@ -974,7 +974,14 @@ def get_sp(no_retry=False, user=None):
     Numbers) then sat on one album all afternoon.
     user: whose Spotify account (their playlists); None = SpotiDrome's own."""
     auth = spotify_oauth(user)
-    token = auth.get_cached_token()
+    try:
+        # spotipy refreshes an expired token in here already, so a revoked login
+        # (invalid_grant) or a network error raised from this line and every page
+        # load got a 500 on /auth/status: the web UI then stayed empty.
+        token = auth.get_cached_token()
+    except Exception as e:
+        print(f"[spotify] Token refresh failed: {e}", file=sys.stderr)
+        return None, auth.get_authorize_url()
     if not token:
         return None, auth.get_authorize_url()
     if auth.is_token_expired(token):

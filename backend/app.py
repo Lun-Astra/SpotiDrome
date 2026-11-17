@@ -803,17 +803,31 @@ def nd_subsonic(action, cfg=None, **params):
         raise ValueError(f"Subsonic error: {data.get('error', {}).get('message', 'unknown')}")
     return data
 
-def nd_get_token(cfg):
-    """Get a JWT token from Navidrome REST API."""
+_nd_tokens = {}   # (url, user, password) -> (token, time it was fetched)
+_nd_tokens_lock = threading.Lock()
+
+def nd_get_token(cfg, fresh=False):
+    """Get a JWT token from Navidrome REST API. Reused for 10 minutes: logging in
+    for every call made a paged listing (missing files, every song's path) hit
+    Navidrome's login limit (a few per 20 s) and fail with 429 half-way."""
+    key = (cfg["url"], cfg["user"], cfg["password"])
+    with _nd_tokens_lock:
+        cached = _nd_tokens.get(key)
+        if cached and not fresh and time.time() - cached[1] < 600:
+            return cached[0]
     try:
         resp = http.post(f"{cfg['url']}/auth/login",
                         json={"username": cfg["user"], "password": cfg["password"]},
                         timeout=15)
         resp.raise_for_status()
-        return resp.json().get("token")
+        token = resp.json().get("token")
     except Exception as e:
         print(f"[nd_auth] Failed to get token: {e}", file=sys.stderr)
         return None
+    if token:
+        with _nd_tokens_lock:
+            _nd_tokens[key] = (token, time.time())
+    return token
 
 def nd_trigger_scan(cfg=None, full=False):
     if cfg is None:
@@ -3453,26 +3467,39 @@ def _nd_real_paths(ssh_cfg, ids=None):
     SSH_MUSIC_PATH made the orphan prune (Fix Broken Entries, and the start of
     Consolidate Editions) delete every Discover song from Navidrome's database,
     which emptied Discover Weekly (#11). The main library keeps SSH_MUSIC_PATH,
-    also when Navidrome runs in a container and sees it under another name."""
-    where = f" WHERE id IN ({','.join(_sql_quote(i) for i in ids)})" if ids is not None else ""
-    db = "sqlite3 -readonly /var/lib/navidrome/navidrome.db"
-    result = subprocess.run(_ssh_cmd(ssh_cfg,
-        f"{db} \"SELECT 'L' || char(1) || id || char(1) || name || char(1) || path FROM library;"
-        f" SELECT 'F' || char(1) || id || char(1) || library_id || char(1) || path FROM media_file{where};\""),
-        capture_output=True, text=True, timeout=60)
-    if result.returncode != 0:   # before 0.58: one library, no library table
-        result = subprocess.run(_ssh_cmd(ssh_cfg,
-            f"{db} \"SELECT 'F' || char(1) || id || char(1) || '' || char(1) || path FROM media_file{where};\""),
-            capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr[-300:] or "sqlite3 select failed")
-    roots, files = {}, []
-    for line in result.stdout.splitlines():
-        parts = line.split("\x01")
-        if parts[0] == "L" and len(parts) == 4:
-            roots[parts[1]] = (parts[2], parts[3].rstrip("/"))
-        elif parts[0] == "F" and len(parts) == 4:
-            files.append(parts[1:])
+    also when Navidrome runs in a container and sees it under another name.
+    Read through Navidrome's own API, not with sqlite3 on navidrome.db: even a
+    read-only second process on the database (WAL mode: readers write to the
+    -shm file too) corrupted it every night when it lives on a NAS (#12)."""
+    nd_cfg = load_nd_config()
+    if not nd_cfg:
+        raise RuntimeError("Navidrome isn't set up")
+    try:
+        libraries = _nd_native("GET", "library", nd_cfg) or []
+    except http.HTTPError as e:
+        # Only "no such API" (before 0.58: one library) may fall back. Any other
+        # failure has to stop here: without the Discover library's folder its
+        # songs would look missing, and the prune would delete them (#11).
+        if e.response is None or e.response.status_code != 404:
+            raise
+        libraries = []
+    roots = {str(l["id"]): (l.get("name"), (l.get("path") or "").rstrip("/")) for l in libraries}
+    songs = []
+    if ids is not None:
+        ids = list(ids)
+        for i in range(0, len(ids), 100):
+            batch = ids[i:i + 100]
+            songs += _nd_native("GET", "song", nd_cfg,
+                                params=[("id", x) for x in batch] + [("_start", 0), ("_end", len(batch))]) or []
+    else:
+        start = 0
+        while True:
+            page = _nd_native("GET", "song", nd_cfg, params={"_start": start, "_end": start + 500}) or []
+            songs += page
+            if len(page) < 500:
+                break
+            start += 500
+    files = [(s["id"], str(s.get("libraryId", "")), s.get("path") or "") for s in songs if s.get("id")]
     host_roots = {}
     for lib_id, (name, nd_path) in roots.items():
         if name == DISCOVER_LIBRARY_NAME:
@@ -3555,41 +3582,17 @@ def prune_orphaned_navidrome_entries(ssh_cfg, nd_cfg):
         except Exception as e:
             file_error = f"Navidrome couldn't remove the missing files: {e}"
 
-    # Navidrome's own `album` table can also be left with rows that have zero
-    # media_file rows pointing at them (found while building edition
-    # consolidation: ~8% of a real library at the time). These are only
-    # *counted* here, never deleted directly: Navidrome (0.61) purges empty
-    # albums itself during the scan below - verified on a throwaway library.
-    # A direct `DELETE FROM album` with the host's sqlite3 CLI is unsafe: the
-    # album_updated_at / album_created_at indexes are on datetime(...), and the
-    # CLI's SQLite rounds fractional seconds >= .9995 up where Navidrome's
-    # bundled SQLite doesn't, so the two compute different index keys. That
-    # mismatch broke every Navidrome scan that reached an affected album with
-    # "database disk image is malformed" from 2026-08-26 until 2026-09-25.
-    def _count_stale_albums():
-        count_cmd = _ssh_cmd(ssh_cfg,
-            "sqlite3 -readonly /var/lib/navidrome/navidrome.db "
-            "\"SELECT COUNT(*) FROM album WHERE id NOT IN (SELECT DISTINCT album_id FROM media_file);\"")
-        result = subprocess.run(count_cmd, capture_output=True, text=True, timeout=20)
-        if result.returncode != 0:
-            return None, result.stderr[-300:]
-        try:
-            return int(result.stdout.strip()), None
-        except ValueError:
-            return None, f"unexpected album count output: {result.stdout[-100:]!r}"
-
-    stale_albums, album_error = _count_stale_albums()
-
-    pruned_albums = 0
-    if (pruned_files or stale_albums) and nd_cfg:
+    # Albums left without songs are purged by Navidrome itself during its scan
+    # (0.61, verified on a throwaway library), so nothing is done to them here.
+    # They used to be counted with the host's sqlite3 CLI before and after that
+    # scan; even that read-only second process on navidrome.db is unsafe (#12),
+    # and a direct `DELETE FROM album` once broke every scan for a month: the
+    # CLI's SQLite rounds datetime() index keys differently from Navidrome's.
+    pruned_albums, album_error = 0, None
+    if pruned_files and nd_cfg:
         ok, _msg = nd_trigger_scan(nd_cfg, full=True)
         if ok:
             nd_wait_for_scan(nd_cfg, timeout=300)
-            if stale_albums:
-                remaining, err = _count_stale_albums()
-                if remaining is not None:
-                    pruned_albums = max(stale_albums - remaining, 0)
-                album_error = album_error or err
 
     return {"pruned": pruned_files, "entries": orphans, "pruned_albums": pruned_albums,
             "error": file_error or album_error}
@@ -7426,11 +7429,14 @@ def _discover_user_dir(key):
 
 def _nd_native(method, path, cfg, **kw):
     """Navidrome's own (non-Subsonic) API, as SpotiDrome's admin account."""
-    token = nd_get_token(cfg)
-    if not token:
-        raise ValueError("Couldn't log in to Navidrome's API")
-    resp = http.request(method, f"{cfg['url']}/api/{path}", timeout=30,
-                        headers={"x-nd-authorization": f"Bearer {token}"}, **kw)
+    for fresh in (False, True):
+        token = nd_get_token(cfg, fresh=fresh)
+        if not token:
+            raise ValueError("Couldn't log in to Navidrome's API")
+        resp = http.request(method, f"{cfg['url']}/api/{path}", timeout=30,
+                            headers={"x-nd-authorization": f"Bearer {token}"}, **kw)
+        if resp.status_code != 401:   # 401: the cached token expired, log in again once
+            break
     resp.raise_for_status()
     return resp.json() if resp.content else None
 

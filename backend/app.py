@@ -84,6 +84,7 @@ API_KEY_SCOPES = {
         ("GET", "/session"),
         ("GET", "/search"),
         ("GET", "/search/album/<browse_id>"),
+        ("GET", "/search/artist"),
         ("POST", "/ytmusic/info"),
         ("POST", "/ytmusic/download"),
         ("GET", "/jobs"),
@@ -4646,15 +4647,34 @@ def _best_thumbnail(thumbnails):
     thumbs = thumbnails or []
     return thumbs[-1].get("url") if thumbs else None
 
-def _ytm_call(fn, *args, timeout=12, **kwargs):
-    """Run one ytmusicapi call under the shared lock with a hard timeout
-    (ytmusicapi's HTTP calls have none of their own). None on any failure."""
-    ytm = _get_ytmusic()
-    if not ytm:
+# LunaDrome's searches get their own YTMusic client (own HTTP session, own
+# lock): on the shared one they queued behind every running download's
+# lookups, which made a search take many seconds while a sync was going.
+_search_ytmusic_client = None
+_search_ytmusic_lock = threading.Lock()
+
+def _get_search_ytmusic():
+    global _search_ytmusic_client
+    if _ytmusic_disabled:
         return None
+    if _search_ytmusic_client is None:
+        try:
+            _search_ytmusic_client = YTMusic(requests_session=_TimeoutSession())
+        except Exception as e:
+            print(f"[search] ytmusic init failed: {e}", file=sys.stderr)
+            return None
+    return _search_ytmusic_client
+
+def _ytm_call(fn, *args, timeout=12, **kwargs):
+    """Run one ytmusicapi call (LunaDrome search) under the search client's
+    lock with a hard timeout (ytmusicapi's HTTP calls have none of their own).
+    None on any failure."""
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        with _ytmusic_lock:  # serialize against every other caller of ytm — see _ytmusic_lock above
+        with _search_ytmusic_lock:  # one call at a time per client — see _ytmusic_lock above
+            ytm = _get_search_ytmusic()
+            if not ytm:
+                return None
             return executor.submit(getattr(ytm, fn), *args, **kwargs).result(timeout=timeout)
     except Exception as e:
         print(f"[search] ytmusic {fn} failed: {e}", file=sys.stderr)
@@ -4740,16 +4760,96 @@ def lunadrome_search_albums(query, limit):
         })
     return out[:limit]
 
+# Search results for a few minutes: LunaDrome's live search and the Songs /
+# Albums tabs ask for the same query again.
+_search_cache = {}
+_search_cache_lock = threading.Lock()
+SEARCH_CACHE_SECONDS = 600
+
+def _cached(key, compute):
+    now = time.time()
+    with _search_cache_lock:
+        hit = _search_cache.get(key)
+        if hit and now - hit[0] < SEARCH_CACHE_SECONDS:
+            return hit[1]
+    value = compute()
+    with _search_cache_lock:
+        if len(_search_cache) > 500:
+            _search_cache.clear()
+        _search_cache[key] = (now, value)
+    return value
+
+def _lunadrome_search(q, limit):
+    # The plain-YouTube search is a yt-dlp process (the slowest part): run it
+    # alongside the two YT Music calls instead of after them.
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        videos_future = executor.submit(lunadrome_search_videos, q, limit, set())
+        songs = lunadrome_search_songs(q, limit)
+        albums = lunadrome_search_albums(q, max(4, limit))   # the Albums tab is a grid; half the limit (6) was too few
+        song_ids = {s["video_id"] for s in songs}
+        videos = [v for v in videos_future.result() if v["video_id"] not in song_ids]
+    finally:
+        executor.shutdown(wait=False)
+    return {"songs": songs, "albums": albums, "videos": videos}
+
 @app.route("/search")
 def lunadrome_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"songs": [], "albums": [], "videos": []})
     limit = max(1, min(int(request.args.get("limit", 12)), 30))
-    songs = lunadrome_search_songs(q, limit)
-    albums = lunadrome_search_albums(q, max(4, limit))   # the Albums tab is a grid; half the limit (6) was too few
-    videos = lunadrome_search_videos(q, limit, {s["video_id"] for s in songs})
-    return jsonify({"songs": songs, "albums": albums, "videos": videos})
+    result = _cached(("search", q.lower(), limit), lambda: _lunadrome_search(q, limit))
+    if not (result["songs"] or result["albums"] or result["videos"]):
+        with _search_cache_lock:   # probably a hiccup: don't keep an empty answer around
+            _search_cache.pop(("search", q.lower(), limit), None)
+    return jsonify(result)
+
+def _lunadrome_artist_albums(name):
+    """Every album, EP and single YT Music lists for the artist called `name`
+    (the best artist match whose name is the same), newest first."""
+    wanted = _normalize_title(name)
+    artists = _ytm_call("search", name, filter="artists", limit=5) or []
+    match = next((a for a in artists if a.get("browseId") and _normalize_title(a.get("artist")) == wanted), None)
+    if not match:
+        return None
+    artist = _ytm_call("get_artist", match["browseId"], timeout=15)
+    if not artist:
+        return None
+    out, seen = [], set()
+    for section, default_type in (("albums", "Album"), ("singles", "Single")):
+        part = artist.get(section) or {}
+        results = part.get("results") or []
+        # The artist page only shows the first ~10; the "More" list has all of them.
+        if part.get("browseId") and part.get("params"):
+            results = _ytm_call("get_artist_albums", part["browseId"], part["params"], timeout=15) or results
+        for r in results:
+            browse_id = r.get("browseId")
+            if not browse_id or browse_id in seen:
+                continue
+            seen.add(browse_id)
+            out.append({
+                "browse_id": browse_id,
+                "title": r.get("title") or "Unknown album",
+                "artist": artist.get("name") or name,
+                "year": r.get("year"),
+                "type": r.get("type") or default_type,
+                "thumbnail": _best_thumbnail(r.get("thumbnails")),
+            })
+    out.sort(key=lambda a: str(a.get("year") or ""), reverse=True)
+    return {"artist": artist.get("name") or name, "browse_id": match["browseId"], "albums": out}
+
+@app.route("/search/artist")
+def lunadrome_search_artist():
+    name = request.args.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    result = _cached(("artist", name.lower()), lambda: _lunadrome_artist_albums(name))
+    if result is None:
+        with _search_cache_lock:
+            _search_cache.pop(("artist", name.lower()), None)
+        return jsonify({"artist": name, "albums": []})
+    return jsonify(result)
 
 @app.route("/search/album/<browse_id>")
 def lunadrome_search_album(browse_id):

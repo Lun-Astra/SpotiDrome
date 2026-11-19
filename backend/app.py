@@ -10,6 +10,7 @@ import mutagen
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, TRCK, TPOS, TXXX, TSRC, error as ID3Error
 from ytmusicapi import YTMusic
+from ytmusicapi.navigation import nav, SINGLE_COLUMN_TAB, SECTION_LIST
 
 app = Flask(__name__)
 CORS(app)
@@ -4810,12 +4811,24 @@ def _lunadrome_artist_albums(name):
     (the best artist match whose name is the same), newest first."""
     wanted = _normalize_title(name)
     artists = _ytm_call("search", name, filter="artists", limit=5) or []
-    match = next((a for a in artists if a.get("browseId") and _normalize_title(a.get("artist")) == wanted), None)
-    if not match:
+    channel_id = next((a["browseId"] for a in artists
+                       if a.get("browseId") and _normalize_title(a.get("artist")) == wanted), None)
+    if not channel_id:
+        # Small artists (a YouTube channel with a few videos) are missing from the
+        # artists-only search, but the plain search still names them.
+        for r in _ytm_call("search", name, limit=10) or []:
+            candidates = [{"name": r.get("artist"), "id": r.get("browseId")}] if r.get("resultType") == "artist" else []
+            candidates += r.get("artists") or []
+            channel_id = next((c["id"] for c in candidates
+                               if c.get("id") and _normalize_title(c.get("name")) == wanted), None)
+            if channel_id:
+                break
+    if not channel_id:
         return None
-    artist = _ytm_call("get_artist", match["browseId"], timeout=15)
+    artist = _ytm_call("get_artist", channel_id, timeout=15)
     if not artist:
-        return None
+        # ytmusicapi can't read a channel page without releases (other header).
+        return _channel_videos(channel_id, name)
     out, seen = [], set()
     for section, default_type in (("albums", "Album"), ("singles", "Single")):
         part = artist.get(section) or {}
@@ -4837,7 +4850,42 @@ def _lunadrome_artist_albums(name):
                 "thumbnail": _best_thumbnail(r.get("thumbnails")),
             })
     out.sort(key=lambda a: str(a.get("year") or ""), reverse=True)
-    return {"artist": artist.get("name") or name, "browse_id": match["browseId"], "albums": out}
+    if not out:
+        return _channel_videos(channel_id, artist.get("name") or name)
+    return {"artist": artist.get("name") or name, "browse_id": channel_id, "albums": out}
+
+def _channel_videos(channel_id, name):
+    """For an artist without albums or singles on YT Music: the videos on
+    their channel page, as single-track items (type "Video", with video_id)."""
+    page = _ytm_call("_send_request", "browse", {"browseId": channel_id}, timeout=15)
+    if not page:
+        return None
+    try:
+        rows = nav(page, SINGLE_COLUMN_TAB + SECTION_LIST)
+    except Exception:
+        return None
+    out = []
+    for row in rows:
+        shelf = row.get("musicCarouselShelfRenderer")
+        title = nav(shelf, ["header", "musicCarouselShelfBasicHeaderRenderer", "title", "runs", 0, "text"], True) if shelf else None
+        if title != "Videos":
+            continue
+        for item in shelf.get("contents") or []:
+            r = item.get("musicTwoRowItemRenderer") or {}
+            video_id = nav(r, ["navigationEndpoint", "watchEndpoint", "videoId"], True)
+            if not video_id:
+                continue
+            out.append({
+                "browse_id": "",
+                "video_id": video_id,
+                "url": f"https://music.youtube.com/watch?v={video_id}",
+                "title": nav(r, ["title", "runs", 0, "text"], True) or "Unknown video",
+                "artist": name,
+                "year": None,
+                "type": "Video",
+                "thumbnail": _best_thumbnail(nav(r, ["thumbnailRenderer", "musicThumbnailRenderer", "thumbnail", "thumbnails"], True)),
+            })
+    return {"artist": name, "browse_id": channel_id, "albums": out}
 
 @app.route("/search/artist")
 def lunadrome_search_artist():
